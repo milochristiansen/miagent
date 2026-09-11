@@ -1,0 +1,91 @@
+#!/bin/sh
+# TGI tool: run a shell command in a bubblewrap sandbox.
+# SCHEMA  -> tool schema (JSON)
+# INVOKE  -> JSON args {"command": "..."} on stdin
+#
+# The sandbox confines the command (bwrap flags below):
+#   - the working directory is the only writable host path; the rest of
+#     the filesystem is read-only, so files can be read from anywhere but
+#     written only here. /tmp is a fresh empty tmpfs.
+#   - --unshare-user + --uid/--gid: the command runs as the current
+#     uid/gid (files it creates keep their real ownership) and all
+#     capabilities are dropped; setuid binaries can't escalate (no-new-
+#     privileges), and unmapped uids (e.g. root) appear as the overflow
+#     uid with no privileges.
+#   - --unshare-pid: host processes are invisible and unsignalable.
+#   - --die-with-parent: the sandboxed command is SIGKILLed when bwrap
+#     (or bwrap's parent) dies, so the tool's shutdown signal kills the
+#     whole sandbox.
+#
+# The tool exec's bwrap, so the harness's signal reaches it directly, and
+# the command's exit code becomes the tool's exit code — the harness
+# composes the failure message (exit code, stdout, stderr) from those
+# channels, so no markers or 2>&1 merging are needed.
+
+case "$TGI_METHOD" in
+  SCHEMA)
+    cat <<'EOF'
+{
+  "name": "bash",
+  "description": "Run a shell command (bash -c) in a bubblewrap sandbox. Writable: the working directory and /tmp; everything else is read-only, including $HOME (dotfiles are readable). Runs as the current user with no privileges; host processes are invisible. On a non-zero exit, the result reports the exit code and the stdout and stderr channels separately.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Shell command to execute, passed to bash -c"
+      }
+    },
+    "required": ["command"]
+  }
+}
+EOF
+    ;;
+  INVOKE)
+    ROOT=$(pwd -P)
+    UID_NUM=$(id -u)
+    GID_NUM=$(id -g)
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "jq not found in PATH" >&2
+      exit 127
+    fi
+    cmd=$(jq -r '.command // empty')
+    if [ -z "$cmd" ]; then
+      echo "missing or empty 'command' argument" >&2
+      exit 2
+    fi
+    if ! command -v bwrap >/dev/null 2>&1; then
+      echo "bwrap not found in PATH" >&2
+      exit 127
+    fi
+
+    # Mount order matters: bwrap applies its mounts in sequence, so the
+    # fresh /tmp must be in place *before* the working directory is bound,
+    # or a cwd that lives under /tmp is shadowed by the tmpfs and the bind
+    # re-creates it empty — the sandbox then cannot even chdir into its
+    # own working directory.
+    export CMD
+    CMD="$cmd"
+    exec bwrap \
+      --die-with-parent \
+      --unshare-user \
+      --unshare-pid \
+      --unshare-ipc \
+      --unshare-uts \
+      --unshare-cgroup \
+      --cap-drop ALL \
+      --uid "$UID_NUM" \
+      --gid "$GID_NUM" \
+      --ro-bind / / \
+      --dev /dev \
+      --proc /proc \
+      --tmpfs /tmp \
+      --bind "$ROOT" "$ROOT" \
+      --chdir "$ROOT" \
+      -- bash -c "$CMD"
+    ;;
+  *)
+    echo "usage: TGI_METHOD=SCHEMA|INVOKE" >&2
+    exit 2
+    ;;
+esac

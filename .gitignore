@@ -1,0 +1,6 @@
+
+# Build output.
+miagent
+
+# Test run related files.
+.miagent/
