@@ -30,8 +30,9 @@ type ToolDef struct {
 
 // toolsDir is the name of the tool directory, in both places tools are read
 // from: the configuration directory holds the base set, and the state
-// directory may hold a project-local set that overrides it. The prompt files
-// and the core .env also live in the configuration directory (see configDir).
+// directory may hold a project-local set that overrides it. The prompts (in a
+// prompts subdirectory) and the core .env also live in the configuration
+// directory (see configDir).
 const (
 	toolsDir = "tools"
 	stateDir = ".miagent"
@@ -65,8 +66,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: miagent \"prompt\"\n"+
 		"The prompt is the raw command line (space-joined); one starting with \"/\"\n"+
 		"is a harness command instead of a prompt (/help, /context, /models, /desc, /compact, /new).\n"+
-		"Prompts: %s/SYSTEM.md, COMPACT-*.md beside it for /compact, and DESCRIPTION.md\n"+
-		"for /desc.\n"+
+		"Prompts: %s/prompts/SYSTEM.md, COMPACT-*.md beside it for /compact, and\n"+
+		"DESCRIPTION.md for /desc.\n"+
 		"Tools: executables in %s/tools, then %s/tools, which overrides it.\n"+
 		"Instructions: AGENTS.md in the working directory, then %s/AGENTS.md, both\n"+
 		"optional, read once at startup like SYSTEM.md, and injected into every\n"+
@@ -82,11 +83,12 @@ func usage() {
 		"MIAGENT_CONTEXT_LIMIT (context window in tokens). /compact reads\n"+
 		"MIAGENT_KEEP_RECENT_TOKENS (recent tokens to keep) and\n"+
 		"MIAGENT_RESERVE_TOKENS (summary budget).\n"+
-		"The prompts, base tools and core .env live in %s, i.e. $XDG_CONFIG_HOME/%s\n"+
-		"(default ~/.config/%s). The copies in this repo's prompts/ and tools/ are the\n"+
-		"source for them: copy what you want into that directory to install it.\n",
+		"The prompts live in %s/prompts, and the base tools and core .env in %s, i.e.\n"+
+		"$XDG_CONFIG_HOME/%s (default ~/.config/%s). The copies in this repo's\n"+
+		"prompts/ and tools/ are the source for them: copy what you want into those\n"+
+		"directories to install it.\n",
 		config, config, stateDir, stateDir, defaultSession, config, stateDir,
-		config, configName, configName)
+		config, config, configName, configName)
 	os.Exit(2)
 }
 
@@ -218,7 +220,7 @@ func main() {
 	tools := discoverTools(ctx)
 
 	// Load the instructions sent with every request: the system prompt from
-	// the configuration directory's SYSTEM.md, then the optional AGENTS.md
+	// the configuration directory's prompts/SYSTEM.md, then the optional AGENTS.md
 	// files, which have lower priority (they add to it rather than replace
 	// it). Read once here, like
 	// the system prompt and unlike the compaction prompts, which /compact

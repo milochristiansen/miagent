@@ -5,12 +5,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
-// describePromptName is the prompt file /desc reads from the configuration
-// directory, alongside SYSTEM.md and COMPACT-*.md (see prompt.go).
+// describePromptName is the prompt file /desc reads from the prompts
+// subdirectory of the configuration directory, alongside SYSTEM.md and
+// COMPACT-*.md (see prompt.go).
 const describePromptName = "DESCRIPTION.md"
 
 // describeMaxTokens bounds the model's reply. A description is one or two
@@ -19,15 +19,15 @@ const describePromptName = "DESCRIPTION.md"
 // spend it on.
 const describeMaxTokens = 512
 
-// loadDescribePrompt reads DESCRIPTION.md from the configuration directory.
-// Like the compaction prompts it is read on demand, when /desc runs, so the
-// wording can change without a restart or a rebuild.
+// loadDescribePrompt reads DESCRIPTION.md from the prompts subdirectory of the
+// configuration directory. Like the compaction prompts it is read on demand,
+// when /desc runs, so the wording can change without a restart or a rebuild.
 func loadDescribePrompt() (string, error) {
-	config, err := configDir()
+	path, err := promptPath(describePromptName)
 	if err != nil {
 		return "", err
 	}
-	return loadPrompt(filepath.Join(config, describePromptName))
+	return loadPrompt(path)
 }
 
 // describeConversation renders a session's user prompts and assistant answers
@@ -65,8 +65,9 @@ func describeInput(conversation string) string {
 
 // cmdDescribe reports a short description of the work done in the session. The
 // conversation is reduced to the user prompts and assistant answers and sent
-// with DESCRIPTION.md, read from the configuration directory; the model's reply
-// is the command's output. The session is only read, never written.
+// with DESCRIPTION.md, read from the configuration directory's prompts
+// subdirectory; the model's reply is the command's output. The session is only
+// read, never written.
 func cmdDescribe(ctx context.Context, prov *provider, sess *Session, d *display, args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("takes no arguments")

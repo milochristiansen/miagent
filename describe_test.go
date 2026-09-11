@@ -53,7 +53,7 @@ func TestDescribeConversation(t *testing.T) {
 // TestCmdDescribe checks the whole command: it reads DESCRIPTION.md, sends the
 // reduced conversation with it, and prints the model's description.
 func TestCmdDescribe(t *testing.T) {
-	dir := configFixture(t)
+	dir := promptsFixture(t)
 	promptText := "Describe the following conversation in one or two sentences."
 	if err := os.WriteFile(filepath.Join(dir, describePromptName), []byte(promptText+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestCmdDescribeEmptySession(t *testing.T) {
 // TestCmdDescribeMissingPrompt reports a missing DESCRIPTION.md rather than
 // sending the model an undescribed conversation.
 func TestCmdDescribeMissingPrompt(t *testing.T) {
-	configFixture(t) // no DESCRIPTION.md written
+	promptsFixture(t) // no DESCRIPTION.md written
 	err := cmdDescribe(context.Background(), &provider{}, describeSession(), newDisplay(), nil)
 	if err == nil || !strings.Contains(err.Error(), describePromptName) {
 		t.Fatalf("cmdDescribe error = %v, want it to name %s", err, describePromptName)

@@ -101,13 +101,13 @@ func TestSessionInstructions(t *testing.T) {
 	// independent, which is the point of the split.
 	root := t.TempDir()
 	t.Chdir(root)
-	config := configFixture(t)
+	prompts := promptsFixture(t)
 	state := filepath.Join(root, "state")
 	if err := os.Mkdir(state, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	const system = "SYSTEM-PROMPT-TEXT"
-	if err := os.WriteFile(filepath.Join(config, "SYSTEM.md"), []byte(system+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(prompts, "SYSTEM.md"), []byte(system+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,7 +141,7 @@ func TestSessionInstructions(t *testing.T) {
 
 	// A malformed system prompt is an error, exactly as before: the agent
 	// files are the optional half, not the system prompt.
-	if err := os.WriteFile(filepath.Join(config, "SYSTEM.md"), []byte("  \n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(prompts, "SYSTEM.md"), []byte("  \n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sessionInstructions(state); err == nil {

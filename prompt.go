@@ -1,10 +1,10 @@
 // Prompt files: the harness's prompts are editable text, not compiled-in
-// strings. They live in the configuration directory (see configDir) as
-// SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md, so one installation serves every
-// project and a prompt can be changed without a rebuild. SYSTEM.md and the
-// optional AGENTS.md files are read once at startup, because every turn needs
-// them; the COMPACT-*.md files and DESCRIPTION.md are read on demand, when
-// /compact and /desc run.
+// strings. They live in a prompts subdirectory of the configuration directory
+// (see configDir) as SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md, so one
+// installation serves every project and a prompt can be changed without a
+// rebuild. SYSTEM.md and the optional AGENTS.md files are read once at
+// startup, because every turn needs them; the COMPACT-*.md files and
+// DESCRIPTION.md are read on demand, when /compact and /desc run.
 package main
 
 import (
@@ -15,10 +15,25 @@ import (
 )
 
 // agentsFile names the per-project instruction file. It is read like the
-// prompts in the configuration directory, two differences aside: it is
-// optional, and it belongs to the project rather than to the installation, so
-// it is looked for in the working directory and the state directory.
+// prompts in the configuration directory's prompts subdirectory, two
+// differences aside: it is optional, and it belongs to the project rather than
+// to the installation, so it is looked for in the working directory and the
+// state directory.
 const agentsFile = "AGENTS.md"
+
+// promptsDir is the name of the configuration directory's prompt
+// subdirectory, which holds SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md.
+const promptsDir = "prompts"
+
+// promptPath returns the path of the named prompt file in the configuration
+// directory's prompts subdirectory.
+func promptPath(name string) (string, error) {
+	config, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(config, promptsDir, name), nil
+}
 
 // loadPrompt reads one required prompt file. Surrounding whitespace is
 // trimmed: a text file ends in a newline, and neither the model nor a cache
@@ -83,11 +98,11 @@ func loadAgents(stateDir string) (string, error) {
 // context for the model, not part of the conversation, so they are never
 // written to the session file and never replayed from it.
 func sessionInstructions(stateDir string) (string, error) {
-	config, err := configDir()
+	systemPath, err := promptPath("SYSTEM.md")
 	if err != nil {
 		return "", err
 	}
-	system, err := loadPrompt(filepath.Join(config, "SYSTEM.md"))
+	system, err := loadPrompt(systemPath)
 	if err != nil {
 		return "", err
 	}

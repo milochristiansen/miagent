@@ -446,7 +446,7 @@ func TestArchiveName(t *testing.T) {
 // TestLoadCompactPrompts covers the prompt files: all four are read, and a
 // missing one fails the load rather than a run.
 func TestLoadCompactPrompts(t *testing.T) {
-	dir := configFixture(t)
+	dir := promptsFixture(t)
 
 	system := "system prompt text"
 	initial := "initial prompt text"
@@ -486,7 +486,7 @@ func TestLoadCompactPrompts(t *testing.T) {
 // finds nothing to do.
 func TestCompactEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	promptDir := configFixture(t)
+	promptDir := promptsFixture(t)
 	for name, text := range map[string]string{
 		"COMPACT-SYSTEM.md":  "summarize",
 		"COMPACT-INITIAL.md": "initial format",
@@ -643,7 +643,7 @@ func TestCompactEndToEnd(t *testing.T) {
 // failed summarization costs nothing: no rewrite, no archive, no temp file.
 func TestCompactLeavesSessionAloneOnProviderFailure(t *testing.T) {
 	dir := t.TempDir()
-	promptDir := configFixture(t)
+	promptDir := promptsFixture(t)
 	for _, name := range []string{"COMPACT-SYSTEM.md", "COMPACT-INITIAL.md", "COMPACT-UPDATE.md", "COMPACT-PREFIX.md"} {
 		if err := os.WriteFile(filepath.Join(promptDir, name), []byte("prompt"), 0o644); err != nil {
 			t.Fatal(err)
@@ -726,9 +726,20 @@ func newTestClient(baseURL string) *openai.Client {
 	return openai.NewClientWithConfig(cfg)
 }
 
+// promptsFixture creates the configuration directory's prompts subdirectory
+// and returns it, so a test can write prompt files into it.
+func promptsFixture(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(configFixture(t), promptsDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // configFixture points XDG_CONFIG_HOME at a fresh directory holding this
 // package's config directory, and returns that directory so a test can write
-// prompt files into it.
+// files into it.
 func configFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

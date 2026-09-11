@@ -2,9 +2,9 @@
 // (packages/coding-agent/src/core/compaction/compaction.ts): pick a cut point
 // that keeps roughly the most recent keepRecentTokens, summarize everything
 // before it with one model call, and replace the summarized items with the
-// summary. The prompts are read from COMPACT-*.md in the configuration
-// directory (see configDir and prompt.go); the session file is archived before
-// being rewritten (see archive.go).
+// summary. The prompts are read from COMPACT-*.md in the prompts subdirectory
+// of the configuration directory (see configDir and prompt.go); the session
+// file is archived before being rewritten (see archive.go).
 package main
 
 import (
@@ -365,7 +365,8 @@ func truncateForSummary(text string, maxChars int) string {
 }
 
 // compactPrompts holds the four prompts a compaction may send, read from
-// COMPACT-*.md in the configuration directory (see prompt.go).
+// COMPACT-*.md in the prompts subdirectory of the configuration directory
+// (see prompt.go).
 type compactPrompts struct {
 	System     string // system prompt of the summarization request
 	Initial    string // summary format, when there is no previous summary
@@ -373,16 +374,12 @@ type compactPrompts struct {
 	TurnPrefix string // summary of a split turn's prefix
 }
 
-// loadCompactPrompts reads the four prompt files from the configuration
-// directory. All four are read even though a given run uses at most two of
-// them: which two depends on the cut point, which is not known until the
-// conversation is measured, so requiring all four keeps the failure
-// deterministic and ahead of any provider call.
+// loadCompactPrompts reads the four prompt files from the prompts
+// subdirectory of the configuration directory. All four are read even though a
+// given run uses at most two of them: which two depends on the cut point,
+// which is not known until the conversation is measured, so requiring all four
+// keeps the failure deterministic and ahead of any provider call.
 func loadCompactPrompts() (*compactPrompts, error) {
-	config, err := configDir()
-	if err != nil {
-		return nil, err
-	}
 	p := &compactPrompts{}
 	for _, f := range []struct {
 		dst  *string
@@ -393,7 +390,11 @@ func loadCompactPrompts() (*compactPrompts, error) {
 		{&p.Update, "COMPACT-UPDATE.md"},
 		{&p.TurnPrefix, "COMPACT-PREFIX.md"},
 	} {
-		text, err := loadPrompt(filepath.Join(config, f.name))
+		path, err := promptPath(f.name)
+		if err != nil {
+			return nil, err
+		}
+		text, err := loadPrompt(path)
 		if err != nil {
 			return nil, err
 		}

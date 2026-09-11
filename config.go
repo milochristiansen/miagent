@@ -1,6 +1,6 @@
-// User-level configuration directory: the prompt files and the core dotenv
-// file live here rather than in the working directory, so one installation
-// serves every project.
+// User-level configuration directory: the prompts (in a prompts subdirectory)
+// and the core dotenv file live here rather than in the working directory, so
+// one installation serves every project.
 package main
 
 import (
