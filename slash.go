@@ -37,6 +37,12 @@ var commands = []command{
 		run:     cmdModels,
 	},
 	{
+		name:      "desc",
+		summary:   "describe the work done in this session in a sentence or two",
+		needModel: true,
+		run:       cmdDescribe,
+	},
+	{
 		name:      "compact",
 		summary:   "replace older conversation with a summary, archiving the session",
 		needModel: true,

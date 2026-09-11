@@ -1,9 +1,10 @@
 // Prompt files: the harness's prompts are editable text, not compiled-in
 // strings. They live in the configuration directory (see configDir) as
-// SYSTEM.md and COMPACT-*.md, so one installation serves every project and a
-// prompt can be changed without a rebuild. SYSTEM.md and the optional
-// AGENTS.md files are read once at startup, because every turn needs them; the
-// COMPACT-*.md files are read on demand, when /compact runs.
+// SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md, so one installation serves every
+// project and a prompt can be changed without a rebuild. SYSTEM.md and the
+// optional AGENTS.md files are read once at startup, because every turn needs
+// them; the COMPACT-*.md files and DESCRIPTION.md are read on demand, when
+// /compact and /desc run.
 package main
 
 import (
