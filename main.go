@@ -270,7 +270,10 @@ func main() {
 				fail("saving session", err)
 			}
 			if line, err := contextLine(sess); err == nil {
-				disp.subdued(line)
+				// A BEL rides the note so it lands at the end of the turn
+				// in both render and raw mode, alerting a reader who has
+				// looked away that the answer is ready.
+				disp.subdued(line + "\a")
 			}
 			return
 		}
