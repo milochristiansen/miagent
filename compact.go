@@ -23,14 +23,6 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-// provider is the model endpoint a command talks to: the configured client and
-// the model name. The agent loop builds one too; /compact needs it because
-// summarization is itself a model call.
-type provider struct {
-	client *openai.Client
-	model  string
-}
-
 // Context sizing. The provider's own counts are the size that matters: a
 // usage record says what it covers and how many tokens that took, so the
 // conversation is measured between records (see tokenIndex), and those counts
@@ -443,6 +435,10 @@ func compactSettingsFromEnv() (compactSettings, error) {
 // summarize runs one summarization call and returns its text and usage. The
 // conversation is presented inside the prompt as text, with the system prompt
 // telling the model to summarize rather than continue it.
+//
+// The configured reasoning effort is deliberately not sent: reasoning tokens
+// count against MaxOutputTokens, so a high effort could spend the summary's
+// whole budget thinking and return no text. Summarization does not need it.
 func (p *provider) summarize(ctx context.Context, system, prompt string, maxTokens int) (string, Usage, error) {
 	resp, err := p.client.CreateResponse(ctx, openai.CreateResponseRequest{
 		Model:           p.model,

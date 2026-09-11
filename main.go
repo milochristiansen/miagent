@@ -64,19 +64,23 @@ func usage() {
 	config := displayConfigDir()
 	fmt.Fprintf(os.Stderr, "Usage: miagent \"prompt\"\n"+
 		"The prompt is the raw command line (space-joined); one starting with \"/\"\n"+
-		"is a harness command instead of a prompt (/context, /compact, /new).\n"+
+		"is a harness command instead of a prompt (/context, /models, /compact, /new).\n"+
 		"Prompts: %s/SYSTEM.md, and COMPACT-*.md beside it for /compact.\n"+
 		"Tools: executables in %s/tools, then %s/tools, which overrides it.\n"+
 		"Instructions: AGENTS.md in the working directory, then %s/AGENTS.md, both\n"+
 		"optional, read once at startup like SYSTEM.md, and injected into every\n"+
 		"request after it (lower priority; never written to the session).\n"+
 		"Configuration: OPENAI_MODEL (required), OPENAI_API_KEY, OPENAI_BASE_URL,\n"+
-		"and MIAGENT_SESSION (JSONL session file to continue; default %s).\n"+
+		"OPENAI_REASONING_EFFORT (minimal, low, medium, or high; unset or \"none\"\n"+
+		"keeps the endpoint default), and MIAGENT_SESSION (JSONL session file to\n"+
+		"continue; default %s). /models lists the endpoint's models and their\n"+
+		"reasoning levels, and names the one it is set to.\n"+
 		"Environment files: %s/.env, then %s/.env, which overrides it; an exported\n"+
 		"variable overrides both.\n"+
-		"/context additionally reads MIAGENT_CONTEXT_LIMIT (context window in\n"+
-		"tokens). /compact reads MIAGENT_KEEP_RECENT_TOKENS (recent tokens to keep)\n"+
-		"and MIAGENT_RESERVE_TOKENS (summary budget).\n"+
+		"/context, and the context line printed after a normal run, reads\n"+
+		"MIAGENT_CONTEXT_LIMIT (context window in tokens). /compact reads\n"+
+		"MIAGENT_KEEP_RECENT_TOKENS (recent tokens to keep) and\n"+
+		"MIAGENT_RESERVE_TOKENS (summary budget).\n"+
 		"The prompts, base tools and core .env live in %s, i.e. $XDG_CONFIG_HOME/%s\n"+
 		"(default ~/.config/%s). The copies in this repo's prompts/ and tools/ are the\n"+
 		"source for them: copy what you want into that directory to install it.\n",
@@ -161,7 +165,18 @@ func main() {
 	if baseURL != "" {
 		cfg.BaseURL = baseURL
 	}
-	prov := &provider{client: openai.NewClientWithConfig(cfg), model: model}
+	// The reasoning level is read here, once, and carried by the provider so
+	// every agent turn sends the same one. A malformed value is not rejected:
+	// the endpoint decides which levels it accepts, and a proxy may take ones
+	// the OpenAI API does not name. /models reports what it is set to.
+	prov := &provider{
+		client:          openai.NewClientWithConfig(cfg),
+		model:           model,
+		baseURL:         baseURL,
+		apiKey:          apiKey,
+		reasoning:       reasoningFromEnv(),
+		reasoningEffort: configuredReasoningEffort(),
+	}
 
 	// A slash-prefixed prompt is a harness command: it runs here, before any
 	// exchange starts, and never enters the conversation.
@@ -247,9 +262,15 @@ func main() {
 		}
 
 		if final {
-			// Final answer: the exchange is complete. Persist and exit.
+			// Final answer: the exchange is complete. Persist it, then leave
+			// a subdued context-size note just below the answer. A bad
+			// MIAGENT_CONTEXT_LIMIT must not turn a completed turn into a
+			// failure, so an unformattable note is omitted rather than fatal.
 			if err := sess.commit(); err != nil {
 				fail("saving session", err)
+			}
+			if line, err := contextLine(sess); err == nil {
+				disp.subdued(line)
 			}
 			return
 		}
@@ -305,6 +326,7 @@ func runModelTurn(
 		Instructions: instructions,
 		Input:        itemsToInput(conversation),
 		Tools:        tools,
+		Reasoning:    prov.reasoning,
 	})
 	if err != nil {
 		return nil, nil, false, err

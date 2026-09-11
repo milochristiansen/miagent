@@ -21,6 +21,13 @@ const (
 	dispOutput
 )
 
+// ANSI styling for a subdued harness note: italic grey, the same treatment
+// termark gives reasoning markdown.
+const (
+	subduedPrefix = "\x1b[3m\x1b[38;5;244m"
+	subduedSuffix = "\x1b[0m"
+)
+
 // display owns the session's screen output. On a terminal it renders three
 // content classes: reasoning as subdued markdown (termark's "reasoning"
 // style), agent output as plain markdown, and tool calls as live code boxes
@@ -175,6 +182,31 @@ func (d *display) info(s string) {
 		d.sepNext = false
 	}
 	d.rawWrite(s)
+}
+
+// subdued writes a harness note as a subdued line directly after the last
+// output line. On a terminal it uses the same italic grey as reasoning
+// markdown; when stdout is not a terminal it falls back to plain text.
+// Unlike info it does not insert a blank separator, because the note belongs
+// to the content it annotates rather than standing apart from it.
+func (d *display) subdued(s string) {
+	s = strings.TrimSuffix(s, "\n")
+	d.endErrLine()
+	if d.cur != nil {
+		d.close()
+	}
+	if d.rawText && !d.rawLast {
+		d.rawWrite("\n")
+	}
+	if d.renderable() {
+		fmt.Fprint(os.Stdout, subduedPrefix+s+subduedSuffix+"\r\n")
+		d.rawText = true
+		d.rawLast = true
+		d.sepNext = false
+		return
+	}
+	d.rawWrite(s + "\n")
+	d.sepNext = false
 }
 
 // output streams agent content (plain markdown).

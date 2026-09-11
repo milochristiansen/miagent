@@ -90,3 +90,33 @@ func TestDisplayReasoningAlreadyTerminated(t *testing.T) {
 		t.Fatalf("stderr = %q, want no extra newline", errOut)
 	}
 }
+
+// TestDisplaySubduedLine covers the final note's placement: it goes directly
+// after the last output line, without info's blank separator, and is plain
+// when stdout is not a terminal (as in this test).
+func TestDisplaySubduedLine(t *testing.T) {
+	out := captureStdout(t, func() {
+		d := newDisplay()
+		d.output("the answer")
+		d.endTurn()
+		d.subdued("context: 13 tokens (maximum unknown; set MIAGENT_CONTEXT_LIMIT)")
+	})
+	want := "the answer\ncontext: 13 tokens (maximum unknown; set MIAGENT_CONTEXT_LIMIT)\n"
+	if out != want {
+		t.Fatalf("stdout = %q, want %q", out, want)
+	}
+}
+
+// TestDisplaySubduedClosesOpenLine covers the other half: a note written
+// without a prior endTurn must still start on its own line.
+func TestDisplaySubduedClosesOpenLine(t *testing.T) {
+	out := captureStdout(t, func() {
+		d := newDisplay()
+		d.output("the answer")
+		d.subdued("context: note")
+	})
+	want := "the answer\ncontext: note\n"
+	if out != want {
+		t.Fatalf("stdout = %q, want %q", out, want)
+	}
+}

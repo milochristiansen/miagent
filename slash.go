@@ -8,13 +8,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// command is one slash command. needModel marks a command that talks to the
-// provider: the harness checks for a configured model before running one, but
-// not before a purely local command such as /context.
+// command is one slash command. needModel marks a command that calls the model
+// itself: the harness checks for a configured OPENAI_MODEL before running one.
+// It is not set for commands that only reach the endpoint (/models) or touch
+// nothing beyond the session (/context, /new).
 type command struct {
 	name      string // as typed, without the leading slash
 	summary   string // one line, listed when a command is not found
@@ -28,6 +30,11 @@ var commands = []command{
 		name:    "context",
 		summary: "context size and maximum for this session",
 		run:     cmdContext,
+	},
+	{
+		name:    "models",
+		summary: "list the endpoint's models and their reasoning levels",
+		run:     cmdModels,
 	},
 	{
 		name:      "compact",
@@ -95,9 +102,20 @@ func cmdContext(_ context.Context, _ *provider, sess *Session, d *display, args 
 	if len(args) > 0 {
 		return fmt.Errorf("takes no arguments")
 	}
+	line, err := contextLine(sess)
+	if err != nil {
+		return err
+	}
+	d.info(line + "\n")
+	return nil
+}
+
+// contextLine formats the context-size line /context prints and a normal run
+// prints just before it exits. The line has no trailing newline; callers add
+// whatever terminator their output path requires.
+func contextLine(sess *Session) (string, error) {
 	if len(sess.Items) == 0 {
-		d.info("context: unknown (the session is empty)\n")
-		return nil
+		return "context: unknown (the session is empty)", nil
 	}
 
 	used, measured := sess.contextTokens()
@@ -110,15 +128,63 @@ func cmdContext(_ context.Context, _ *provider, sess *Session, d *display, args 
 	}
 	limit, err := envTokenLimit("MIAGENT_CONTEXT_LIMIT")
 	if err != nil {
-		return err
+		return "", err
 	}
 	if limit == 0 {
-		d.info(fmt.Sprintf("context: %s tokens%s (maximum unknown; set MIAGENT_CONTEXT_LIMIT)\n",
-			commas(used), note))
-		return nil
+		return fmt.Sprintf("context: %s tokens%s (maximum unknown; set MIAGENT_CONTEXT_LIMIT)",
+			commas(used), note), nil
 	}
-	d.info(fmt.Sprintf("context: %s / %s tokens (%.1f%%%s)\n",
-		commas(used), commas(limit), 100*float64(used)/float64(limit), note))
+	return fmt.Sprintf("context: %s / %s tokens (%.1f%%%s)",
+		commas(used), commas(limit), 100*float64(used)/float64(limit), note), nil
+}
+
+// cmdModels lists the models the configured endpoint offers, with the
+// reasoning efforts each is known to accept, and names the model and effort
+// the harness is currently set to.
+//
+// The standard OpenAI-compatible /models response says nothing about
+// reasoning, so a level a model reports itself (some routers add one) is used
+// when present and the harness's own model-family table otherwise; a model
+// neither source covers is reported as unknown rather than guessed at. The
+// command talks to the endpoint but needs no model of its own, so it runs
+// before OPENAI_MODEL is required and can be used to choose one.
+func cmdModels(ctx context.Context, prov *provider, _ *Session, d *display, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("takes no arguments")
+	}
+	models, err := prov.listModels(ctx)
+	if err != nil {
+		return err
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "models at %s (%d):\n", endpointLabel(prov.baseURL), len(models))
+	if len(models) == 0 {
+		b.WriteString("  (none)\n")
+	}
+	width := 0
+	for _, m := range models {
+		if n := len(m.ID); n > width {
+			width = n
+		}
+	}
+	for _, m := range models {
+		marker := "  "
+		if prov.model != "" && m.ID == prov.model {
+			marker = "* "
+		}
+		fmt.Fprintf(&b, "%s%-*s  %s\n", marker, width, m.ID, reasoningSummary(m))
+	}
+	switch {
+	case prov.model == "":
+		b.WriteString("no model configured; set OPENAI_MODEL\n")
+	case prov.reasoningEffort != "":
+		fmt.Fprintf(&b, "configured: %s, reasoning effort %q (%s)\n", prov.model, prov.reasoningEffort, reasoningEffortEnv)
+	default:
+		fmt.Fprintf(&b, "configured: %s, reasoning effort default\n", prov.model)
+	}
+	d.info(b.String())
 	return nil
 }
 
