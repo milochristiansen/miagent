@@ -7,11 +7,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // TGIResult is the outcome of a TGI tool invocation.
@@ -80,7 +82,7 @@ func RunTGITool(ctx context.Context, name, toolPath, method string, input io.Rea
 	go func() {
 		select {
 		case <-ctx.Done():
-			cmd.Process.Signal(os.Kill)
+			terminateTool(cmd.Process, done, toolStopGrace, stdout, stderr)
 		case <-done:
 		}
 	}()
@@ -96,5 +98,47 @@ func RunTGITool(ctx context.Context, name, toolPath, method string, input io.Rea
 		Stdout: outBuf.String(),
 		Stderr: errBuf.String(),
 		Code:   cmd.ProcessState.ExitCode(),
+	}
+}
+
+// toolStopGrace is how long a tool is given to exit after it is asked to
+// stop, before it is killed.
+const toolStopGrace = 5 * time.Second
+
+// terminateTool stops a running tool process, giving it grace to exit after
+// it is asked to stop. Where the platform supports a graceful stop the tool
+// is asked to exit with SIGTERM; where it does not (Windows) it is killed
+// outright. A tool that ignores SIGTERM is killed once grace expires. done
+// is closed once the process has been reaped, which bounds the wait to the
+// tool's actual lifetime.
+//
+// A forced kill also closes the given pipes. Killing the tool does not
+// necessarily close the write ends of its output pipes: children it spawned
+// inherit them and can keep them open, which would leave the caller's drains
+// blocked on them forever. Closing our read ends lets those drains finish;
+// any child that survives is on its own.
+func terminateTool(p *os.Process, done <-chan bool, grace time.Duration, pipes ...io.Closer) {
+	err := requestStop(p)
+	switch {
+	case err == nil:
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+			_ = p.Kill()
+		}
+	case errors.Is(err, os.ErrProcessDone):
+		// The tool is already gone; its pipes will reach EOF on their own,
+		// so leave them alone rather than risk dropping buffered output.
+		return
+	default:
+		_ = p.Kill()
+	}
+	for _, c := range pipes {
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 }

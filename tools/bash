@@ -27,7 +27,7 @@ case "$TGI_METHOD" in
     cat <<'EOF'
 {
   "name": "bash",
-  "description": "Run a shell command (bash -c) in a bubblewrap sandbox. Writable: the working directory and /tmp; everything else is read-only, including $HOME (dotfiles are readable). Runs as the current user with no privileges; host processes are invisible. On a non-zero exit, the result reports the exit code and the stdout and stderr channels separately.",
+  "description": "Run a shell command (bash -c) in a bubblewrap sandbox. Writable: the working directory and /tmp; everything else is read-only, including $HOME (dotfiles are readable), network is accessible. Runs as the current user with no privileges; host processes are invisible. On a non-zero exit, the result reports the exit code and the stdout and stderr channels separately.",
   "parameters": {
     "type": "object",
     "properties": {
