@@ -24,35 +24,46 @@ type command struct {
 	run       func(ctx context.Context, prov *provider, sess *Session, d *display, args []string) error
 }
 
-// commands lists the slash commands in listing order.
-var commands = []command{
-	{
-		name:    "context",
-		summary: "context size and maximum for this session",
-		run:     cmdContext,
-	},
-	{
-		name:    "models",
-		summary: "list the endpoint's models and their reasoning levels",
-		run:     cmdModels,
-	},
-	{
-		name:      "desc",
-		summary:   "describe the work done in this session in a sentence or two",
-		needModel: true,
-		run:       cmdDescribe,
-	},
-	{
-		name:      "compact",
-		summary:   "replace older conversation with a summary, archiving the session",
-		needModel: true,
-		run:       cmdCompact,
-	},
-	{
-		name:    "new",
-		summary: "archive the session and its compaction archives, then start fresh",
-		run:     cmdNew,
-	},
+// commandTable returns the slash commands in listing order.
+//
+// It is a function rather than a variable because /help renders the table it
+// is part of: a variable initialized with cmdHelp would depend on itself
+// (commands -> cmdHelp -> helpText -> commands), which the compiler rejects.
+func commandTable() []command {
+	return []command{
+		{
+			name:    "help",
+			summary: "how to prompt the harness and which slash commands exist",
+			run:     cmdHelp,
+		},
+		{
+			name:    "context",
+			summary: "context size and maximum for this session",
+			run:     cmdContext,
+		},
+		{
+			name:    "models",
+			summary: "list the endpoint's models and their reasoning levels",
+			run:     cmdModels,
+		},
+		{
+			name:      "desc",
+			summary:   "describe the work done in this session in a sentence or two",
+			needModel: true,
+			run:       cmdDescribe,
+		},
+		{
+			name:      "compact",
+			summary:   "replace older conversation with a summary, archiving the session",
+			needModel: true,
+			run:       cmdCompact,
+		},
+		{
+			name:    "new",
+			summary: "archive the session and its compaction archives, then start fresh",
+			run:     cmdNew,
+		},
+	}
 }
 
 // cmdCompact replaces the session's older conversation with a summary of it,
@@ -62,6 +73,41 @@ func cmdCompact(ctx context.Context, prov *provider, sess *Session, d *display, 
 		return fmt.Errorf("takes no arguments")
 	}
 	return prov.compact(ctx, sess, d)
+}
+
+// cmdHelp prints how a prompt reaches the harness and which slash commands it
+// supports. It is the friendly counterpart to an unknown command: the same
+// list, under an explanation instead of an error.
+func cmdHelp(_ context.Context, _ *provider, _ *Session, d *display, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("takes no arguments")
+	}
+	d.info(helpText())
+	return nil
+}
+
+// helpText is what /help prints: the harness's own guidance on entering a
+// prompt, without the part that suggests running /help, followed by the
+// available commands. The reader is already running it.
+func helpText() string {
+	var b strings.Builder
+	b.WriteString("Simply enter your prompt on the command line raw or quoted. Additionally, some slash (/) commands exist:\n")
+	for _, line := range commandLines() {
+		b.WriteString(line + "\n")
+	}
+	return b.String()
+}
+
+// commandLines returns one indented line per available command. /help prints
+// them and an unknown command lists them, so the two listings cannot drift
+// apart.
+func commandLines() []string {
+	table := commandTable()
+	lines := make([]string, 0, len(table))
+	for _, c := range table {
+		lines = append(lines, fmt.Sprintf("  /%s\t%s", c.name, c.summary))
+	}
+	return lines
 }
 
 // parseCommand splits a prompt into a slash command: the name without its
@@ -78,7 +124,7 @@ func parseCommand(prompt string) (name string, args []string, ok bool) {
 
 // findCommand looks up a command by name.
 func findCommand(name string) (command, bool) {
-	for _, c := range commands {
+	for _, c := range commandTable() {
 		if c.name == name {
 			return c, true
 		}
@@ -90,8 +136,8 @@ func findCommand(name string) (command, bool) {
 // commands that exist.
 func unknownCommand(name string) {
 	fmt.Fprintf(os.Stderr, "unknown command /%s\navailable commands:\n", name)
-	for _, c := range commands {
-		fmt.Fprintf(os.Stderr, "  /%s\t%s\n", c.name, c.summary)
+	for _, line := range commandLines() {
+		fmt.Fprintln(os.Stderr, line)
 	}
 	os.Exit(2)
 }

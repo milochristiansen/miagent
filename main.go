@@ -64,7 +64,7 @@ func usage() {
 	config := displayConfigDir()
 	fmt.Fprintf(os.Stderr, "Usage: miagent \"prompt\"\n"+
 		"The prompt is the raw command line (space-joined); one starting with \"/\"\n"+
-		"is a harness command instead of a prompt (/context, /models, /desc, /compact, /new).\n"+
+		"is a harness command instead of a prompt (/help, /context, /models, /desc, /compact, /new).\n"+
 		"Prompts: %s/SYSTEM.md, COMPACT-*.md beside it for /compact, and DESCRIPTION.md\n"+
 		"for /desc.\n"+
 		"Tools: executables in %s/tools, then %s/tools, which overrides it.\n"+
