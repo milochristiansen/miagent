@@ -118,13 +118,22 @@ func discardArchive(path string) {
 	_ = os.Remove(path)
 }
 
-// packArchive writes files into a gzip-compressed tar archive at path, storing
-// each under its base name. All the files must share a directory, which the
-// callers guarantee: they are one session file and its compaction archives.
+// archiveEntry is content stored in an archive with no file behind it, written
+// after the files passed to packArchive. /new uses one for the generated
+// session-name.md, which must live inside the archive rather than beside it.
+type archiveEntry struct {
+	name    string
+	content string
+}
+
+// packArchive writes files and extra in-memory entries into a gzip-compressed
+// tar archive at path, storing each under its base name. All the files must
+// share a directory, which the callers guarantee: they are one session file and
+// its compaction archives.
 //
 // The archive is created exclusively, so an existing file is never overwritten;
 // on failure the caller removes whatever was written.
-func packArchive(path string, files []string) (err error) {
+func packArchive(path string, files []string, entries []archiveEntry) (err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -142,6 +151,11 @@ func packArchive(path string, files []string) (err error) {
 			return err
 		}
 	}
+	for _, e := range entries {
+		if err = addContentToArchive(tw, e.name, e.content); err != nil {
+			return err
+		}
+	}
 	// Close the layers in order: each writes its trailer through the one
 	// below it.
 	if err = tw.Close(); err != nil {
@@ -151,6 +165,23 @@ func packArchive(path string, files []string) (err error) {
 		return err
 	}
 	return f.Sync()
+}
+
+// addContentToArchive appends in-memory content to a tar archive under name.
+// The header is built directly, so the entry needs no file on disk to describe
+// it; the mode matches the files the archives normally hold.
+func addContentToArchive(tw *tar.Writer, name, content string) error {
+	hdr := &tar.Header{
+		Name:    name,
+		Mode:    0o644,
+		Size:    int64(len(content)),
+		ModTime: time.Now(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err := io.WriteString(tw, content)
+	return err
 }
 
 // addToArchive appends one file to a tar archive under its base name.

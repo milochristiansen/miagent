@@ -1,5 +1,7 @@
 // /new: retire the current session into an archive, so the next prompt starts
-// a fresh conversation.
+// a fresh conversation. The archive is named from the session's first few user
+// prompts (see sessionname.go), so a later command can list it under a short
+// description.
 package main
 
 import (
@@ -23,9 +25,10 @@ const archiveExt = ".tar.gz"
 //
 // The archive is written and closed before anything is deleted, so the
 // conversation exists in exactly one place at every moment: either as loose
-// files or inside the archive. A failure before the deletions leaves the
-// session untouched.
-func cmdNew(_ context.Context, _ *provider, sess *Session, d *display, args []string) error {
+// files or inside the archive. The session is named before the archive is
+// written, so a model call that fails leaves every original in place and /new
+// can simply be retried.
+func cmdNew(ctx context.Context, prov *provider, sess *Session, d *display, args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("takes no arguments")
 	}
@@ -46,12 +49,27 @@ func cmdNew(_ context.Context, _ *provider, sess *Session, d *display, args []st
 		return nil
 	}
 
+	// The generated name goes inside the archive as session-name.md. A
+	// session with no user prompt has nothing to name, so it is archived
+	// without the entry rather than refused.
+	name, err := sessionName(ctx, prov, sess.Items)
+	if err != nil {
+		return fmt.Errorf("naming the session: %w", err)
+	}
+	var entries []archiveEntry
+	if name != "" {
+		entries = append(entries, archiveEntry{
+			name:    sessionNameArchiveEntry,
+			content: name + "\n",
+		})
+	}
+
 	stem := "archive-" + time.Now().UTC().Format("20060102T150405Z")
 	target, err := uniquePath(filepath.Dir(sess.path), stem, archiveExt)
 	if err != nil {
 		return err
 	}
-	if err := packArchive(target, files.all()); err != nil {
+	if err := packArchive(target, files.all(), entries); err != nil {
 		os.Remove(target) // never leave a half-written archive behind
 		return err
 	}

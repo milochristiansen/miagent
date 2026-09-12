@@ -1,10 +1,11 @@
 // Prompt files: the harness's prompts are editable text, not compiled-in
 // strings. They live in a prompts subdirectory of the configuration directory
-// (see configDir) as SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md, so one
-// installation serves every project and a prompt can be changed without a
-// rebuild. SYSTEM.md and the optional AGENTS.md files are read once at
-// startup, because every turn needs them; the COMPACT-*.md files and
-// DESCRIPTION.md are read on demand, when /compact and /desc run.
+// (see configDir) as SYSTEM.md, COMPACT-*.md, DESCRIPTION.md, and
+// SESSION-NAME.md, so one installation serves every project and a prompt can
+// be changed without a rebuild. SYSTEM.md and the optional AGENTS.md files are
+// read once at startup, because every turn needs them; the COMPACT-*.md files,
+// DESCRIPTION.md, and SESSION-NAME.md are read on demand, when /compact, /desc,
+// and /new run.
 package main
 
 import (
@@ -22,7 +23,8 @@ import (
 const agentsFile = "AGENTS.md"
 
 // promptsDir is the name of the configuration directory's prompt
-// subdirectory, which holds SYSTEM.md, COMPACT-*.md, and DESCRIPTION.md.
+// subdirectory, which holds SYSTEM.md, COMPACT-*.md, DESCRIPTION.md, and
+// SESSION-NAME.md.
 const promptsDir = "prompts"
 
 // promptPath returns the path of the named prompt file in the configuration

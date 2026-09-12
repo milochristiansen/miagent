@@ -66,8 +66,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: miagent \"prompt\"\n"+
 		"The prompt is the raw command line (space-joined); one starting with \"/\"\n"+
 		"is a harness command instead of a prompt (/help, /context, /models, /desc, /compact, /new).\n"+
-		"Prompts: %s/prompts/SYSTEM.md, COMPACT-*.md beside it for /compact, and\n"+
-		"DESCRIPTION.md for /desc.\n"+
+		"Prompts: %s/prompts/SYSTEM.md, COMPACT-*.md beside it for /compact,\n"+
+		"DESCRIPTION.md for /desc, and SESSION-NAME.md for /new.\n"+
 		"Tools: executables in %s/tools, then %s/tools, which overrides it.\n"+
 		"Instructions: AGENTS.md in the working directory, then %s/AGENTS.md, both\n"+
 		"optional, read once at startup like SYSTEM.md, and injected into every\n"+
@@ -161,9 +161,10 @@ func main() {
 	disp := newDisplay()
 
 	// The provider is needed by commands that call the model (/compact
-	// summarizes through it) as well as by the agent loop below, so it is
-	// built before dispatch. Constructing it does no I/O; a command that
-	// actually calls the model declares that with needModel.
+	// summarizes through it and /new names the session through it) as well
+	// as by the agent loop below, so it is built before dispatch.
+	// Constructing it does no I/O; a command that actually calls the model
+	// declares that with needModel.
 	cfg := openai.DefaultConfig(apiKey)
 	if baseURL != "" {
 		cfg.BaseURL = baseURL

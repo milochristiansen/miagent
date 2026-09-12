@@ -19,7 +19,7 @@ const describePromptName = "DESCRIPTION.md"
 // spend it on.
 const describeMaxTokens = 512
 
-// loadDescribePrompt reads DESCRIPTION.md from the prompts subdirectory of the
+// loadDescribePrompt reads the description prompt from the prompts subdirectory of the
 // configuration directory. Like the compaction prompts it is read on demand,
 // when /desc runs, so the wording can change without a restart or a rebuild.
 func loadDescribePrompt() (string, error) {

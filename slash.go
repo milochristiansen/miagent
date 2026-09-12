@@ -15,8 +15,8 @@ import (
 
 // command is one slash command. needModel marks a command that calls the model
 // itself: the harness checks for a configured OPENAI_MODEL before running one.
-// It is not set for commands that only reach the endpoint (/models) or touch
-// nothing beyond the session (/context, /new).
+// It is not set for a command that does not call the model: /models only
+// reaches the endpoint, and /context only reads the session.
 type command struct {
 	name      string // as typed, without the leading slash
 	summary   string // one line, listed when a command is not found
@@ -59,9 +59,10 @@ func commandTable() []command {
 			run:       cmdCompact,
 		},
 		{
-			name:    "new",
-			summary: "archive the session and its compaction archives, then start fresh",
-			run:     cmdNew,
+			name:      "new",
+			summary:   "archive the session and its compaction archives under a generated name, then start fresh",
+			needModel: true,
+			run:       cmdNew,
 		},
 	}
 }

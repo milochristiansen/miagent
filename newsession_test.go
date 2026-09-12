@@ -6,6 +6,8 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -204,6 +206,19 @@ func TestCmdNewEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
+	// The naming prompt and a stub endpoint that returns a fixed name, so
+	// /new stores a session-name.md alongside the packed files.
+	prompts := promptsFixture(t)
+	if err := os.WriteFile(filepath.Join(prompts, sessionNamePromptName), []byte("Name this session.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","role":"assistant",` +
+			`"content":[{"type":"output_text","text":"Adding session naming to /new"}]}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	prov := &provider{client: newTestClient(srv.URL), model: "stub"}
+
 	// A session with a conversation and two compaction archives, one of
 	// them from another session (which must survive).
 	sessionPath := filepath.Join(dir, stateDir, "session.jsonl")
@@ -237,7 +252,7 @@ func TestCmdNewEndToEnd(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := cmdNew(context.Background(), nil, s, newDisplay(), nil); err != nil {
+		if err := cmdNew(context.Background(), prov, s, newDisplay(), nil); err != nil {
 			t.Fatalf("cmdNew: %v", err)
 		}
 	})
@@ -262,13 +277,17 @@ func TestCmdNewEndToEnd(t *testing.T) {
 		t.Fatalf("archives = %v (err %v), want exactly one", archives, err)
 	}
 	got := readTarGz(t, archives[0])
-	if len(got) != len(wantContents) {
-		t.Fatalf("archive holds %d files (%v), want %d", len(got), keys(got), len(wantContents))
+	// The packed files plus the generated session-name.md entry.
+	if len(got) != len(wantContents)+1 {
+		t.Fatalf("archive holds %d files (%v), want %d", len(got), keys(got), len(wantContents)+1)
 	}
 	for name, want := range wantContents {
 		if got[name] != want {
 			t.Fatalf("archive entry %s = %q, want %q", name, got[name], want)
 		}
+	}
+	if got[sessionNameArchiveEntry] != "Adding session naming to /new\n" {
+		t.Fatalf("archive entry %s = %q, want the generated name", sessionNameArchiveEntry, got[sessionNameArchiveEntry])
 	}
 
 	// The session in memory is empty.
@@ -484,7 +503,8 @@ func TestSessionFilesDescribe(t *testing.T) {
 }
 
 // TestCmdNewArchivesOnly covers the state left when a session file is gone but
-// its compaction archives remain: /new still packs what is there.
+// its compaction archives remain: /new still packs what is there. The session
+// has no in-memory prompt to name, so no model call is needed.
 func TestCmdNewArchivesOnly(t *testing.T) {
 	dir := t.TempDir()
 	sessionPath := filepath.Join(dir, "session.jsonl")
