@@ -18,6 +18,16 @@ import (
 // archivePrefix marks an archived session file.
 const archivePrefix = "prepak-"
 
+// newArchivePrefix marks the archive /new writes: a pack of the session file
+// and its compaction archives. The timestamp follows it, so the archives of a
+// directory sort by date.
+const newArchivePrefix = "archive-"
+
+// archiveStampLayout is the timestamp embedded in archive file names: UTC,
+// compact, and sortable. archiveName formats with it, and /sessions parses the
+// same shape back out of a name to date an archive.
+const archiveStampLayout = "20060102T150405Z"
+
 // archiveName returns the archive file name for a session file's base name and
 // timestamp.
 //
@@ -27,7 +37,7 @@ const archivePrefix = "prepak-"
 // session it came from (dotfiles are skipped by ls and by default globs), and
 // the name does not carry a stray "-." in the middle.
 func archiveName(base string, ts time.Time) string {
-	stamp := ts.UTC().Format("20060102T150405Z")
+	stamp := ts.UTC().Format(archiveStampLayout)
 	if rest, ok := strings.CutPrefix(base, "."); ok && rest != "" {
 		return "." + archivePrefix + stamp + "-" + rest
 	}
@@ -205,6 +215,94 @@ func addToArchive(tw *tar.Writer, path string) error {
 	defer f.Close()
 	_, err = io.Copy(tw, f)
 	return err
+}
+
+// readArchive reads a gzip-compressed tar archive into memory, returning its
+// regular files in the order they are stored. A stored name's leading "./" is
+// dropped; otherwise the name comes back as written, and a caller that writes
+// them back is responsible for rejecting names that would escape the
+// destination directory. /new packs only regular files, so any other kind of
+// entry is skipped.
+func readArchive(path string) ([]archiveEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+
+	var entries []archiveEntry
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		// A hand-packed archive may prefix entries with "./" (tar -C dir .);
+		// /new stores bare base names. Normalizing lets both be read, and the
+		// callers that write names back still reject anything that escapes.
+		entries = append(entries, archiveEntry{
+			name:    strings.TrimPrefix(hdr.Name, "./"),
+			content: string(b),
+		})
+	}
+	return entries, nil
+}
+
+// readArchiveEntry returns the content of the named regular entry in a
+// gzip-compressed tar archive, and whether the archive holds it. Entries
+// before the one wanted are streamed past rather than held, so reading a
+// description out of a large archive costs no more memory than the entry
+// itself. A stored name's leading "./" is dropped, as in readArchive.
+func readArchiveEntry(path, name string) (string, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", false, err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		if strings.TrimPrefix(hdr.Name, "./") != name {
+			continue
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			return "", false, err
+		}
+		return string(b), true, nil
+	}
 }
 
 // removeFiles deletes every path, reporting all the failures it hit rather

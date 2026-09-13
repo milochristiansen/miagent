@@ -62,33 +62,10 @@ func fail(format string, err error) {
 }
 
 func usage() {
-	config := displayConfigDir()
-	fmt.Fprintf(os.Stderr, "Usage: miagent \"prompt\"\n"+
-		"The prompt is the raw command line (space-joined); one starting with \"/\"\n"+
-		"is a harness command instead of a prompt (/help, /context, /models, /desc, /compact, /new).\n"+
-		"Prompts: %s/prompts/SYSTEM.md, COMPACT-*.md beside it for /compact,\n"+
-		"DESCRIPTION.md for /desc, and SESSION-NAME.md for /new.\n"+
-		"Tools: executables in %s/tools, then %s/tools, which overrides it.\n"+
-		"Instructions: AGENTS.md in the working directory, then %s/AGENTS.md, both\n"+
-		"optional, read once at startup like SYSTEM.md, and injected into every\n"+
-		"request after it (lower priority; never written to the session).\n"+
-		"Configuration: OPENAI_MODEL (required), OPENAI_API_KEY, OPENAI_BASE_URL,\n"+
-		"OPENAI_REASONING_EFFORT (minimal, low, medium, or high; unset or \"none\"\n"+
-		"keeps the endpoint default), and MIAGENT_SESSION (JSONL session file to\n"+
-		"continue; default %s). /models lists the endpoint's models and their\n"+
-		"reasoning levels, and names the one it is set to.\n"+
-		"Environment files: %s/.env, then %s/.env, which overrides it; an exported\n"+
-		"variable overrides both.\n"+
-		"/context, and the context line printed after a normal run, reads\n"+
-		"MIAGENT_CONTEXT_LIMIT (context window in tokens). /compact reads\n"+
-		"MIAGENT_KEEP_RECENT_TOKENS (recent tokens to keep) and\n"+
-		"MIAGENT_RESERVE_TOKENS (summary budget).\n"+
-		"The prompts live in %s/prompts, and the base tools and core .env in %s, i.e.\n"+
-		"$XDG_CONFIG_HOME/%s (default ~/.config/%s). The copies in this repo's\n"+
-		"prompts/ and tools/ are the source for them: copy what you want into those\n"+
-		"directories to install it.\n",
-		config, config, stateDir, stateDir, defaultSession, config, stateDir,
-		config, config, configName, configName)
+	fmt.Fprintf(os.Stderr, "Usage: miagent prompt...\n"+
+		"The prompt is the raw command line (space-joined)\n"+
+		"If the first prompt character is a \"/\" it is treated as a harness command instead of a prompt.\n"+
+		"Commands: (/help, /context, /models, /desc, /compact, /new, /sessions, /load).\n")
 	os.Exit(2)
 }
 

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -312,8 +313,15 @@ func (s *Session) load() error {
 		return err
 	}
 	defer f.Close()
+	return s.loadFrom(f)
+}
 
-	scanner := bufio.NewScanner(f)
+// loadFrom reads session records from r into s and marks everything read as
+// committed. load uses it on the session file; a command adopting a session
+// file uses it to recognize a bad one before it replaces the current session.
+// A missing file is load's concern, not loadFrom's.
+func (s *Session) loadFrom(r io.Reader) error {
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSessionLineBytes)
 	compaction := false
 	for scanner.Scan() {

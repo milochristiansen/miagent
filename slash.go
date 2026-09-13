@@ -33,7 +33,7 @@ func commandTable() []command {
 	return []command{
 		{
 			name:    "help",
-			summary: "how to prompt the harness and which slash commands exist",
+			summary: "list all slash commands",
 			run:     cmdHelp,
 		},
 		{
@@ -43,7 +43,7 @@ func commandTable() []command {
 		},
 		{
 			name:    "models",
-			summary: "list the endpoint's models and their reasoning levels",
+			summary: "list the endpoint's models and their supported reasoning levels",
 			run:     cmdModels,
 		},
 		{
@@ -63,6 +63,17 @@ func commandTable() []command {
 			summary:   "archive the session and its compaction archives under a generated name, then start fresh",
 			needModel: true,
 			run:       cmdNew,
+		},
+		{
+			name:    "sessions",
+			summary: "list archived sessions by date, with the description each holds",
+			run:     cmdSessions,
+		},
+		{
+			name:      "load",
+			summary:   "archive this session, then replace it with the named archived session",
+			needModel: true,
+			run:       cmdLoad,
 		},
 	}
 }
@@ -92,7 +103,7 @@ func cmdHelp(_ context.Context, _ *provider, _ *Session, d *display, args []stri
 // available commands. The reader is already running it.
 func helpText() string {
 	var b strings.Builder
-	b.WriteString("Simply enter your prompt on the command line raw or quoted. Additionally, some slash (/) commands exist:\n")
+	b.WriteString("Enter your prompt on the command line raw or quoted (all segments are space joined). The following slash (/) commands exist:\n")
 	for _, line := range commandLines() {
 		b.WriteString(line + "\n")
 	}

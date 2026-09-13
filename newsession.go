@@ -64,7 +64,7 @@ func cmdNew(ctx context.Context, prov *provider, sess *Session, d *display, args
 		})
 	}
 
-	stem := "archive-" + time.Now().UTC().Format("20060102T150405Z")
+	stem := newArchivePrefix + time.Now().UTC().Format(archiveStampLayout)
 	target, err := uniquePath(filepath.Dir(sess.path), stem, archiveExt)
 	if err != nil {
 		return err
