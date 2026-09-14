@@ -60,10 +60,19 @@ type LiveBox struct {
 	tail []codeSeg
 
 	// Windowed mode (Limit > 0). out holds the completed streamed rows, oldest
-	// first, at most Limit of them; drawn is how many output rows are
-	// currently on screen. Both are guarded by mu.
+	// first, at most Limit of them; drawn is how many physical rows the window
+	// (including its live header, when set) currently occupies on screen; and
+	// total is how many such rows have ever been added, so the window can
+	// report how many fell off its top. All are guarded by mu.
 	out   [][]codeSeg
 	drawn int
+	total int
+
+	// headerLabel is the live output header's label and headerSet reports
+	// whether OutputHeader has drawn it. The header is part of the redrawn
+	// window so its elided note can change as rows scroll away.
+	headerLabel string
+	headerSet   bool
 
 	// inputs counts the argument rows Row has committed, for the input cap.
 	inputs int
@@ -102,15 +111,63 @@ func limitRows(limit, height int) int {
 	return limit
 }
 
-// Header draws a full-width border row embedding label. It is static: written
-// once and never redrawn.
-func (b *LiveBox) Header(label string) {
+// Header draws a static full-width border row embedding label. An optional
+// elided count is inset at the right, which is where the arguments section
+// notes the rows a capped argument list dropped.
+func (b *LiveBox) Header(label string, elided ...int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.open {
 		return
 	}
-	boxBorder(b.w, b.style, b.W, label)
+	n := 0
+	if len(elided) > 0 {
+		n = elided[0]
+	}
+	boxBorder(b.w, b.style, b.W, label, elidedNote(n))
+}
+
+// OutputHeader draws the border separating the static rows from the streamed
+// output. When the box is capped, that border becomes the top of the redrawn
+// window so it can report the output rows that scrolled out of view; without a
+// cap it is an ordinary header, since nothing is ever elided. It must be the
+// last static element: all Out/Err content follows it.
+func (b *LiveBox) OutputHeader(label string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.open {
+		return
+	}
+	if b.Limit <= 0 {
+		boxBorder(b.w, b.style, b.W, label)
+		return
+	}
+	b.headerLabel = label
+	b.headerSet = true
+	// Draw the header live (no newline): the window owns this row from here and
+	// repaints it with its elided note on every update.
+	segs := b.headerRow("")
+	b.writeSegs(b.w, segs)
+	b.drawn = b.physicalHeight([][]codeSeg{segs})
+}
+
+// headerRow is the live output header rendered as a styled row for the window.
+// Called with b.mu held.
+func (b *LiveBox) headerRow(note string) []codeSeg {
+	return []codeSeg{{"", codeHeaderNote(b.headerLabel, note, b.W)}}
+}
+
+// elidedNote renders the right-side count of rows that scrolled out of view.
+// Zero elided is no note at all, so a box that never scrolled stays clean.
+func elidedNote(n int) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n == 1:
+		return "1 Line Elided"
+	default:
+		return itoa(n) + " Lines Elided"
+	}
 }
 
 // Row commits one content row in the code-block color (used for static
@@ -269,25 +326,28 @@ func (b *LiveBox) appendWindowed(color string, p []byte) {
 // addOut appends one completed output row, dropping the oldest once the window
 // is full. Called with b.mu held.
 func (b *LiveBox) addOut(segs []codeSeg) {
+	b.total++
 	b.out = append(b.out, segs)
 	if len(b.out) > b.Limit {
 		b.out = b.out[len(b.out)-b.Limit:]
 	}
 }
 
-// window returns the rows the output window currently shows: the most recent
-// completed rows, with the tail, when present, as the final row. At most
-// b.Limit logical rows are returned, and, when the terminal height is known,
-// no more physical rows than fit the screen: a long line that soft-wraps into
-// several rows is trimmed from the top like any other. Called with b.mu held.
-func (b *LiveBox) window() [][]codeSeg {
+// window returns the rows the output window currently shows and how many
+// completed rows have scrolled off its top. The rows are the most recent
+// completed rows, with the tail, when present, as the final row: at most
+// b.Limit logical rows, and, when the terminal height is known, no more
+// physical rows than fit alongside the live header. A long line that
+// soft-wraps into several rows is trimmed from the top like any other, and
+// counts as elided. Called with b.mu held.
+func (b *LiveBox) window() ([][]codeSeg, int) {
 	var rows [][]codeSeg
+	start := 0
 	if len(b.tail) == 0 {
 		rows = b.out
 	} else {
 		// Keep one slot for the partial row.
 		maxCompleted := b.Limit - 1
-		start := 0
 		if len(b.out) > maxCompleted {
 			start = len(b.out) - maxCompleted
 		}
@@ -298,13 +358,28 @@ func (b *LiveBox) window() [][]codeSeg {
 
 	// Wrapped rows count for more than one terminal row. Drop the oldest until
 	// the window fits; always keep the newest row, even if it alone is taller
-	// than the screen (there is nothing useful to show otherwise).
+	// than the screen (there is nothing useful to show otherwise). A live
+	// header keeps a row of its own.
 	if b.height > 0 {
-		for len(rows) > 1 && b.physicalHeight(rows) > b.height {
+		maxRows := b.height
+		if b.headerSet {
+			maxRows--
+		}
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		for len(rows) > 1 && b.physicalHeight(rows) > maxRows {
 			rows = rows[1:]
+			start++
 		}
 	}
-	return rows
+
+	// A partial tail is not a line and never counts as elided.
+	elided := b.total - len(b.out) + start
+	if elided < 0 {
+		elided = 0
+	}
+	return rows, elided
 }
 
 // redraw repaints the output window in place. The cursor is assumed to be at
@@ -317,7 +392,15 @@ func (b *LiveBox) window() [][]codeSeg {
 // the screen cannot be redrawn in place. b.drawn records the physical height
 // of the last paint, so the cursor can be returned to the window's first row.
 func (b *LiveBox) redraw() {
-	rows := b.window()
+	rows, elided := b.window()
+	region := rows
+	if b.headerSet {
+		// The live header is the window's first row, so its note is repainted
+		// with everything below it.
+		region = make([][]codeSeg, 0, len(rows)+1)
+		region = append(region, b.headerRow(elidedNote(elided)))
+		region = append(region, rows...)
+	}
 
 	// Back up to the window's first physical row and erase everything below
 	// it, so a shorter repaint cannot leave stale cells on screen.
@@ -329,7 +412,7 @@ func (b *LiveBox) redraw() {
 	}
 	io.WriteString(b.w, "\x1b[J")
 
-	for i, segs := range rows {
+	for i, segs := range region {
 		if i > 0 {
 			// \r cancels a pending autowrap, \n drops to the next row: the
 			// pair always separates the previous logical row cleanly, wrapped
@@ -338,7 +421,7 @@ func (b *LiveBox) redraw() {
 		}
 		b.writeSegs(b.w, segs)
 	}
-	b.drawn = b.physicalHeight(rows)
+	b.drawn = b.physicalHeight(region)
 }
 
 // physicalHeight returns the number of terminal rows the window occupies at

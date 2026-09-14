@@ -171,7 +171,7 @@ func TestLiveBoxWindowedShowsLastRows(t *testing.T) {
 	var out strings.Builder
 	b := NewLiveBox(&out, 3)
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	for _, l := range []string{"one\n", "two\n", "three\n", "four\n", "five\n"} {
 		if _, err := b.Out().Write([]byte(l)); err != nil {
 			t.Fatal(err)
@@ -195,7 +195,7 @@ func TestLiveBoxWindowedTail(t *testing.T) {
 	var out strings.Builder
 	b := NewLiveBox(&out, 2)
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	for _, p := range []string{"a\n", "b\n", "c", "d"} {
 		if _, err := b.Out().Write([]byte(p)); err != nil {
 			t.Fatal(err)
@@ -215,7 +215,7 @@ func TestLiveBoxWindowedStderrInterleaves(t *testing.T) {
 	var out strings.Builder
 	b := NewLiveBox(&out, 3)
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	b.Out().Write([]byte("out one\n"))
 	b.Err().Write([]byte("err one\n"))
 	b.Out().Write([]byte("out two\n"))
@@ -238,7 +238,7 @@ func TestLiveBoxInputCap(t *testing.T) {
 	b.Row("a")
 	b.Row("b")
 	b.Row("c") // over the cap
-	b.Header("output")
+	b.OutputHeader("output")
 	b.End(0)
 
 	rows := screenRows(out.String())
@@ -253,7 +253,7 @@ func TestLiveBoxUnlimitedShowsAll(t *testing.T) {
 	var out strings.Builder
 	b := NewLiveBox(&out)
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	for _, l := range []string{"one\n", "two\n", "three\n", "four\n", "five\n"} {
 		b.Out().Write([]byte(l))
 	}
@@ -285,7 +285,7 @@ func TestLiveBoxWindowedConcurrentWrites(t *testing.T) {
 	var out strings.Builder
 	b := NewLiveBox(&out, 4)
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 
 	done := make(chan struct{})
 	go func() {
@@ -314,7 +314,7 @@ func TestLiveBoxWindowedWraps(t *testing.T) {
 	b := NewLiveBox(&out, 5)
 	b.W = 10
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	b.Out().Write([]byte("0123456789abcdef\nshort\n"))
 	b.End(0)
 
@@ -335,7 +335,7 @@ func TestLiveBoxWindowedFitsWrappedScreen(t *testing.T) {
 	b.height = 3
 
 	b.Header("tool")
-	b.Header("output")
+	b.OutputHeader("output")
 	for i := 0; i < 6; i++ {
 		fmt.Fprintf(b.Out(), "line-%02d-abcdefghij\n", i)
 	}
@@ -347,5 +347,81 @@ func TestLiveBoxWindowedFitsWrappedScreen(t *testing.T) {
 	rows := screenRowsWidth(out.String(), 10)
 	if content := contentRowsOf(rows); len(content) > 3 {
 		t.Fatalf("screen shows %d content rows, want at most 3:\n%s", len(content), strings.Join(rows, "\n"))
+	}
+}
+
+// TestElidedNote covers the header note's wording: nothing elided is no note,
+// and a count is singular or plural as appropriate.
+func TestElidedNote(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{-1, ""},
+		{0, ""},
+		{1, "1 Line Elided"},
+		{2, "2 Lines Elided"},
+		{15, "15 Lines Elided"},
+	}
+	for _, tc := range cases {
+		if got := elidedNote(tc.n); got != tc.want {
+			t.Errorf("elidedNote(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestCodeHeaderNote covers the right-inset note fitting the border width and
+// degrading to the plain header when there is no room for it.
+func TestCodeHeaderNote(t *testing.T) {
+	got := codeHeaderNote("output", "3 Lines Elided", 40)
+	if w := displayWidth(got); w != 40 {
+		t.Errorf("header width = %d, want 40 (%q)", w, got)
+	}
+	if !strings.Contains(got, "output") || !strings.Contains(got, "3 Lines Elided") {
+		t.Errorf("header = %q, want both the label and the note", got)
+	}
+	if got := codeHeaderNote("output", "3 Lines Elided", 5); strings.Contains(got, "3 Lines Elided") {
+		t.Errorf("narrow header = %q, want the note dropped", got)
+	}
+}
+
+// TestLiveBoxOutputHeaderElidedNote covers the live output header reporting
+// the completed rows that scrolled out of its window.
+func TestLiveBoxOutputHeaderElidedNote(t *testing.T) {
+	var out strings.Builder
+	b := NewLiveBox(&out, 2)
+	b.Header("tool")
+	b.OutputHeader("output")
+	for i := 1; i <= 5; i++ {
+		fmt.Fprintf(b.Out(), "line %d\n", i)
+	}
+	b.End(0)
+
+	rows := screenRows(out.String())
+	header := ""
+	for _, r := range rows {
+		if strings.Contains(r, "output") {
+			header = r
+		}
+	}
+	if !strings.Contains(header, "3 Lines Elided") {
+		t.Fatalf("output header = %q, want it to report 3 Lines Elided:\n%s", header, strings.Join(rows, "\n"))
+	}
+	if got := contentRowsOf(rows); !equalStrings(got, []string{"line 4", "line 5"}) {
+		t.Fatalf("window = %q, want [line 4 line 5]", got)
+	}
+}
+
+// TestLiveBoxInputHeaderNote covers a static header carrying an elided count,
+// which is how the arguments section reports a truncated call.
+func TestLiveBoxInputHeaderNote(t *testing.T) {
+	var out strings.Builder
+	b := NewLiveBox(&out)
+	b.Header("tool", 4)
+	b.OutputHeader("output")
+	b.End(0)
+
+	if !strings.Contains(out.String(), "4 Lines Elided") {
+		t.Fatalf("header = %q, want a 4 Lines Elided note", out.String())
 	}
 }

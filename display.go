@@ -269,14 +269,15 @@ func (d *display) toolStart(name, args string) {
 
 	if d.renderable() {
 		d.box = termark.NewLiveBox(os.Stdout, d.toolSize)
-		d.box.Header("tool: " + name)
-		// The box caps the arguments at the same amount as the output. The
-		// note for a truncated call is added here because only the display
-		// knows how many argument lines there are in total.
-		for _, l := range toolcallInputLines(args, d.box.Limit) {
+		// The box caps the arguments at the same amount as the output. Only the
+		// display knows how many argument lines there are in total, so it puts
+		// the dropped count on the header before adding the rows that are kept.
+		input, elided := toolcallInputLines(args, d.box.Limit)
+		d.box.Header("tool: "+name, elided)
+		for _, l := range input {
 			d.box.Row(l)
 		}
-		d.box.Header("output")
+		d.box.OutputHeader("output")
 		return
 	}
 

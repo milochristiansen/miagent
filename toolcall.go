@@ -46,20 +46,14 @@ func toolcallSizeFromEnv() (int, error) {
 	return n, nil
 }
 
-// toolcallInputLines returns the argument rows a tool box shows: the
-// pretty-printed arguments, capped to limit rows (0 means all). When rows are
-// dropped the last row is a "… (N more lines)" note, so the reader can tell the
-// call was truncated; the note replaces the last content row rather than adding
-// one, which keeps the returned window at exactly limit rows.
-func toolcallInputLines(args string, limit int) []string {
-	lines := splitContent(args)
+// toolcallInputLines returns the argument rows a tool box shows and how many
+// were dropped: the pretty-printed arguments, capped to limit rows (0 means
+// all). The caller puts the dropped count on the header, so a truncated call
+// is reported without spending a content row on the note.
+func toolcallInputLines(args string, limit int) (lines []string, elided int) {
+	lines = splitContent(args)
 	if limit <= 0 || len(lines) <= limit {
-		return lines
+		return lines, 0
 	}
-	if limit == 1 {
-		// No room for both a line and a note: the first line is the most use.
-		return lines[:1]
-	}
-	note := fmt.Sprintf("… (%d more lines)", len(lines)-(limit-1))
-	return append(lines[:limit-1:limit-1], note)
+	return lines[:limit], len(lines) - limit
 }

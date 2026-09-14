@@ -37,17 +37,42 @@ func boxHeight(w io.Writer) int {
 
 // boxBorder writes a full-width border row in the code-block foreground and
 // background, embedding the label ("─ label ───…"; an empty label is a bare
-// rule).
-func boxBorder(w io.Writer, style Style, W int, label string) {
+// rule). An optional note is inset at the right end of the rule, which is
+// where the box reports how many rows it has elided.
+func boxBorder(w io.Writer, style Style, W int, label string, note ...string) {
+	n := ""
+	if len(note) > 0 {
+		n = note[0]
+	}
 	if bg := style.CodeBlockBG; bg != "" {
 		io.WriteString(w, bgSGR(bg))
 	}
 	if fg := style.CodeBlockColor; fg != "" {
 		io.WriteString(w, fgSGR(fg))
 	}
-	io.WriteString(w, codeHeader(label, W))
+	io.WriteString(w, codeHeaderNote(label, n, W))
 	io.WriteString(w, resetSGR)
 	io.WriteString(w, "\n")
+}
+
+// codeHeaderNote builds a header border with a label on the left and a note
+// inset at the right end: "─ label ───── note ─". It falls back to the plain
+// label border when there is not room for both, so a long label or a long note
+// degrades instead of overflowing.
+func codeHeaderNote(label, note string, width int) string {
+	if note == "" {
+		return codeHeader(label, width)
+	}
+	left := ""
+	if label != "" {
+		left = "─ " + label + " "
+	}
+	right := " " + note + " ─"
+	lw, rw := displayWidth(left), displayWidth(right)
+	if lw+rw > width {
+		return codeHeader(label, width)
+	}
+	return left + strings.Repeat("─", width-lw-rw) + right
 }
 
 // tabStop is the interval between tab stops: a tab advances to the next

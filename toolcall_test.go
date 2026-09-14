@@ -44,28 +44,29 @@ func TestToolcallSizeFromEnv(t *testing.T) {
 }
 
 // TestToolcallInputLines covers the argument window: at most limit rows, with
-// a note replacing the last row when rows are dropped so the reader can tell
-// the call was truncated.
+// the number dropped returned so the caller can report it on the header.
 func TestToolcallInputLines(t *testing.T) {
 	cases := []struct {
-		name  string
-		args  string
-		limit int
-		want  []string
+		name       string
+		args       string
+		limit      int
+		want       []string
+		wantElided int
 	}{
-		{"empty", "", 3, nil},
-		{"unlimited", "a\nb\nc\nd", 0, []string{"a", "b", "c", "d"}},
-		{"fits", "a\nb", 3, []string{"a", "b"}},
-		{"exact", "a\nb", 2, []string{"a", "b"}},
-		{"truncated", "a\nb\nc\nd\ne", 3, []string{"a", "b", "… (3 more lines)"}},
-		{"single row", "a\nb\nc", 1, []string{"a"}},
-		{"trailing newline dropped", "a\n", 3, []string{"a"}},
+		{"empty", "", 3, nil, 0},
+		{"unlimited", "a\nb\nc\nd", 0, []string{"a", "b", "c", "d"}, 0},
+		{"fits", "a\nb", 3, []string{"a", "b"}, 0},
+		{"exact", "a\nb", 2, []string{"a", "b"}, 0},
+		{"truncated", "a\nb\nc\nd\ne", 3, []string{"a", "b", "c"}, 2},
+		{"single row", "a\nb\nc", 1, []string{"a"}, 2},
+		{"trailing newline dropped", "a\n", 3, []string{"a"}, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toolcallInputLines(tc.args, tc.limit)
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("toolcallInputLines(%q, %d) = %q, want %q", tc.args, tc.limit, got, tc.want)
+			got, elided := toolcallInputLines(tc.args, tc.limit)
+			if !reflect.DeepEqual(got, tc.want) || elided != tc.wantElided {
+				t.Fatalf("toolcallInputLines(%q, %d) = %q, %d, want %q, %d",
+					tc.args, tc.limit, got, elided, tc.want, tc.wantElided)
 			}
 		})
 	}
