@@ -16,7 +16,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-// reasoningEffortEnv names the environment variable that sets the effort.
+// reasoningEffortEnv names the environment variable that sets the effort for agent turns.
 const reasoningEffortEnv = "OPENAI_REASONING_EFFORT"
 
 // reasoningEfforts are the values the OpenAI Responses API documents, weakest

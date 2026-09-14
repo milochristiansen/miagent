@@ -437,15 +437,14 @@ func compactSettingsFromEnv() (compactSettings, error) {
 // conversation is presented inside the prompt as text, with the system prompt
 // telling the model to summarize rather than continue it.
 //
-// The configured reasoning effort is deliberately not sent: reasoning tokens
-// count against MaxOutputTokens, so a high effort could spend the summary's
-// whole budget thinking and return no text. Summarization does not need it.
+// Reasoning is explicitly disabled.
 func (p *provider) summarize(ctx context.Context, system, prompt string, maxTokens int) (string, Usage, error) {
 	resp, err := p.client.CreateResponse(ctx, openai.CreateResponseRequest{
 		Model:           p.model,
 		Instructions:    system,
 		Input:           []any{promptMessage("user", "input_text", prompt)},
 		MaxOutputTokens: maxTokens,
+		Reasoning:       &openai.ResponseReasoning{Effort: "none"},
 	})
 	if err != nil {
 		return "", Usage{}, err
