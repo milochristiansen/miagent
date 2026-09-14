@@ -80,8 +80,13 @@ Standard out and error will not be interleaved. The data the model receives will
 
 For obvious reasons, keep your writing under control. You don't want to balloon context for no reason.
 
-The tool call with not finish until the tool itself exits, and the output pipes are closed. If long running children
+The tool call will not finish until the tool itself exits, and the output pipes are closed. If long running children
 are spawned that retain either of the output pipes, they could cause the tool call to hang.
+
+To keep a hung tool from hanging the harness, every call is bounded by a five-minute limit, applied fresh to each
+call: a tool invoked twice in one turn gets the full five minutes both times. When a call reaches the limit it is
+stopped exactly as if an interrupt had arrived. The result's stderr gets a note that the call timed out, and its exit
+code is reported as non-zero.
 
 If the harness receives an exit flavored signal while a tool is running (`SIGINT` or `SIGTERM`) it will send `SIGTERM`
 to the tool, wait up to 5 seconds for it to exit, and then sends `SIGKILL` and closes the pipes. For a good user

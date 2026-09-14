@@ -24,11 +24,36 @@ type TGIResult struct {
 	Err    error  `json:"call_err,omitzero"`
 }
 
+// toolCallTimeout bounds a single TGI tool call. It is applied fresh to every
+// call, so a tool invoked twice in one turn gets the full limit both times. A
+// call that reaches it is stopped the same way an interrupt stops one (see
+// terminateTool) and the timeout is reported in the result.
+const toolCallTimeout = 5 * time.Minute
+
 // RunTGITool runs the given binary as a TGI tool and returns the result.
 // teeOut and teeErr, when non-nil, additionally receive the tool's stdout
 // and stderr live as it runs (used to stream output into the display's open
 // tool box); they may be written from concurrent goroutines.
+//
+// The call is bounded by toolCallTimeout, fresh for each call, so a tool that
+// hangs cannot hang the harness.
 func RunTGITool(ctx context.Context, name, toolPath, method string, input io.Reader, teeOut, teeErr io.Writer) TGIResult {
+	return runTGITool(ctx, toolCallTimeout, name, toolPath, method, input, teeOut, teeErr)
+}
+
+// runTGITool is RunTGITool with an explicit per-call limit, so tests can
+// exercise the timeout without waiting out the real one. A limit of zero
+// applies no timeout.
+func runTGITool(ctx context.Context, limit time.Duration, name, toolPath, method string, input io.Reader, teeOut, teeErr io.Writer) TGIResult {
+	if limit > 0 {
+		// Layer the limit on the caller's context rather than replacing it:
+		// a call ends on whichever comes first — the tool finishing, an
+		// interrupt, or the limit expiring.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
+	}
+
 	cmd := exec.Command(toolPath)
 
 	cmd.Env = append(os.Environ(), []string{
@@ -78,8 +103,11 @@ func RunTGITool(ctx context.Context, name, toolPath, method string, input io.Rea
 		_, _ = io.Copy(errTarget, stderr)
 	}()
 
-	// Listen for shutdown command.
+	// Listen for a shutdown command or the per-call limit.
+	var listener sync.WaitGroup
+	listener.Add(1)
 	go func() {
+		defer listener.Done()
 		select {
 		case <-ctx.Done():
 			terminateTool(cmd.Process, done, toolStopGrace, stdout, stderr)
@@ -93,11 +121,33 @@ func RunTGITool(ctx context.Context, name, toolPath, method string, input io.Rea
 	// Close out the command (also break down the shutdown listener)
 	_ = cmd.Wait()
 	close(done)
+	listener.Wait()
 
+	// A deadline means the per-call limit was what ended the call; an
+	// interrupt cancels the derived context too, but with context.Canceled.
+	// Say which it was where the display and the model will both see it, and
+	// force the "didn't exit on its own" code even if the tool handled the
+	// stop signal and exited zero.
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if timedOut {
+		note := fmt.Sprintf("tool call timed out after %s\n", limit)
+		if errBuf.Len() > 0 && !bytes.HasSuffix(errBuf.Bytes(), []byte("\n")) {
+			errBuf.WriteByte('\n')
+		}
+		errBuf.WriteString(note)
+		if teeErr != nil {
+			_, _ = io.WriteString(teeErr, note)
+		}
+	}
+
+	code := cmd.ProcessState.ExitCode()
+	if timedOut {
+		code = -1
+	}
 	return TGIResult{
 		Stdout: outBuf.String(),
 		Stderr: errBuf.String(),
-		Code:   cmd.ProcessState.ExitCode(),
+		Code:   code,
 	}
 }
 

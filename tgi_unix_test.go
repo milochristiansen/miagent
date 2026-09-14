@@ -196,3 +196,63 @@ func TestTerminateToolClosesPipesAfterKill(t *testing.T) {
 	}
 	_ = cmd.Wait()
 }
+
+// TestRunTGIToolTimesOut covers the per-call limit: a tool that runs past the
+// limit is stopped rather than hanging the harness, and the result says why
+// even though the tool handled the stop signal and exited zero.
+func TestRunTGIToolTimesOut(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	tool := filepath.Join(dir, "hang")
+	script := fmt.Sprintf("#!/bin/sh\ntrap 'exit 0' TERM\n: > %q\nwhile :; do sleep 0.05; done\n", ready)
+	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var tee strings.Builder
+	ch := make(chan TGIResult, 1)
+	start := time.Now()
+	go func() {
+		ch <- runTGITool(context.Background(), 200*time.Millisecond, "hang", tool, "INVOKE", nil, nil, &tee)
+	}()
+	waitForFile(t, ready) // the trap is installed and the loop is running
+
+	select {
+	case r := <-ch:
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("the tool was stopped after %v, want its limit enforced promptly", elapsed)
+		}
+		if r.Err != nil {
+			t.Fatalf("running the tool: %v", r.Err)
+		}
+		if r.Code != -1 {
+			t.Fatalf("exit code = %d, want -1 after a timeout", r.Code)
+		}
+		if !strings.Contains(r.Stderr, "timed out") {
+			t.Fatalf("stderr = %q, want a timeout note", r.Stderr)
+		}
+		if !strings.Contains(tee.String(), "timed out") {
+			t.Fatalf("live stderr = %q, want the timeout note streamed to the display", tee.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool was not stopped by its limit")
+	}
+}
+
+// TestRunTGIToolTimeoutIsPerCall covers "fresh for each call": two calls that
+// together outlast the limit both succeed when neither alone reaches it.
+func TestRunTGIToolTimeoutIsPerCall(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "nap")
+	script := "#!/bin/sh\nsleep 0.25\nprintf done\n"
+	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		r := runTGITool(context.Background(), 400*time.Millisecond, "nap", tool, "INVOKE", nil, nil, nil)
+		if r.Err != nil || r.Code != 0 || r.Stdout != "done" {
+			t.Fatalf("call %d = %+v, want a clean run", i, r)
+		}
+	}
+}
