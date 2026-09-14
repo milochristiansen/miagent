@@ -137,8 +137,12 @@ func main() {
 	}
 
 	// The session's screen: termark renderers on a terminal, plain text
-	// otherwise (see display.go).
+	// otherwise (see display.go). A malformed tool-call display size is
+	// reported now, before any output, rather than partway through a run.
 	disp := newDisplay()
+	if disp.toolSizeErr != nil {
+		fail("loading configuration", disp.toolSizeErr)
+	}
 
 	// The provider is needed by commands that call the model (/compact
 	// summarizes through it and /new names the session through it) as well

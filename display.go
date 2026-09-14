@@ -48,9 +48,28 @@ type display struct {
 
 	box    *termark.LiveBox // open tool box (render mode)
 	rawTee *rawTee          // open tool box (raw mode)
+
+	// toolSize is MIAGENT_TOOLCALL_SIZE: the number of rows each tool box
+	// section may show, 0 for all. toolSizeErr records a malformed value so main
+	// can report it before the run starts (see newDisplay).
+	toolSize    int
+	toolSizeErr error
 }
 
-func newDisplay() *display { return &display{} }
+// newDisplay builds the session's screen and reads the tool-call display
+// configuration. A malformed MIAGENT_TOOLCALL_SIZE is kept on the display
+// rather than reported here, because the display is built before the run is
+// configured; main fails on it before anything is drawn.
+func newDisplay() *display {
+	d := &display{toolSize: defaultToolcallSize}
+	size, err := toolcallSizeFromEnv()
+	if err != nil {
+		d.toolSizeErr = err
+		return d
+	}
+	d.toolSize = size
+	return d
+}
 
 // renderable reports whether termark renderers can be used, probing once if
 // stdout turns out to be a terminal after all (e.g. the first content of a
@@ -249,9 +268,12 @@ func (d *display) toolStart(name, args string) {
 	}
 
 	if d.renderable() {
-		d.box = termark.NewLiveBox(os.Stdout)
+		d.box = termark.NewLiveBox(os.Stdout, d.toolSize)
 		d.box.Header("tool: " + name)
-		for _, l := range splitContent(args) {
+		// The box caps the arguments at the same amount as the output. The
+		// note for a truncated call is added here because only the display
+		// knows how many argument lines there are in total.
+		for _, l := range toolcallInputLines(args, d.box.Limit) {
 			d.box.Row(l)
 		}
 		d.box.Header("output")

@@ -21,6 +21,20 @@ func boxWidth(w io.Writer) int {
 	return 80
 }
 
+// boxHeight returns the terminal height for box borders, or 0 when w is not a
+// terminal (or its size is unknown). A 0 means the height is unknown, so no
+// screen-height cap is applied.
+func boxHeight(w io.Writer) int {
+	if f, ok := w.(*os.File); ok {
+		if term.IsTerminal(int(f.Fd())) {
+			if _, H, err := term.GetSize(int(f.Fd())); err == nil && H > 0 {
+				return H
+			}
+		}
+	}
+	return 0
+}
+
 // boxBorder writes a full-width border row in the code-block foreground and
 // background, embedding the label ("─ label ───…"; an empty label is a bare
 // rule).
