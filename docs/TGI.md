@@ -7,6 +7,20 @@ takes results on standard output and standard error in whatever format the tool 
 variables are used to pass some other useful information that the call will need.
 
 
+## Tool environment:
+
+Alongside the process environment it inherits, every tool is run with:
+
+* **`TGI_VERSION`** — the protocol version, currently `1`.
+* **`TGI_METHOD`** — `SCHEMA` during discovery, `INVOKE` during a call.
+* **`TGI_TOOL`** — during discovery the tool file's name, during a call the name
+  the tool declared in its schema.
+* **`MIAGENT_CONFIG_DIR`** — the resolved configuration directory (see below).
+  It is always set, whether it was configured or defaulted, so a tool can find
+  the installed prompts, tools, and `.env` without repeating the XDG
+  resolution.
+
+
 ## Tool Discovery:
 
 When MiAgent starts up, all tools are run with `TGI_METHOD` set to `SCHEMA`, `TGI_TOOL` set to the file name, and no
@@ -28,7 +42,8 @@ If the tool exits with a non-zero code or a `name` is not provided, a warning wi
 
 Tools are loaded from the following directories in lexical order.
 
-1. `$XDG_CONFIG_HOME/miagent/tools` — the installed base set (`~/.config/miagent/tools` by default).
+1. `$MIAGENT_CONFIG_DIR/tools` — the installed base set (`$XDG_CONFIG_HOME/miagent/tools`, or
+   `~/.config/miagent/tools`, by default).
 2. `<working-directory>/.miagent/tools` — the project-local set.
 
 If multiple tools use the same name, the last loaded tool wins.
@@ -70,7 +85,7 @@ experience, you should close gracefully as soon as you possibly can when getting
 
 ## Installing Tools:
 
-Generally it is recommended to install tools globally in `$XDG_CONFIG_HOME/miagent/tools`, however when installing from
+Generally it is recommended to install tools globally in `$MIAGENT_CONFIG_DIR/tools`, however when installing from
 an agent where this path is not writeable tools should be installed to the local tools directory at `./.miagent/tools`
 
 

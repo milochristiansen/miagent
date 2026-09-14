@@ -65,7 +65,9 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage: miagent prompt...\n"+
 		"The prompt is the raw command line (space-joined)\n"+
 		"If the first prompt character is a \"/\" it is treated as a harness command instead of a prompt.\n"+
-		"Commands: (/help, /context, /models, /desc, /compact, /new, /sessions, /load).\n")
+		"Commands: (/help, /context, /models, /desc, /compact, /new, /sessions, /load).\n"+
+		"Configuration is read from MIAGENT_CONFIG_DIR when set, otherwise\n"+
+		"$XDG_CONFIG_HOME/miagent (~/.config/miagent by default).\n")
 	os.Exit(2)
 }
 
@@ -88,10 +90,11 @@ func main() {
 		cancel()
 	}()
 
-	// Load the environment: the core .env in the configuration directory,
-	// then the state directory's .env, which overrides it (see loadEnv).
-	if err := loadEnv(stateDir); err != nil {
-		fail("loading environment", err)
+	// Configure the run: the local .env first (it may point
+	// MIAGENT_CONFIG_DIR at another installation), then the resolved
+	// configuration directory, then the core .env (see loadConfig).
+	if err := loadConfig(stateDir); err != nil {
+		fail("loading configuration", err)
 	}
 
 	apiKey := os.Getenv("OPENAI_API_KEY")

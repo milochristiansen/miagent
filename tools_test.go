@@ -160,6 +160,27 @@ func TestToolsDirs(t *testing.T) {
 	}
 }
 
+// TestRunTGIToolPassesConfigDir covers the canonical path reaching tools: a
+// tool inherits the harness environment, so MIAGENT_CONFIG_DIR is available
+// without the tool repeating the XDG resolution.
+func TestRunTGIToolPassesConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "printconfig")
+	script := "#!/bin/sh\nprintf '%s' \"$MIAGENT_CONFIG_DIR\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(configDirEnv, "/some/canonical/config")
+
+	r := RunTGITool(context.Background(), "printconfig", path, "INVOKE", nil, nil, nil)
+	if r.Err != nil {
+		t.Fatalf("RunTGITool: %v", r.Err)
+	}
+	if r.Code != 0 || r.Stdout != "/some/canonical/config" {
+		t.Fatalf("stdout = %q, code = %d; want the config dir", r.Stdout, r.Code)
+	}
+}
+
 // toolName reads a Responses tool's name back out of its parameters, which is
 // where the SDK's inline function representation carries it.
 func toolName(t openai.ResponseTool) string {

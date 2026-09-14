@@ -10,7 +10,7 @@ import (
 // and none of the suggestion to run /help that the guidance itself came from.
 func TestHelpText(t *testing.T) {
 	text := helpText()
-	if !strings.Contains(text, "Simply enter your prompt on the command line raw or quoted.") {
+	if !strings.Contains(text, "Enter your prompt on the command line raw or quoted (all segments are space joined).") {
 		t.Fatalf("helpText() = %q, want the prompt guidance", text)
 	}
 	for _, suggestion := range []string{"run `miagent /help`", "run miagent /help", "run /help"} {

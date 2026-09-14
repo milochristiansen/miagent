@@ -15,15 +15,18 @@ short, the quality is... Variable, but stuff seems to work mostly. Have fun, but
 
 ## Configuration directory
 
-MiAgent reads its prompts, tools, and core environment file from a user-level configuration directory:
-`$XDG_CONFIG_HOME/miagent`, or `~/.config/miagent` when `XDG_CONFIG_HOME` is unset.
+MiAgent reads its prompts, tools, and core environment file from a user-level configuration directory. By default it
+is `$XDG_CONFIG_HOME/miagent`, or `~/.config/miagent` when `XDG_CONFIG_HOME` is unset. Set `MIAGENT_CONFIG_DIR` (in
+the environment or in a project's `.miagent/.env`) to use a different directory instead. The resolved path is exported
+to every tool the harness runs as `MIAGENT_CONFIG_DIR`, so a tool can find the installation without repeating the XDG
+resolution.
 
 To successfully run this agent, you need to create that directory, and copy, minimum, the `tools`, `docs`, and `prompts`
 directories from this repository. It is suggested that you also copy the `.env.example` file, rename it to `.env`, and
 edit it to taste. Make sure to set the model provider information!
 
 ```sh
-config="${XDG_CONFIG_HOME:-$HOME/.config}/miagent"
+config="${MIAGENT_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/miagent}"
 mkdir -p "$config/prompts" "$config/tools" "$config/docs"
 
 cp prompts/* "$config/prompts/" # agent prompts

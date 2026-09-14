@@ -9,4 +9,4 @@ flag such as `--help`, `-h`, etc), instruct them to "Simply enter your prompt on
 additionally some slash (`/`) commands exist, run `miagent /help` to see them."
 
 If the user wants you to write a tool for this agent, there is documentation for how to do so in
-`$XDG_CONFIG_HOME/miagent/docs/TGI.md`
+`$MIAGENT_CONFIG_DIR/docs/TGI.md`

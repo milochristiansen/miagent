@@ -744,6 +744,9 @@ func configFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", root)
+	// An ambient MIAGENT_CONFIG_DIR would shadow the fixture; clear it so the
+	// directory under test is the one resolved from XDG_CONFIG_HOME.
+	t.Setenv(configDirEnv, "")
 	dir := filepath.Join(root, configName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
