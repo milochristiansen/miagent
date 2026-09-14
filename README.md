@@ -34,12 +34,3 @@ cp tools/* "$config/tools/"     # executable tools
 cp docs/* "$config/docs/"       # agent documentation
 cp .env.example "$config/.env"  # endpoint, model, and limits
 ```
-
-
-## Tool call display
-
-On a terminal each tool call is drawn as a box with the call's arguments and its live output. `MIAGENT_TOOLCALL_SIZE`
-caps how many lines of each section are shown; it defaults to `10`, and `0` shows everything. The output is a window
-over the most recent lines, so it scrolls inside the box rather than scrolling the rest of the session away. A value
-larger than the terminal is reduced to the terminal height, and the cap is ignored when output is not a terminal (so
-a piped or redirected run still records every line).
