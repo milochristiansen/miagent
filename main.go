@@ -16,7 +16,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -296,12 +298,19 @@ func main() {
 }
 
 // runModelTurn streams one model response for the given conversation and
-// returns the items it produced, plus whether the turn was final (no
-// function calls to run). Assistant text and reasoning are routed through
-// the display as they arrive, and any answer the stream did not carry as
-// deltas is echoed once the response completes. instructions is the request's
-// full instruction text: the system prompt plus whatever AGENTS.md
-// contributed.
+// returns the items it produced, plus whether the turn was final (no function
+// calls to run). Assistant text and reasoning are routed through the display
+// as they arrive, and any answer the stream did not carry as deltas is echoed
+// once the response completes. instructions is the request's full instruction
+// text: the system prompt plus whatever AGENTS.md contributed.
+//
+// A call that ends abnormally is not necessarily the end of the turn. If the
+// provider closed the stream early or the connection went idle, the answer so
+// far is kept and the model is asked to continue from where it stopped, using
+// the CONTINUE.md prompt. A call that produced nothing at all is retried a
+// bounded number of times first. Progress is what separates the two: an
+// attempt that streamed something is continued, while an attempt that failed
+// outright is retried up to maxModelRetries times.
 func runModelTurn(
 	ctx context.Context,
 	prov *provider,
@@ -310,17 +319,160 @@ func runModelTurn(
 	tools []openai.ResponseTool,
 	d *display,
 ) (items []StoredItem, usage *Usage, final bool, err error) {
+	// One endTurn for the whole turn: a continuation is the same answer, so
+	// the display stays open across attempts and the resumed text joins what
+	// is already on screen rather than starting a new block.
 	defer d.endTurn()
 
-	stream, err := prov.client.CreateResponseStream(ctx, openai.CreateResponseRequest{
+	conversationInput := itemsToInput(conversation)
+
+	var (
+		carry          strings.Builder // assistant text streamed by attempts that failed
+		continuing     bool            // the next attempt resumes a partial answer
+		continuePrompt string          // loaded from CONTINUE.md on first use
+		retries        int             // consecutive attempts that produced nothing
+	)
+
+	for {
+		input := conversationInput
+		if continuing {
+			// Replay what was streamed as the model's own partial message,
+			// then ask it to keep going. The synthetic messages belong to
+			// this request only; they are never persisted.
+			input = append([]any{}, conversationInput...)
+			if carry.Len() > 0 {
+				input = append(input, openai.ResponseInputMessage{
+					Type:    "message",
+					Role:    "assistant",
+					Content: []openai.ResponseInputText{{Type: "output_text", Text: carry.String()}},
+				})
+			}
+			if continuePrompt == "" {
+				prompt, perr := loadContinuePrompt()
+				if perr != nil {
+					return nil, nil, false, perr
+				}
+				continuePrompt = prompt
+			}
+			input = append(input, openai.ResponseInputMessage{
+				Type:    "message",
+				Role:    "user",
+				Content: []openai.ResponseInputText{{Type: "input_text", Text: continuePrompt}},
+			})
+		}
+
+		attempt, aerr := streamModelTurn(ctx, prov, instructions, input, tools, d, modelIdleTimeout)
+		if aerr == nil {
+			// Fold the text of any earlier failed attempts into the final
+			// answer so the pieces persist as a single assistant message.
+			answer := carry.String() + assistantText(attempt.items)
+			if answer == "" {
+				answer = carry.String() + attempt.text
+			}
+			if rest := streamedRemainder(carry.String()+attempt.text, answer); rest != "" {
+				d.output(rest)
+			}
+			items = setAssistantText(attempt.items, answer)
+			if attempt.usage != nil {
+				usage = attempt.usage
+			}
+			final = true
+			for _, it := range items {
+				if it.Role == "function_call" {
+					final = false
+					break
+				}
+			}
+			return items, usage, final, nil
+		}
+
+		// An interrupt is not a failure to retry: the caller handles it.
+		if ctx.Err() != nil {
+			return nil, nil, false, aerr
+		}
+
+		if attempt.progress {
+			// The attempt produced output before it failed. Keep it and
+			// continue; as long as each attempt makes some progress the turn
+			// is moving forward, so there is no retry limit here.
+			carry.WriteString(attempt.text)
+			continuing = true
+			retries = 0
+			continue
+		}
+
+		// Nothing was produced: the request itself failed. Retry it a bounded
+		// number of times before giving up.
+		if retries >= maxModelRetries {
+			return nil, nil, false, aerr
+		}
+		retries++
+	}
+}
+
+// modelIdleTimeout is how long a model call may go without producing any
+// output before the harness abandons it. Lifecycle events that say the request
+// is still alive do not count: a provider that never gets to the answer would
+// otherwise keep the connection open indefinitely. Providers are supposed to
+// close a dead connection themselves, but that cannot be relied on, so the
+// limit is enforced here. It covers the wait for the first output too (the
+// request itself), and resets with every new attempt.
+const modelIdleTimeout = 2 * time.Minute
+
+// maxModelRetries is how many times a model call that produced nothing at all
+// is retried before the turn fails. An attempt that streamed something is a
+// continuation, not a retry, and is not counted here.
+const maxModelRetries = 5
+
+// streamAttempt is what one streaming request produced. On success items and
+// usage are set. On failure items is nil, but text and progress record what
+// was streamed before the failure so the caller can retry or continue.
+type streamAttempt struct {
+	items    []StoredItem
+	usage    *Usage
+	text     string // assistant text streamed as deltas
+	progress bool   // any reasoning, text, or tool-call content arrived
+}
+
+// streamModelTurn runs one streaming request and returns what it produced. A
+// nil error means the response completed. Any other outcome carries the
+// streamed text and whether there was any progress at all.
+//
+// The attempt is abandoned if it produces no output for idleTimeout: the
+// stream is cancelled, which both stops the wait and tells the provider to
+// drop the connection. The timeout is passed in rather than read from the
+// constant so tests can exercise it in milliseconds.
+func streamModelTurn(
+	ctx context.Context,
+	prov *provider,
+	instructions string,
+	input []any,
+	tools []openai.ResponseTool,
+	d *display,
+	idleTimeout time.Duration,
+) (streamAttempt, error) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var idle atomic.Bool
+	idleTimer := time.AfterFunc(idleTimeout, func() {
+		idle.Store(true)
+		cancel()
+	})
+	defer idleTimer.Stop()
+
+	stream, err := prov.client.CreateResponseStream(attemptCtx, openai.CreateResponseRequest{
 		Model:        prov.model,
 		Instructions: instructions,
-		Input:        itemsToInput(conversation),
+		Input:        input,
 		Tools:        tools,
 		Reasoning:    prov.reasoning,
 	})
 	if err != nil {
-		return nil, nil, false, err
+		if idle.Load() {
+			return streamAttempt{}, fmt.Errorf("model call idle for %s", idleTimeout)
+		}
+		return streamAttempt{}, err
 	}
 	defer stream.Close()
 
@@ -334,6 +486,7 @@ func runModelTurn(
 		fnByID    = map[string]int{} // item id -> index into fnCalls
 		rsItems   []StoredItem       // reasoning items in stream order
 		rsByID    = map[string]int{} // item id -> index into rsItems
+		progress  bool
 	)
 	addFn := func(id string) int {
 		if idx, ok := fnByID[id]; ok {
@@ -375,36 +528,56 @@ func runModelTurn(
 			break
 		}
 		if err != nil {
-			return nil, nil, false, err
+			if idle.Load() {
+				return streamAttempt{text: msgText.String(), progress: progress},
+					fmt.Errorf("model call idle for %s", idleTimeout)
+			}
+			return streamAttempt{text: msgText.String(), progress: progress}, err
 		}
+
+		// activity records that this event carried model output. The idle
+		// timer only resets on output, not on lifecycle chatter, so a
+		// connection that keeps saying it is alive without producing
+		// anything still reaches the limit.
+		activity := false
 
 		switch ev.Type {
 		case openai.ResponseStreamEventReasoningTextDelta:
 			if ev.Delta != "" {
+				activity, progress = true, true
 				d.reasoning(ev.Delta)
 				addReasoningText(ev.ItemID, false, ev.ContentIndex, ev.Delta)
 			}
 
 		case openai.ResponseStreamEventReasoningSummaryTextDelta:
 			if ev.Delta != "" {
+				activity, progress = true, true
 				d.reasoning(ev.Delta)
 				addReasoningText(ev.ItemID, true, ev.SummaryIndex, ev.Delta)
 			}
 
 		case openai.ResponseStreamEventOutputTextDelta:
-			msgText.WriteString(ev.Delta)
-			d.output(ev.Delta)
+			if ev.Delta != "" {
+				activity, progress = true, true
+				msgText.WriteString(ev.Delta)
+				d.output(ev.Delta)
+			}
 
 		case openai.ResponseStreamEventFunctionArgumentsDelta:
 			// Record the arguments fragment, keyed by the item id shared
 			// with the call's output_item.added event.
 			if ev.ItemID != "" {
+				activity, progress = true, true
 				fnCalls[addFn(ev.ItemID)].Arguments += ev.Delta
 			}
 
 		case openai.ResponseStreamEventOutputItemAdded:
 			it := ev.Item
+			if it != nil {
+				activity = true
+			}
 			if it != nil && it.Type == "function_call" {
+				progress = true
 				idx := addFn(it.ID)
 				if it.Name != "" {
 					fnCalls[idx].Name = it.Name
@@ -425,14 +598,14 @@ func runModelTurn(
 			if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
 				msg = ev.Response.Error.Message
 			}
-			return nil, nil, false, errors.New(msg)
+			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
 
 		case openai.ResponseStreamEventIncomplete:
 			msg := "response incomplete"
 			if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
 				msg += ": " + ev.Response.Error.Message
 			}
-			return nil, nil, false, errors.New(msg)
+			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
 
 		case openai.ResponseStreamEventError:
 			msg := ev.Message
@@ -442,56 +615,70 @@ func runModelTurn(
 			if msg == "" {
 				msg = "unknown stream error"
 			}
-			return nil, nil, false, errors.New(msg)
+			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
+		}
+
+		if activity {
+			idleTimer.Reset(idleTimeout)
 		}
 	}
 	if !completed {
-		return nil, nil, false, errors.New("stream ended before response.completed")
+		return streamAttempt{text: msgText.String(), progress: progress},
+			errors.New("stream ended before response.completed")
 	}
 
 	// Prefer the canonical items carried by response.completed; fall back
 	// to the items reconstructed from stream events, in the order the model
 	// produced them: reasoning, then its answer, then its function calls.
+	var attemptItems []StoredItem
 	if len(finalResp.Output) > 0 {
-		items = responseItems(finalResp.Output)
+		attemptItems = responseItems(finalResp.Output)
 	} else {
-		items = make([]StoredItem, 0, len(rsItems)+1+len(fnCalls))
-		items = append(items, rsItems...)
+		attemptItems = make([]StoredItem, 0, len(rsItems)+1+len(fnCalls))
+		attemptItems = append(attemptItems, rsItems...)
 		if msgText.Len() > 0 {
-			items = append(items, StoredItem{Role: "assistant", Content: msgText.String()})
+			attemptItems = append(attemptItems, StoredItem{Role: "assistant", Content: msgText.String()})
 		}
 		// Function call names arrive in output_item.added; the arguments
 		// deltas fill them in. Calls whose item events never arrived are
 		// dropped here rather than replayed nameless.
 		for _, call := range fnCalls {
 			if call.Name != "" {
-				items = append(items, call)
+				attemptItems = append(attemptItems, call)
 			}
 		}
 	}
+	return streamAttempt{
+		items:    attemptItems,
+		usage:    usageOf(finalResp.Usage),
+		text:     msgText.String(),
+		progress: progress,
+	}, nil
+}
 
-	// Echo of the response is done; line termination is handled by the
-	// display (renderer Close / raw-mode endTurn).
-
-	// The display only ever sees deltas, so a provider that reports the
-	// message text in response.completed without streaming it (or streams only
-	// part of it) would leave the turn blank on screen. Echo whatever the
-	// display has not seen, before the turn's line is terminated.
-	if answer := assistantText(items); answer != "" {
-		if rest := streamedRemainder(msgText.String(), answer); rest != "" {
-			d.output(rest)
+// setAssistantText returns items whose assistant message carries answer, so
+// the pieces a turn streamed across several attempts persist as one message.
+// When the response carried no assistant message at all (a turn of tool calls
+// only), the message is inserted after any reasoning items, matching the order
+// the items were streamed in.
+func setAssistantText(items []StoredItem, answer string) []StoredItem {
+	for i := range items {
+		if items[i].Role == "assistant" {
+			items[i].Content = answer
+			return items
 		}
 	}
-
-	// A final turn produced no function calls.
-	final = true
-	for _, it := range items {
-		if it.Role == "function_call" {
-			final = false
-			break
-		}
+	if answer == "" {
+		return items
 	}
-	return items, usageOf(finalResp.Usage), final, nil
+	at := 0
+	for at < len(items) && items[at].Role == "reasoning" {
+		at++
+	}
+	items = append(items, StoredItem{})
+	copy(items[at+1:], items[at:])
+	items[at] = StoredItem{Role: "assistant", Content: answer}
+	return items
 }
 
 // assistantText returns the assistant message text carried by items, which is

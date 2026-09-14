@@ -1,11 +1,11 @@
 // Prompt files: the harness's prompts are editable text, not compiled-in
 // strings. They live in a prompts subdirectory of the configuration directory
-// (see configDir) as SYSTEM.md, COMPACT-*.md, DESCRIPTION.md, and
-// SESSION-NAME.md, so one installation serves every project and a prompt can
+// (see configDir) as SYSTEM.md, COMPACT-*.md, DESCRIPTION.md, SESSION-NAME.md,
+// and CONTINUE.md, so one installation serves every project and a prompt can
 // be changed without a rebuild. SYSTEM.md and the optional AGENTS.md files are
 // read once at startup, because every turn needs them; the COMPACT-*.md files,
-// DESCRIPTION.md, and SESSION-NAME.md are read on demand, when /compact, /desc,
-// and /new run.
+// DESCRIPTION.md, SESSION-NAME.md, and CONTINUE.md are read on demand, when
+// /compact, /desc, and /new run or a model call has to be continued.
 package main
 
 import (
@@ -23,9 +23,13 @@ import (
 const agentsFile = "AGENTS.md"
 
 // promptsDir is the name of the configuration directory's prompt
-// subdirectory, which holds SYSTEM.md, COMPACT-*.md, DESCRIPTION.md, and
-// SESSION-NAME.md.
+// subdirectory, which holds SYSTEM.md, COMPACT-*.md, DESCRIPTION.md,
+// SESSION-NAME.md, and CONTINUE.md.
 const promptsDir = "prompts"
+
+// continuePromptName is the prompt file the harness reads when a model call
+// was cut off before it completed and the answer is being resumed.
+const continuePromptName = "CONTINUE.md"
 
 // promptPath returns the path of the named prompt file in the configuration
 // directory's prompts subdirectory.
@@ -35,6 +39,18 @@ func promptPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(config, promptsDir, name), nil
+}
+
+// loadContinuePrompt reads the continuation prompt from the prompts
+// subdirectory of the configuration directory. Like the compaction and
+// description prompts it is read on demand, only when a model call has been
+// cut short and needs resuming, so ordinary runs never need the file.
+func loadContinuePrompt() (string, error) {
+	path, err := promptPath(continuePromptName)
+	if err != nil {
+		return "", err
+	}
+	return loadPrompt(path)
 }
 
 // loadPrompt reads one required prompt file. Surrounding whitespace is
