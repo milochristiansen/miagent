@@ -30,6 +30,30 @@ func fakeTool(t *testing.T, dir, file, name string) string {
 	return path
 }
 
+// fakeMultiTool writes an executable that answers TGI SCHEMA with one JSON
+// schema per line, so a single binary can expose several tools. On INVOKE it
+// prints the TGI_TOOL it was called with, which lets a test confirm that each
+// declared name dispatches back to the same executable.
+func fakeMultiTool(t *testing.T, dir, file string, names ...string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, file)
+	script := "#!/bin/sh\n" +
+		"if [ \"$TGI_METHOD\" = SCHEMA ]; then\n"
+	for _, name := range names {
+		script += fmt.Sprintf(`  printf '{"name":"%s","description":"fake","parameters":{"type":"object"}}\n'`+"\n", name)
+	}
+	script += "elif [ \"$TGI_METHOD\" = INVOKE ]; then\n" +
+		"  printf '%s' \"$TGI_TOOL\"\n" +
+		"fi\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestDiscoverToolsDirs covers which directories tools come from and which
 // definition survives a name collision: the project-local tool wins over the
 // installed one, and the tool is advertised once.
@@ -221,5 +245,115 @@ func TestBashToolRunsInItsWorkingDirectory(t *testing.T) {
 	}
 	if got := strings.TrimSpace(res.Stdout); got != want {
 		t.Fatalf("the tool ran in %q, want %q", got, want)
+	}
+}
+
+// TestDiscoverToolsMultiplePerBinary covers one binary declaring several tools
+// as JSON Lines: every declared name becomes callable, and each points back at
+// the single executable that provides them.
+func TestDiscoverToolsMultiplePerBinary(t *testing.T) {
+	config := configFixture(t)
+	t.Chdir(t.TempDir())
+
+	path := fakeMultiTool(t, filepath.Join(config, toolsDir), "multi", "alpha", "beta")
+
+	discoveredTools = map[string]ToolDef{}
+	defs := discoverTools(context.Background())
+	if len(defs) != 2 {
+		t.Fatalf("discovered %d tools, want 2", len(defs))
+	}
+
+	for _, name := range []string{"alpha", "beta"} {
+		def, ok := discoveredTools[name]
+		if !ok {
+			t.Fatalf("tool %q not discovered", name)
+		}
+		if def.ExecPath != path {
+			t.Fatalf("tool %q executes %q, want %q", name, def.ExecPath, path)
+		}
+	}
+}
+
+// TestExecuteToolDispatchesByName covers the call half of a multi-tool binary:
+// the harness passes the declared name in TGI_TOOL, so the one executable can
+// tell its own tools apart.
+func TestExecuteToolDispatchesByName(t *testing.T) {
+	config := configFixture(t)
+	t.Chdir(t.TempDir())
+
+	fakeMultiTool(t, filepath.Join(config, toolsDir), "multi", "alpha", "beta")
+
+	discoveredTools = map[string]ToolDef{}
+	discoverTools(context.Background())
+
+	for _, name := range []string{"alpha", "beta"} {
+		r, _ := executeTool(context.Background(), name, "{}", nil, nil)
+		if r.Err != nil {
+			t.Fatalf("%s: %v", name, r.Err)
+		}
+		if r.Code != 0 || r.Stdout != name {
+			t.Fatalf("%s: stdout = %q, code = %d; want the declared name", name, r.Stdout, r.Code)
+		}
+	}
+}
+
+// TestDiscoverToolsPrettyPrintedSchema covers the documented single-schema
+// form, a pretty-printed JSON object spanning several lines. It must keep
+// working now that output is otherwise read as JSON Lines.
+func TestDiscoverToolsPrettyPrintedSchema(t *testing.T) {
+	config := configFixture(t)
+	t.Chdir(t.TempDir())
+
+	base := filepath.Join(config, toolsDir)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"if [ \"$TGI_METHOD\" = SCHEMA ]; then\n" +
+		"  cat <<'EOF'\n" +
+		"{\n" +
+		"  \"name\": \"pretty\",\n" +
+		"  \"description\": \"fake\",\n" +
+		"  \"parameters\": {\"type\": \"object\"}\n" +
+		"}\n" +
+		"EOF\n" +
+		"fi\n"
+	if err := os.WriteFile(filepath.Join(base, "pretty"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	discoveredTools = map[string]ToolDef{}
+	defs := discoverTools(context.Background())
+	if len(defs) != 1 || toolName(defs[0]) != "pretty" {
+		t.Fatalf("defs = %v, want the one pretty-printed tool", defs)
+	}
+}
+
+// TestDiscoverToolsRejectsBadBatch covers a binary whose JSONL batch contains a
+// declaration without a name: the batch is rejected whole, so the binary
+// contributes none of its tools, while a well-formed binary beside it loads.
+func TestDiscoverToolsRejectsBadBatch(t *testing.T) {
+	config := configFixture(t)
+	t.Chdir(t.TempDir())
+
+	base := filepath.Join(config, toolsDir)
+	fakeMultiTool(t, base, "good", "alpha", "beta")
+
+	bad := filepath.Join(base, "bad")
+	script := "#!/bin/sh\n" +
+		"if [ \"$TGI_METHOD\" = SCHEMA ]; then\n" +
+		"  printf '{\"name\":\"gamma\"}\\n{\"description\":\"no name\"}\\n'\n" +
+		"fi\n"
+	if err := os.WriteFile(bad, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	discoveredTools = map[string]ToolDef{}
+	defs := discoverTools(context.Background())
+	if len(defs) != 2 || toolName(defs[0]) != "alpha" || toolName(defs[1]) != "beta" {
+		t.Fatalf("defs = %v, want only the well-formed binary's tools", defs)
+	}
+	if _, ok := discoveredTools["gamma"]; ok {
+		t.Fatal("gamma was loaded from a batch that should have been rejected")
 	}
 }

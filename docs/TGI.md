@@ -27,6 +27,10 @@ When MiAgent starts up, all tools are run with `TGI_METHOD` set to `SCHEMA`, `TG
 standard input provided. The tool is then expected to provide a JSON schema describing the tool in a format that the
 harness will be able to read.
 
+A single tool is one JSON object. A binary that implements several tools writes one JSON object per line (JSON Lines);
+every schema it declares is registered against that same executable, and on a call the binary tells the tools apart by
+`TGI_TOOL`, which is set to the declared name being invoked.
+
 The following fields are supported:
 
 * **`name`** (required, non-empty) — the function name the model will call. The file name is irrelevant; two files may
@@ -38,7 +42,8 @@ The following fields are supported:
   model provider as-is; the harness does not validate it, and the provider is what enforces it. A tool that takes no
   arguments can omit this field.
 
-If the tool exits with a non-zero code or a `name` is not provided, a warning will be printed and the tool skipped.
+If the tool exits with a non-zero code, or any schema in it is malformed or has no `name`, a warning will be printed
+and the whole file skipped.
 
 Tools are loaded from the following directories in lexical order.
 

@@ -595,7 +595,8 @@ func responseItems(output []any) []StoredItem {
 // executable it finds there. Directories are scanned in precedence order (see
 // toolsDirs): a tool whose name is already known is replaced by the later
 // definition, so the tool list carries each name once, in its surviving
-// version.
+// version. A single executable may declare several tools (see fetchToolMetas);
+// each name it declares is registered against that one executable.
 //
 // A missing directory is not an error: a project that defines no tools of its
 // own, and an installation that has not had any installed, are both ordinary.
@@ -626,28 +627,38 @@ func discoverTools(ctx context.Context) []openai.ResponseTool {
 				continue
 			}
 
-			def, err := fetchToolMeta(ctx, execPath)
+			defs, err := fetchToolMetas(ctx, execPath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: tool %q in %s: %v\n", entry.Name(), dir, err)
 				continue
 			}
 
-			discoveredTools[def.Name] = *def
-			if i, ok := index[def.Name]; ok {
-				// Overridden: keep one entry, carrying the winner.
-				tools[i] = def.Definition
-				continue
+			for _, def := range defs {
+				discoveredTools[def.Name] = *def
+				if i, ok := index[def.Name]; ok {
+					// Overridden: keep one entry, carrying the winner.
+					tools[i] = def.Definition
+					continue
+				}
+				index[def.Name] = len(tools)
+				tools = append(tools, def.Definition)
 			}
-			index[def.Name] = len(tools)
-			tools = append(tools, def.Definition)
 		}
 	}
 	return tools
 }
 
-// fetchToolMeta runs the tool with TGI_METHOD=SCHEMA and parses the
-// JSON tool definition from its stdout.
-func fetchToolMeta(ctx context.Context, execPath string) (*ToolDef, error) {
+// fetchToolMetas runs the tool with TGI_METHOD=SCHEMA and parses the tool
+// definitions from its stdout. A tool may declare one tool as a single JSON
+// object, or several as JSON Lines: one JSON object per line. The output is
+// decoded as a stream of JSON values, which covers both (to a decoder,
+// newline-delimited objects and one pretty-printed object are the same thing).
+//
+// Every declaration is registered against the same executable; the tool tells
+// them apart on a call by the TGI_TOOL it is given (the name declared here). A
+// malformed declaration, or one without a name, fails the whole file and none
+// of its tools are loaded.
+func fetchToolMetas(ctx context.Context, execPath string) ([]*ToolDef, error) {
 	r := RunTGITool(ctx, filepath.Base(execPath), execPath, "SCHEMA", nil, nil, nil)
 	if r.Err != nil {
 		return nil, r.Err
@@ -660,29 +671,42 @@ func fetchToolMeta(ctx context.Context, execPath string) (*ToolDef, error) {
 		return nil, fmt.Errorf("tool exited %d: %s", r.Code, detail)
 	}
 
-	var meta struct {
+	type meta struct {
 		Name        string                 `json:"name"`
 		Description string                 `json:"description"`
 		Parameters  map[string]interface{} `json:"parameters"`
 	}
-	if err := json.Unmarshal([]byte(r.Stdout), &meta); err != nil {
-		return nil, fmt.Errorf("bad JSON: %w", err)
-	}
-	if meta.Name == "" {
-		return nil, fmt.Errorf("missing 'name' field")
+
+	var defs []*ToolDef
+	dec := json.NewDecoder(strings.NewReader(r.Stdout))
+	for n := 1; ; n++ {
+		var m meta
+		err := dec.Decode(&m)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("bad JSON: %w", err)
+		}
+		if m.Name == "" {
+			return nil, fmt.Errorf("missing 'name' field in schema %d", n)
+		}
+
+		defs = append(defs, &ToolDef{
+			Name:     m.Name,
+			ExecPath: execPath,
+			Definition: openai.NewResponseFunctionTool(openai.FunctionDefinition{
+				Name:        m.Name,
+				Description: m.Description,
+				Parameters:  m.Parameters,
+			}),
+		})
 	}
 
-	def := openai.NewResponseFunctionTool(openai.FunctionDefinition{
-		Name:        meta.Name,
-		Description: meta.Description,
-		Parameters:  meta.Parameters,
-	})
-
-	return &ToolDef{
-		Name:       meta.Name,
-		ExecPath:   execPath,
-		Definition: def,
-	}, nil
+	if len(defs) == 0 {
+		return nil, fmt.Errorf("no tool definitions in output")
+	}
+	return defs, nil
 }
 
 // executeTool runs a discovered TGI tool with the given JSON arguments,
