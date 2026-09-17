@@ -248,6 +248,124 @@ func TestBashToolRunsInItsWorkingDirectory(t *testing.T) {
 	}
 }
 
+// TestBashToolGivesGoAWritableBuildCache covers the XDG cache default: Go's
+// build cache lives under the user's cache home, which the sandbox mounts
+// read-only, so a build would fail before it starts. The tool binds that home
+// writable, so Go's own default cache works and is shared between calls.
+// XDG_CACHE_HOME points at a temp directory so the test does not disturb the
+// runner's cache.
+func TestBashToolGivesGoAWritableBuildCache(t *testing.T) {
+	for _, dep := range []string{"bwrap", "jq", "go"} {
+		if _, err := exec.LookPath(dep); err != nil {
+			t.Skipf("%s is not installed", dep)
+		}
+	}
+	tool, err := filepath.Abs(filepath.Join(toolsDir, "bash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheHome := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	// Let Go resolve its own default rather than inheriting a cache the runner
+	// happens to name.
+	t.Setenv("GOCACHE", "")
+	t.Chdir(t.TempDir())
+
+	res := RunTGITool(context.Background(), "bash", tool, "INVOKE",
+		strings.NewReader(`{"command":"cache=$(go env GOCACHE) && mkdir -p \"$cache\" && : > \"$cache/probe\" && printf '%s' \"$cache\""}`), nil, nil)
+	if res.Err != nil {
+		t.Fatalf("running the bash tool: %v", res.Err)
+	}
+	if res.Code != 0 {
+		t.Fatalf("bash tool exited %d: %s", res.Code, res.Stderr)
+	}
+	want := filepath.Join(cacheHome, "go-build")
+	if got := strings.TrimSpace(res.Stdout); got != want {
+		t.Fatalf("GOCACHE = %q, want the cache under the bound home %q", got, want)
+	}
+	// The probe was written inside the sandbox; finding it on the host proves
+	// the cache home was bound writable.
+	if _, err := os.Stat(filepath.Join(want, "probe")); err != nil {
+		t.Fatalf("the cache home was not writable from the sandbox: %v", err)
+	}
+}
+
+// TestBashToolBindsConfiguredCaches covers MIAGENT_BASH_RW: its colon-separated
+// entries replace the built-in language list, a leading ~ is expanded, and each
+// is created and bound writable. The XDG cache home is bound regardless.
+func TestBashToolBindsConfiguredCaches(t *testing.T) {
+	for _, dep := range []string{"bwrap", "jq"} {
+		if _, err := exec.LookPath(dep); err != nil {
+			t.Skipf("%s is not installed", dep)
+		}
+	}
+	tool, err := filepath.Abs(filepath.Join(toolsDir, "bash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheA := filepath.Join(t.TempDir(), "a") // left missing for the tool to create
+	home := t.TempDir()
+	cacheB := filepath.Join(home, ".rw-cache")
+	cacheHome := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MIAGENT_BASH_RW", cacheA+":~/.rw-cache")
+	t.Setenv("TEST_CACHE_A", cacheA)
+	t.Setenv("TEST_CACHE_B", cacheB)
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	t.Setenv("GOCACHE", "")
+	t.Chdir(t.TempDir())
+
+	res := RunTGITool(context.Background(), "bash", tool, "INVOKE",
+		strings.NewReader(`{"command":"printf a > \"$TEST_CACHE_A/a\" && printf b > \"$TEST_CACHE_B/b\" && printf x > \"$XDG_CACHE_HOME/x\""}`), nil, nil)
+	if res.Err != nil {
+		t.Fatalf("running the bash tool: %v", res.Err)
+	}
+	if res.Code != 0 {
+		t.Fatalf("bash tool exited %d: %s", res.Code, res.Stderr)
+	}
+	for _, f := range []string{
+		filepath.Join(cacheA, "a"),
+		filepath.Join(cacheB, "b"),
+		filepath.Join(cacheHome, "x"),
+	} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("%s was not writable from the sandbox: %v", f, err)
+		}
+	}
+}
+
+// TestBashToolBindsDefaultLanguageCaches covers the built-in list: a language
+// cache directory, here CARGO_HOME pointing at an existing directory, is bound
+// writable with MIAGENT_BASH_RW unset.
+func TestBashToolBindsDefaultLanguageCaches(t *testing.T) {
+	for _, dep := range []string{"bwrap", "jq"} {
+		if _, err := exec.LookPath(dep); err != nil {
+			t.Skipf("%s is not installed", dep)
+		}
+	}
+	tool, err := filepath.Abs(filepath.Join(toolsDir, "bash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cargoHome := t.TempDir()
+	t.Setenv("MIAGENT_BASH_RW", "")
+	t.Setenv("CARGO_HOME", cargoHome)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+
+	res := RunTGITool(context.Background(), "bash", tool, "INVOKE",
+		strings.NewReader(`{"command":"printf c > \"$CARGO_HOME/c\""}`), nil, nil)
+	if res.Err != nil {
+		t.Fatalf("running the bash tool: %v", res.Err)
+	}
+	if res.Code != 0 {
+		t.Fatalf("bash tool exited %d: %s", res.Code, res.Stderr)
+	}
+	if _, err := os.Stat(filepath.Join(cargoHome, "c")); err != nil {
+		t.Fatalf("the language cache was not writable from the sandbox: %v", err)
+	}
+}
+
 // TestDiscoverToolsMultiplePerBinary covers one binary declaring several tools
 // as JSON Lines: every declared name becomes callable, and each points back at
 // the single executable that provides them.

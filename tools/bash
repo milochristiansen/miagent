@@ -4,9 +4,12 @@
 # INVOKE  -> JSON args {"command": "..."} on stdin
 #
 # The sandbox confines the command (bwrap flags below):
-#   - the working directory is the only writable host path; the rest of
-#     the filesystem is read-only, so files can be read from anywhere but
-#     written only here. /tmp is a fresh empty tmpfs.
+#   - the working directory is writable, and so are the global build caches
+#     of the common language toolchains: the XDG cache home always, and a
+#     list of per-language cache directories (or whatever MIAGENT_BASH_RW
+#     names) when they exist. Everything else on the host is read-only, so
+#     files can be read from anywhere but written only there. /tmp is a
+#     fresh empty tmpfs.
 #   - --unshare-user + --uid/--gid: the command runs as the current
 #     uid/gid (files it creates keep their real ownership) and all
 #     capabilities are dropped; setuid binaries can't escalate (no-new-
@@ -27,7 +30,7 @@ case "$TGI_METHOD" in
     cat <<'EOF'
 {
   "name": "bash",
-  "description": "Run a shell command (bash -c) in a bubblewrap sandbox. Writable: the working directory and /tmp; everything else is read-only, including $HOME (dotfiles are readable), network is accessible. Runs as the current user with no privileges; host processes are invisible. On a non-zero exit, the result reports the exit code and the stdout and stderr channels separately.",
+  "description": "Run a shell command (bash -c) in a bubblewrap sandbox. Writable: the working directory, /tmp, and the global build caches of common language toolchains (the XDG cache home plus directories such as ~/.cargo, ~/.npm, and ~/.gradle); the rest of the filesystem, including most of $HOME, is read-only (dotfiles remain readable). Network is accessible. Runs as the current user with no privileges; host processes are invisible. On a non-zero exit, the result reports the exit code and the stdout and stderr channels separately.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -59,14 +62,29 @@ EOF
       exit 127
     fi
 
+    # The sandbox mounts the host read-only except for the working directory
+    # and the build caches below, so toolchains can use their real global
+    # caches instead of failing the first time they write to $HOME. The XDG
+    # cache home is always one of them (Go, uv, pip, zig, ccache and many
+    # others live there); MIAGENT_BASH_RW, a colon-separated list of
+    # directories with a leading ~ expanded, replaces the built-in list of
+    # per-language caches when set.
+    CACHE_HOME="${XDG_CACHE_HOME:-}"
+    case "$CACHE_HOME" in
+      /*) ;;
+      *) CACHE_HOME="$HOME/.cache" ;;
+    esac
+
     # Mount order matters: bwrap applies its mounts in sequence, so the
     # fresh /tmp must be in place *before* the working directory is bound,
     # or a cwd that lives under /tmp is shadowed by the tmpfs and the bind
     # re-creates it empty — the sandbox then cannot even chdir into its
-    # own working directory.
+    # own working directory. The cache binds follow the tmpfs, so a cache
+    # under /tmp is not shadowed, and precede the working directory bind,
+    # so every writable path is in place when the command runs.
     export CMD
     CMD="$cmd"
-    exec bwrap \
+    set -- bwrap \
       --die-with-parent \
       --unshare-user \
       --unshare-pid \
@@ -79,10 +97,76 @@ EOF
       --ro-bind / / \
       --dev /dev \
       --proc /proc \
-      --tmpfs /tmp \
+      --tmpfs /tmp
+
+    # The XDG cache home is created if missing: that is where the tools
+    # using it expect to find it, and a read-only $HOME means they cannot.
+    if mkdir -p "$CACHE_HOME"; then
+      set -- "$@" --bind "$CACHE_HOME" "$CACHE_HOME"
+    fi
+    # An explicit GOCACHE can point outside the cache home; make it writable
+    # too. Only the unset case falls back to Go's default, under that home.
+    if [ -n "${GOCACHE:-}" ] && mkdir -p "$GOCACHE"; then
+      set -- "$@" --bind "$GOCACHE" "$GOCACHE"
+    fi
+
+    if [ -n "${MIAGENT_BASH_RW:-}" ]; then
+      # An explicit list replaces the built-in one. Its entries are created:
+      # naming a directory is a request for it to exist and be writable.
+      old_ifs=$IFS
+      IFS=:
+      for d in $MIAGENT_BASH_RW; do
+        IFS=$old_ifs
+        case "$d" in
+          "~") d="$HOME" ;;
+          "~/"*) d="$HOME/${d#"~/"}" ;;
+        esac
+        if [ -n "$d" ] && mkdir -p "$d"; then
+          set -- "$@" --bind "$d" "$d"
+        fi
+      done
+      IFS=$old_ifs
+    else
+      # The built-in language caches. Only directories that already exist
+      # are bound, so an unused toolchain does not litter $HOME. Each is
+      # the tool's own global cache, honouring its environment override
+      # where there is a conventional one.
+      for d in \
+        "${CARGO_HOME:-$HOME/.cargo}" \
+        "${RUSTUP_HOME:-$HOME/.rustup}" \
+        "${npm_config_cache:-${NPM_CONFIG_CACHE:-$HOME/.npm}}" \
+        "${BUN_INSTALL:-$HOME/.bun}" \
+        "${PNPM_HOME:-$HOME/.local/share/pnpm}" \
+        "${GOMODCACHE:-${GOPATH:-$HOME/go}/pkg/mod}" \
+        "${GOPATH:-$HOME/go}/bin" \
+        "${GRADLE_USER_HOME:-$HOME/.gradle}" \
+        "$HOME/.m2" \
+        "${NUGET_PACKAGES:-$HOME/.nuget/packages}" \
+        "${DOTNET_CLI_HOME:-$HOME/.dotnet}" \
+        "$HOME/.julia" \
+        "${CABAL_DIR:-$HOME/.cabal}" \
+        "${STACK_ROOT:-$HOME/.stack}" \
+        "${GHCUP_HOME:-$HOME/.ghcup}" \
+        "${GEM_HOME:-$HOME/.gem}" \
+        "${MIX_HOME:-$HOME/.mix}" \
+        "${HEX_HOME:-$HOME/.hex}" \
+        "${PUB_CACHE:-$HOME/.pub-cache}" \
+        "$HOME/.dart-tool" \
+        "$HOME/.swiftpm" \
+        "${PERL_CPANM_HOME:-$HOME/.cpanm}" \
+        "$HOME/.luarocks" \
+        "${CCACHE_DIR:-$HOME/.ccache}" \
+      ; do
+        [ -d "$d" ] || continue
+        set -- "$@" --bind "$d" "$d"
+      done
+    fi
+
+    set -- "$@" \
       --bind "$ROOT" "$ROOT" \
       --chdir "$ROOT" \
       -- bash -c "$CMD"
+    exec "$@"
     ;;
   *)
     echo "usage: TGI_METHOD=SCHEMA|INVOKE" >&2
