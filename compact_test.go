@@ -133,6 +133,52 @@ func TestEstimateAndContextTokens(t *testing.T) {
 	})
 }
 
+// TestPlanCompactionAcceptsIncompleteTurn covers the whole planning path for a
+// session an interrupt left mid-turn: a compaction must plan around trailing
+// thinking rather than refuse with an internal error.
+func TestPlanCompactionAcceptsIncompleteTurn(t *testing.T) {
+	big := strings.Repeat("x", 400)
+	s := &Session{Items: []StoredItem{
+		{Role: "user", Content: big},
+		{Role: "assistant", Content: big},
+		{Role: "user", Content: big},
+		{Role: "reasoning", Reasoning: &reasoning{Content: []ReasoningPart{{Text: big}}}},
+	}}
+	plan, err := planCompaction(s, 1)
+	if err != nil {
+		t.Fatalf("planCompaction: %v", err)
+	}
+	if plan == nil {
+		t.Fatal("planCompaction = nil, want a plan for the older history")
+	}
+}
+
+// TestValidateKeptIncompleteTurn covers the states an interrupted turn can
+// leave at the end of the kept range: thinking with no reply yet, either as the
+// final item or before the next prompt, which a compaction must accept rather
+// than refuse to run.
+func TestValidateKeptIncompleteTurn(t *testing.T) {
+	thinking := StoredItem{Role: "reasoning", Reasoning: &reasoning{Content: []ReasoningPart{{Text: "half a thought"}}}}
+	cases := map[string][]StoredItem{
+		"trailing thinking": {
+			{Role: "user", Content: "do it"},
+			thinking,
+		},
+		"thinking before the next prompt": {
+			{Role: "user", Content: "do it"},
+			thinking,
+			{Role: "user", Content: "try again"},
+		},
+	}
+	for name, kept := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateKept(kept); err != nil {
+				t.Fatalf("validateKept: %v", err)
+			}
+		})
+	}
+}
+
 // TestFindCutPoint covers where a compaction splits: never at an item that
 // must stay with what precedes it, always reporting the turn being split so
 // its prefix can be summarized separately, and sizing the conversation from
@@ -216,6 +262,27 @@ func TestFindCutPoint(t *testing.T) {
 		cut := newTokenIndex(items, nil).findCutPoint(100)
 		if cut.firstKept != 1 {
 			t.Fatalf("firstKept = %d, want 1 (reasoning kept with its reply)", cut.firstKept)
+		}
+	})
+
+	t.Run("unfinished turn's thinking is not pulled into the next turn", func(t *testing.T) {
+		// An interrupt can leave a turn that streamed only thinking. When
+		// the next prompt follows it, the cut opens at that user item: the
+		// orphaned thinking belongs to the summarized history, not to the
+		// new turn, so the cut must not step back over it.
+		items := []StoredItem{
+			{Role: "user", Content: big},      // 0
+			{Role: "assistant", Content: big}, // 1
+			{Role: "user", Content: big},      // 2
+			{Role: "reasoning", Reasoning: &reasoning{Content: []ReasoningPart{{Text: big}}}}, // 3, orphaned
+			{Role: "user", Content: big}, // 4, the next prompt
+		}
+		cut := newTokenIndex(items, nil).findCutPoint(1)
+		if got := items[cut.firstKept].Role; got != "user" {
+			t.Fatalf("firstKept = %d (%s), want the kept range to open at the next user prompt", cut.firstKept, got)
+		}
+		if err := validateKept(items[cut.firstKept:]); err != nil {
+			t.Fatalf("validateKept: %v", err)
 		}
 	})
 

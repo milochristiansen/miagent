@@ -255,9 +255,14 @@ func (x *tokenIndex) findCutPoint(keepRecent int) cutPoint {
 
 	// Reasoning immediately before the cut belongs to the reply that follows
 	// it, so step back to keep the two together: a kept range must not open
-	// with a reply whose thinking was summarized away.
-	for cutIndex > 0 && x.items[cutIndex-1].Role == "reasoning" {
-		cutIndex--
+	// with a reply whose thinking was summarized away. The step-back applies
+	// only when the cut opens with such a reply. Reasoning before a user item
+	// is the tail of a turn an interrupt left unfinished, not this turn's
+	// thinking, and belongs to the history being summarized.
+	if cutIndex > 0 && (x.items[cutIndex].Role == "assistant" || x.items[cutIndex].Role == "function_call") {
+		for cutIndex > 0 && x.items[cutIndex-1].Role == "reasoning" {
+			cutIndex--
+		}
 	}
 
 	cut := cutPoint{firstKept: cutIndex, turnStart: -1}
@@ -576,11 +581,16 @@ func validateKept(kept []StoredItem) error {
 				return fmt.Errorf("internal error: tool result %q would be kept without its call", it.CallID)
 			}
 		case "reasoning":
-			// Thinking belongs to the reply it precedes.
-			if i+1 < len(kept) && (kept[i+1].Role == "assistant" || kept[i+1].Role == "function_call") {
+			// Thinking belongs to the reply it precedes. A trailing
+			// reasoning item is all an interrupted turn produced so far, and
+			// one followed by a user item is that interrupted turn the next
+			// prompt continues: neither has a reply here to be separated
+			// from, so both stand on their own.
+			if i+1 == len(kept) {
 				continue
 			}
-			if i+1 < len(kept) && kept[i+1].Role == "reasoning" {
+			next := kept[i+1].Role
+			if next == "assistant" || next == "function_call" || next == "reasoning" || next == "user" {
 				continue
 			}
 			return errors.New("internal error: thinking would be kept without the reply it belongs to")

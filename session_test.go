@@ -315,6 +315,43 @@ func TestSessionKeepsReasoning(t *testing.T) {
 	}
 }
 
+// TestSessionKeepsIncompleteTurn covers what an interrupted turn leaves on
+// disk: the user's input, whatever the model produced, and an output answering
+// any call the signal cut off, all of which load back as a replayable
+// conversation.
+func TestSessionKeepsIncompleteTurn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	s := newSession(path)
+	partial := []StoredItem{
+		{Role: "assistant", Content: "working on"},
+		{Role: "function_call", CallID: "c1", Name: "bash", Arguments: `{"command":`},
+	}
+	s.Items = append(s.Items, StoredItem{Role: "user", Content: "do the thing"})
+	s.Items = append(s.Items, partial...)
+	s.Items = append(s.Items, unansweredToolOutputs(partial)...)
+	if err := s.commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	reloaded := newSession(path)
+	if err := reloaded.load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(reloaded.Items) != 4 {
+		t.Fatalf("items = %d, want 4 (input, partial reply, call, answer)", len(reloaded.Items))
+	}
+	if reloaded.Items[0].Content != "do the thing" || reloaded.Items[1].Content != "working on" {
+		t.Fatalf("items = %+v, want the input and the partial reply", reloaded.Items)
+	}
+	call, out := reloaded.Items[2], reloaded.Items[3]
+	if call.Role != "function_call" || call.CallID != "c1" {
+		t.Fatalf("item 2 = %+v, want the interrupted function call", call)
+	}
+	if out.Role != "function_call_output" || out.CallID != "c1" || out.Output == "" {
+		t.Fatalf("item 3 = %+v, want an output that answers the call", out)
+	}
+}
+
 // TestItemsToInputReasoning covers what a provider is handed for stored
 // reasoning: the text it produced, a content array it will accept, and
 // nothing at all for an item carrying no text.

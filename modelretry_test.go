@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -199,8 +200,10 @@ func TestStreamModelTurnIdleTimeout(t *testing.T) {
 	if !attempt.progress || attempt.text != "partial" {
 		t.Fatalf("attempt = %+v, want progress and the streamed text", attempt)
 	}
-	if len(attempt.items) != 0 {
-		t.Fatalf("attempt.items = %v, want none before completion", attempt.items)
+	// The streamed text is carried as a partial item, so a caller that
+	// keeps the turn does not lose output the display already showed.
+	if got := assistantText(attempt.items); got != "partial" {
+		t.Fatalf("attempt.items = %+v, want the streamed text as an assistant item", attempt.items)
 	}
 }
 
@@ -254,5 +257,256 @@ func TestStreamModelTurnIdleTimeoutIgnoresLifecycle(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the idle timeout never fired")
+	}
+}
+
+// functionCallAdded is a response.output_item.added event for a function call.
+func functionCallAdded(id, callID, name string) string {
+	return `{"type":"response.output_item.added","item":{"id":` + quote(id) +
+		`,"type":"function_call","call_id":` + quote(callID) + `,"name":` + quote(name) + `}}`
+}
+
+// functionArgsDelta is one response.function_call_arguments.delta event.
+func functionArgsDelta(id, delta string) string {
+	return `{"type":"response.function_call_arguments.delta","item_id":` + quote(id) + `,"delta":` + quote(delta) + `}`
+}
+
+// reasoningDelta is one response.reasoning_text.delta event.
+func reasoningDelta(id, delta string) string {
+	return `{"type":"response.reasoning_text.delta","item_id":` + quote(id) + `,"content_index":0,"delta":` + quote(delta) + `}`
+}
+
+// TestStreamModelTurnKeepsPartialFunctionCall covers what a stream that dies
+// mid-call carries: the call's identity and the arguments that arrived before
+// the failure, so an interrupted turn can still record what the model asked
+// for.
+func TestStreamModelTurnKeepsPartialFunctionCall(t *testing.T) {
+	release := make(chan struct{})
+	prov, _ := scriptedProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "data: %s\n\n", functionCallAdded("fc_1", "call_1", "bash"))
+		fmt.Fprintf(w, "data: %s\n\n", functionArgsDelta("fc_1", `{"command":`))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	})
+	t.Cleanup(func() { close(release) })
+
+	attempt, err := streamModelTurn(context.Background(), prov, "instructions", nil, nil, newDisplay(), 150*time.Millisecond)
+	if err == nil {
+		t.Fatal("streamModelTurn = nil error, want the idle timeout reported")
+	}
+	var call *StoredItem
+	for i := range attempt.items {
+		if attempt.items[i].Role == "function_call" {
+			call = &attempt.items[i]
+		}
+	}
+	if call == nil {
+		t.Fatalf("attempt.items = %+v, want the partial function call", attempt.items)
+	}
+	if call.CallID != "call_1" || call.Name != "bash" || call.Arguments != `{"command":` {
+		t.Fatalf("call = %+v, want the partial arguments and the call's identity", call)
+	}
+}
+
+// TestStreamModelTurnKeepsPartialReasoning covers the thinking an interrupted
+// stream produced: it is carried as a reasoning item, so the context the model
+// already established survives even though the reply never finished.
+func TestStreamModelTurnKeepsPartialReasoning(t *testing.T) {
+	release := make(chan struct{})
+	prov, _ := scriptedProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "data: %s\n\n", reasoningDelta("rs_1", "thinking"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	})
+	t.Cleanup(func() { close(release) })
+
+	var (
+		attempt streamAttempt
+		err     error
+	)
+	_ = captureStderr(t, func() {
+		attempt, err = streamModelTurn(context.Background(), prov, "instructions", nil, nil, newDisplay(), 150*time.Millisecond)
+	})
+	if err == nil {
+		t.Fatal("streamModelTurn = nil error, want the idle timeout reported")
+	}
+	var rs *StoredItem
+	for i := range attempt.items {
+		if attempt.items[i].Role == "reasoning" {
+			rs = &attempt.items[i]
+		}
+	}
+	if rs == nil || rs.Reasoning == nil || len(rs.Reasoning.Content) != 1 || rs.Reasoning.Content[0].Text != "thinking" {
+		t.Fatalf("attempt.items = %+v, want the partial reasoning text", attempt.items)
+	}
+}
+
+// TestRunModelTurnKeepsTextStreamedBeforeGivingUp covers a turn that streamed
+// part of an answer, lost the connection, and then could not be resumed: the
+// text already shown is returned so the caller persists it rather than losing
+// an answer the reader has seen.
+func TestRunModelTurnKeepsTextStreamedBeforeGivingUp(t *testing.T) {
+	prov, bodies := scriptedProvider(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			// Half an answer, then the connection ends without completing.
+			fmt.Fprintf(w, "data: %s\n\n", textDelta("kept "))
+		},
+		// Every later attempt is an unscripted request, which fails before
+		// streaming anything.
+	)
+
+	items := []StoredItem(nil)
+	err := error(nil)
+	_ = captureStdout(t, func() {
+		items, _, _, err = runModelTurn(context.Background(), prov, "instructions", nil, nil, newDisplay())
+	})
+	if err == nil {
+		t.Fatal("runModelTurn = nil error, want the failure reported")
+	}
+	if got := assistantText(items); got != "kept " {
+		t.Fatalf("stored answer = %q, want the text streamed before the failure", got)
+	}
+	if got, want := len(bodies()), maxModelRetries+2; got != want {
+		t.Fatalf("provider saw %d requests, want %d (the streamed attempt plus the retries)", got, want)
+	}
+}
+
+// TestRunModelTurnKeepsPartialAnswerOnInterrupt covers the interrupt path: a
+// turn whose stream is cancelled returns the text streamed before the signal
+// instead of dropping it, so the caller can persist an incomplete turn.
+func TestRunModelTurnKeepsPartialAnswerOnInterrupt(t *testing.T) {
+	prov, _ := scriptedProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "data: %s\n\n", textDelta("Half an "))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The turn runs in the background so the test can cancel it once the
+	// streamed text has reached the display, which is when the delta is
+	// safely in the turn's accumulators too.
+	seen, stop := watchStdout(t)
+	type turn struct {
+		items []StoredItem
+		final bool
+		err   error
+	}
+	ch := make(chan turn, 1)
+	go func() {
+		items, _, final, err := runModelTurn(ctx, prov, "instructions", nil, nil, newDisplay())
+		ch <- turn{items, final, err}
+	}()
+
+	waitForOutput(t, seen, "Half an ")
+	cancel()
+
+	select {
+	case got := <-ch:
+		stop()
+		if got.err == nil {
+			t.Fatal("runModelTurn = nil error, want the interrupt reported")
+		}
+		if got.final {
+			t.Fatal("final = true, want the turn reported as unfinished")
+		}
+		if text := assistantText(got.items); text != "Half an " {
+			t.Fatalf("stored answer = %q, want the streamed prefix", text)
+		}
+	case <-time.After(5 * time.Second):
+		stop()
+		t.Fatal("runModelTurn did not return after the interrupt")
+	}
+}
+
+// TestUnansweredToolOutputs covers the repair an interrupted turn applies
+// before it is saved: every function call the model made gets an output, so
+// the partial turn is still a conversation the provider accepts.
+func TestUnansweredToolOutputs(t *testing.T) {
+	items := []StoredItem{
+		{Role: "assistant", Content: "let me look"},
+		{Role: "function_call", CallID: "c0", Name: "bash", Arguments: `{"command":"ls"}`},
+		{Role: "function_call_output", CallID: "c0", Output: "done"},
+		{Role: "function_call", CallID: "c1", Name: "bash", Arguments: `{"command":`},
+	}
+	out := unansweredToolOutputs(items)
+	if len(out) != 1 {
+		t.Fatalf("unansweredToolOutputs = %+v, want one output for the unanswered call", out)
+	}
+	if out[0].Role != "function_call_output" || out[0].CallID != "c1" {
+		t.Fatalf("output = %+v, want a function_call_output for c1", out[0])
+	}
+	if !strings.Contains(out[0].Output, "interrupted") {
+		t.Fatalf("output = %q, want it to say the call was interrupted", out[0].Output)
+	}
+}
+
+// watchStdout redirects os.Stdout to a pipe while a turn runs and returns a
+// predicate that reports whether the output so far contains a string, plus a
+// stop function that restores os.Stdout and returns everything written.
+func watchStdout(t *testing.T) (seen func(string) bool, stop func() string) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b := make([]byte, 4096)
+		for {
+			n, err := r.Read(b)
+			if n > 0 {
+				mu.Lock()
+				buf.Write(b[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	seen = func(sub string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Contains(buf.String(), sub)
+	}
+	stop = func() string {
+		os.Stdout = old
+		_ = w.Close()
+		<-done
+		_ = r.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+	// Restore os.Stdout even if a test fails before calling stop, so a
+	// leaked pipe cannot swallow the output of every later test.
+	t.Cleanup(func() { stop() })
+	return seen, stop
+}
+
+// waitForOutput waits until seen reports sub, or fails the test.
+func waitForOutput(t *testing.T, seen func(string) bool, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !seen(sub) {
+		if time.Now().After(deadline) {
+			t.Fatalf("output never contained %q", sub)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

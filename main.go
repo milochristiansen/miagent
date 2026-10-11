@@ -134,7 +134,10 @@ func main() {
 	}
 
 	interrupted := func() {
-		fmt.Fprintf(os.Stderr, "interrupted by signal; session saved up to the last complete exchange\n")
+		if err := sess.commit(); err != nil {
+			fmt.Fprintf(os.Stderr, "saving session: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "interrupted by signal; session saved (a turn may be incomplete)\n")
 		os.Exit(3)
 	}
 
@@ -231,13 +234,9 @@ func main() {
 		// Run one model turn: stream the response through the display,
 		// and return the items it produced (assistant message, function
 		// calls) plus the usage the provider reported, for persistence.
+		// A turn that was interrupted returns what it streamed so far, so
+		// its input and output are kept rather than dropped.
 		turnItems, turnUsage, final, err := runModelTurn(ctx, prov, instructions, sess.Items, tools, disp)
-		if err != nil {
-			if ctx.Err() != nil {
-				interrupted()
-			}
-			fail("response", err)
-		}
 		sess.Items = append(sess.Items, turnItems...)
 		if turnUsage != nil {
 			// Locate the measurement: the input tokens covered the items
@@ -249,6 +248,20 @@ func main() {
 			// its own usage.
 			turnUsage.AtItems = len(sess.Items)
 			sess.Usages = append(sess.Usages, *turnUsage)
+		}
+		if err != nil {
+			// The turn failed, but it may still have produced output. A
+			// function call the model made but never got to run still
+			// needs an output, or the replayed turn is rejected; answer
+			// any such call, persist what there is, then report.
+			sess.Items = append(sess.Items, unansweredToolOutputs(turnItems)...)
+			if cerr := sess.commit(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "saving session: %v\n", cerr)
+			}
+			if ctx.Err() != nil {
+				interrupted()
+			}
+			fail("response", err)
 		}
 
 		if final {
@@ -333,6 +346,14 @@ func runModelTurn(
 		retries        int             // consecutive attempts that produced nothing
 	)
 
+	// partial collects what the turn has produced so far: the items of the
+	// last attempt, with the text carried from earlier failed attempts folded
+	// into the assistant message. It is what an interrupted or given-up turn
+	// hands back so its output is not lost.
+	partial := func(attempt streamAttempt) []StoredItem {
+		return setAssistantText(attempt.items, carry.String()+attempt.text)
+	}
+
 	for {
 		input := conversationInput
 		if continuing {
@@ -350,7 +371,7 @@ func runModelTurn(
 			if continuePrompt == "" {
 				prompt, perr := loadContinuePrompt()
 				if perr != nil {
-					return nil, nil, false, perr
+					return partial(streamAttempt{}), nil, false, perr
 				}
 				continuePrompt = prompt
 			}
@@ -387,8 +408,10 @@ func runModelTurn(
 		}
 
 		// An interrupt is not a failure to retry: the caller handles it.
+		// Return what the turn produced so far, so the caller can persist
+		// an incomplete turn instead of dropping its output.
 		if ctx.Err() != nil {
-			return nil, nil, false, aerr
+			return partial(attempt), attempt.usage, false, aerr
 		}
 
 		if attempt.progress {
@@ -402,9 +425,10 @@ func runModelTurn(
 		}
 
 		// Nothing was produced: the request itself failed. Retry it a bounded
-		// number of times before giving up.
+		// number of times before giving up, keeping any text the turn
+		// streamed on an earlier attempt.
 		if retries >= maxModelRetries {
-			return nil, nil, false, aerr
+			return partial(attempt), nil, false, aerr
 		}
 		retries++
 	}
@@ -425,8 +449,10 @@ const modelIdleTimeout = 2 * time.Minute
 const maxModelRetries = 5
 
 // streamAttempt is what one streaming request produced. On success items and
-// usage are set. On failure items is nil, but text and progress record what
-// was streamed before the failure so the caller can retry or continue.
+// usage are set. On failure items holds the reasoning, text, and function
+// calls reconstructed from the events that did arrive — an incomplete turn
+// keeps its output — while text and progress additionally tell the caller
+// whether it is worth retrying or continuing.
 type streamAttempt struct {
 	items    []StoredItem
 	usage    *Usage
@@ -522,6 +548,17 @@ func streamModelTurn(
 		(*parts)[partIndex].Text += delta
 	}
 
+	// failed assembles what the events produced so far and pairs it with the
+	// error that ended the stream, so a partial attempt still carries its
+	// reasoning, text, and function calls to the caller.
+	failed := func(err error) (streamAttempt, error) {
+		return streamAttempt{
+			items:    streamedItems(rsItems, fnCalls, msgText.String()),
+			text:     msgText.String(),
+			progress: progress,
+		}, err
+	}
+
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -529,10 +566,9 @@ func streamModelTurn(
 		}
 		if err != nil {
 			if idle.Load() {
-				return streamAttempt{text: msgText.String(), progress: progress},
-					fmt.Errorf("model call idle for %s", idleTimeout)
+				return failed(fmt.Errorf("model call idle for %s", idleTimeout))
 			}
-			return streamAttempt{text: msgText.String(), progress: progress}, err
+			return failed(err)
 		}
 
 		// activity records that this event carried model output. The idle
@@ -598,14 +634,14 @@ func streamModelTurn(
 			if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
 				msg = ev.Response.Error.Message
 			}
-			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
+			return failed(errors.New(msg))
 
 		case openai.ResponseStreamEventIncomplete:
 			msg := "response incomplete"
 			if ev.Response != nil && ev.Response.Error != nil && ev.Response.Error.Message != "" {
 				msg += ": " + ev.Response.Error.Message
 			}
-			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
+			return failed(errors.New(msg))
 
 		case openai.ResponseStreamEventError:
 			msg := ev.Message
@@ -615,7 +651,7 @@ func streamModelTurn(
 			if msg == "" {
 				msg = "unknown stream error"
 			}
-			return streamAttempt{text: msgText.String(), progress: progress}, errors.New(msg)
+			return failed(errors.New(msg))
 		}
 
 		if activity {
@@ -623,8 +659,7 @@ func streamModelTurn(
 		}
 	}
 	if !completed {
-		return streamAttempt{text: msgText.String(), progress: progress},
-			errors.New("stream ended before response.completed")
+		return failed(errors.New("stream ended before response.completed"))
 	}
 
 	// Prefer the canonical items carried by response.completed; fall back
@@ -634,19 +669,7 @@ func streamModelTurn(
 	if len(finalResp.Output) > 0 {
 		attemptItems = responseItems(finalResp.Output)
 	} else {
-		attemptItems = make([]StoredItem, 0, len(rsItems)+1+len(fnCalls))
-		attemptItems = append(attemptItems, rsItems...)
-		if msgText.Len() > 0 {
-			attemptItems = append(attemptItems, StoredItem{Role: "assistant", Content: msgText.String()})
-		}
-		// Function call names arrive in output_item.added; the arguments
-		// deltas fill them in. Calls whose item events never arrived are
-		// dropped here rather than replayed nameless.
-		for _, call := range fnCalls {
-			if call.Name != "" {
-				attemptItems = append(attemptItems, call)
-			}
-		}
+		attemptItems = streamedItems(rsItems, fnCalls, msgText.String())
 	}
 	return streamAttempt{
 		items:    attemptItems,
@@ -654,6 +677,27 @@ func streamModelTurn(
 		text:     msgText.String(),
 		progress: progress,
 	}, nil
+}
+
+// streamedItems assembles the items reconstructed from a stream's events, in
+// the order the model produced them: reasoning, then its answer, then its
+// function calls. It is also the fallback when response.completed carries no
+// output items, and the source of a partial attempt's items when the stream
+// fails first. A function call is kept only once its name and call id are
+// known: a call missing either cannot be replayed or answered, so storing it
+// would produce a session the provider rejects.
+func streamedItems(rsItems, fnCalls []StoredItem, text string) []StoredItem {
+	items := make([]StoredItem, 0, len(rsItems)+1+len(fnCalls))
+	items = append(items, rsItems...)
+	if text != "" {
+		items = append(items, StoredItem{Role: "assistant", Content: text})
+	}
+	for _, call := range fnCalls {
+		if call.Name != "" && call.CallID != "" {
+			items = append(items, call)
+		}
+	}
+	return items
 }
 
 // setAssistantText returns items whose assistant message carries answer, so
@@ -938,6 +982,35 @@ func toolFailure(teeErr io.Writer, msg string) (TGIResult, string) {
 	enc.SetIndent("", "    ")
 	_ = enc.Encode(res) // never fails for this value
 	return res, buf.String()
+}
+
+// unansweredToolOutputs returns a function_call_output for every function
+// call in items that no output answers, so a turn the interrupt cut off after
+// the model asked for a tool but before it could run can be persisted and
+// replayed: the provider rejects a function call left without its output. The
+// synthesized output says the call never ran, matching what executeTool reports
+// for a call the signal stopped before it started.
+func unansweredToolOutputs(items []StoredItem) []StoredItem {
+	answered := make(map[string]bool)
+	for _, it := range items {
+		if it.Role == "function_call_output" {
+			answered[it.CallID] = true
+		}
+	}
+	var out []StoredItem
+	for _, it := range items {
+		if it.Role != "function_call" || it.CallID == "" || answered[it.CallID] {
+			continue
+		}
+		answered[it.CallID] = true
+		_, envelope := toolFailure(nil, "not executed: interrupted by signal")
+		out = append(out, StoredItem{
+			Role:   "function_call_output",
+			CallID: it.CallID,
+			Output: envelope,
+		})
+	}
+	return out
 }
 
 // tryIndentJSONishText attempts to reindent the given string as if it was JSON, returning the trimmed text if it is not JSON.

@@ -380,10 +380,11 @@ func (s *Session) loadFrom(r io.Reader) error {
 }
 
 // commit appends the items and usage records added since the last commit to
-// the session file, creating the file if needed. An exchange is committed only
-// when it is complete: either a final answer or a finished tool round, so an
-// interruption never leaves a partial exchange (e.g. function calls without
-// their outputs) on disk.
+// the session file, creating the file if needed. It writes whatever is
+// pending, complete or not: the caller decides when a turn is worth keeping,
+// and the shutdown path commits a partial turn rather than dropping it (see
+// the interrupt handling in main). A caller that commits an interrupted turn
+// answers its dangling function calls first, so the file is still replayable.
 func (s *Session) commit() error {
 	items := s.Items[s.committed:]
 	usages := s.Usages[s.committedUsages:]
