@@ -190,13 +190,13 @@ func contextLine(sess *Session) (string, error) {
 	case !measured:
 		note = ", estimated; no model turn has reported usage yet"
 	}
-	limit, err := envTokenLimit("MIAGENT_CONTEXT_LIMIT")
+	limit, err := envTokenLimit(contextLimitEnv)
 	if err != nil {
 		return "", err
 	}
 	if limit == 0 {
-		return fmt.Sprintf("context: %s tokens%s (maximum unknown; set MIAGENT_CONTEXT_LIMIT)",
-			commas(used), note), nil
+		return fmt.Sprintf("context: %s tokens%s (maximum unknown; set %s)",
+			commas(used), note, contextLimitEnv), nil
 	}
 	return fmt.Sprintf("context: %s / %s tokens (%.1f%%%s)",
 		commas(used), commas(limit), 100*float64(used)/float64(limit), note), nil

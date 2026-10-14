@@ -90,12 +90,29 @@ func main() {
 	go func() {
 		<-sigCh
 		cancel()
+		// The first signal asks the run to stop. If that does not take (a
+		// blocked write, a live tool, a model call the provider will not let
+		// go of), a second signal is the reader insisting: stop routing
+		// signals and restore the default action, so Ctrl-C or SIGTERM can
+		// still end the process. Without this, signal.Notify keeps the
+		// default action disabled for the rest of the run and only SIGKILL
+		// remains.
+		signal.Stop(sigCh)
+		signal.Reset(os.Interrupt, syscall.SIGTERM)
 	}()
 
 	// Configure the run: the local .env first (it may point
 	// MIAGENT_CONFIG_DIR at another installation), then the resolved
 	// configuration directory, then the core .env (see loadConfig).
 	if err := loadConfig(stateDir); err != nil {
+		fail("loading configuration", err)
+	}
+
+	// How much of the context window must stay free before a turn may start.
+	// A malformed value is reported now, before the run, like the tool-call
+	// display size.
+	contextHeadroom, err := contextHeadroomFromEnv()
+	if err != nil {
 		fail("loading configuration", err)
 	}
 
@@ -231,6 +248,18 @@ func main() {
 		default:
 		}
 
+		// Do not start a turn the context window can barely hold: a request
+		// made with almost no room left is the one a provider is most likely
+		// to cut off mid-answer. Stop before the request is made and leave the
+		// session for /compact to shrink. The prompt just typed is dropped
+		// rather than committed, so it is not folded into the summary.
+		if note, refuse, err := contextRefusal(sess, contextHeadroom); err != nil {
+			fail("context", err)
+		} else if refuse {
+			disp.info(note + "\n")
+			os.Exit(1)
+		}
+
 		// Run one model turn: stream the response through the display,
 		// and return the items it produced (assistant message, function
 		// calls) plus the usage the provider reported, for persistence.
@@ -344,6 +373,7 @@ func runModelTurn(
 		continuing     bool            // the next attempt resumes a partial answer
 		continuePrompt string          // loaded from CONTINUE.md on first use
 		retries        int             // consecutive attempts that produced nothing
+		continuations  int             // attempts that resumed a partial answer
 	)
 
 	// partial collects what the turn has produced so far: the items of the
@@ -416,8 +446,16 @@ func runModelTurn(
 
 		if attempt.progress {
 			// The attempt produced output before it failed. Keep it and
-			// continue; as long as each attempt makes some progress the turn
-			// is moving forward, so there is no retry limit here.
+			// continue from where it stopped. Continuations are bounded like
+			// retries: a provider at its context limit can stream a little
+			// reasoning and then report the response incomplete on every
+			// call, which is progress by the letter of this rule but never an
+			// answer, and would otherwise loop forever.
+			if continuations >= maxModelContinuations {
+				return partial(attempt), attempt.usage, false,
+					fmt.Errorf("model turn did not complete after %d continuation attempts: %w", continuations, aerr)
+			}
+			continuations++
 			carry.WriteString(attempt.text)
 			continuing = true
 			retries = 0
@@ -447,6 +485,13 @@ const modelIdleTimeout = 2 * time.Minute
 // is retried before the turn fails. An attempt that streamed something is a
 // continuation, not a retry, and is not counted here.
 const maxModelRetries = 5
+
+// maxModelContinuations is how many times a model call that was cut off after
+// streaming some output is resumed before the turn is abandoned. A provider
+// that keeps producing a token or two of reasoning and then reporting the
+// response incomplete is making "progress" on every call without ever
+// finishing an answer; without this bound that state never ends.
+const maxModelContinuations = 10
 
 // streamAttempt is what one streaming request produced. On success items and
 // usage are set. On failure items holds the reasoning, text, and function

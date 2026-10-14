@@ -170,6 +170,36 @@ func TestRunModelTurnGivesUpAfterRetries(t *testing.T) {
 	}
 }
 
+// TestRunModelTurnBoundsContinuations covers a provider that answers every
+// call the same way: a little reasoning, then response.incomplete. Each call is
+// "progress", so the turn resumes — but only a bounded number of times, after
+// which it gives up rather than issuing calls forever. This is the shape a call
+// takes when the context window is nearly full and the provider has almost no
+// room left to finish an answer.
+func TestRunModelTurnBoundsContinuations(t *testing.T) {
+	writeContinuePrompt(t, "please continue where you left off")
+
+	scripts := make([]sseScript, 0, maxModelContinuations+1)
+	for i := 0; i <= maxModelContinuations; i++ {
+		scripts = append(scripts, func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprintf(w, "data: %s\n\n", reasoningDelta("rs_1", "still thinking"))
+			fmt.Fprintf(w, "data: %s\n\n", `{"type":"response.incomplete","response":{"id":"r","status":"incomplete"}}`)
+		})
+	}
+	prov, bodies := scriptedProvider(t, scripts...)
+
+	var err error
+	_ = captureStderr(t, func() {
+		_, _, _, err = runModelTurn(context.Background(), prov, "instructions", nil, nil, newDisplay())
+	})
+	if err == nil {
+		t.Fatal("runModelTurn = nil error, want the unfinished turn reported")
+	}
+	if got, want := len(bodies()), maxModelContinuations+1; got != want {
+		t.Fatalf("provider saw %d requests, want the turn bounded to %d", got, want)
+	}
+}
+
 // TestStreamModelTurnIdleTimeout covers the idle limit directly: a stream that
 // sends something and then goes quiet is cancelled, and what it already sent
 // is reported as progress so the caller continues rather than retries.
