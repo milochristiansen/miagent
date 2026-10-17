@@ -12,6 +12,25 @@ A lot of the code is very "sloppy", straight out of the agent. Some of it was wr
 by me personally. It depends on how interesting I found something vs how interesting I found the result. Long story
 short, the quality is... Variable, but stuff seems to work mostly. Have fun, but don't use this for anything critical.
 
+Aside from a `bash` tool, there is also a pair of tools for using the DeepSeek search and fetch APIs. This tool
+automatically hides itself if you do not provide a DeepSeek API key, either separately or via using a DeepSeek model.
+
+
+## Should I use this?
+
+No.
+
+This agent harness is made for me, and my tastes. You *may* use it, I even put a bit of effort into making it generic in
+spots where I could have made it specific to my environment, but I recommend that you do not use this project.
+
+Not because it won't work for you, but because you will likely enjoy the result a lot more if you *make your own!* It
+isn't hard, and you will have a tool you understand well enough to tweak it any way you like and have exactly what you
+want.
+
+That said, feel free to try this out and steal any ideas you like from it for your own thing, or even use this as a base
+to make your own thing. Or, *sigh*, I suppose you could just use this raw the way it is. It works pretty well and I like
+it quite a lot, so I guess it will probably do just as well for you. But, really, make your own. It's fun.
+
 
 ## Configuration directory
 

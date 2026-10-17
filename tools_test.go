@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -473,5 +477,195 @@ func TestDiscoverToolsRejectsBadBatch(t *testing.T) {
 	}
 	if _, ok := discoveredTools["gamma"]; ok {
 		t.Fatal("gamma was loaded from a batch that should have been rejected")
+	}
+}
+
+// deepSeekToolEnvNames are the variables the deepseek-search tool consults when
+// it decides whether it has a likely API key and where to send requests.
+var deepSeekToolEnvNames = []string{
+	"DEEPSEEK_SEARCH_API_KEY",
+	"DEEPSEEK_API_KEY",
+	"OPENAI_API_KEY",
+	"OPENAI_MODEL",
+	"DEEPSEEK_SEARCH_BASE_URL",
+	"DEEPSEEK_BASE_URL",
+	"DEEPSEEK_API_BASE_URL",
+}
+
+// clearDeepSeekToolEnv unsets the tool's configuration for the duration of a
+// test. t.Setenv cannot unset, but the tool treats an empty value as absent.
+func clearDeepSeekToolEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range deepSeekToolEnvNames {
+		t.Setenv(name, "")
+	}
+}
+
+// deepSeekToolPath returns the shipped deepseek-search tool, skipping when it
+// is not present in this checkout.
+func deepSeekToolPath(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join(toolsDir, "deepseek-search"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("deepseek-search tool not found: %v", err)
+	}
+	return path
+}
+
+// decodedToolNames reads the JSON Lines schema output back into tool names.
+func decodedToolNames(t *testing.T, stdout string) []string {
+	t.Helper()
+	var names []string
+	dec := json.NewDecoder(strings.NewReader(stdout))
+	for {
+		var meta struct {
+			Name string `json:"name"`
+		}
+		err := dec.Decode(&meta)
+		if err == io.EOF {
+			return names
+		}
+		if err != nil {
+			t.Fatalf("decoding schema output %q: %v", stdout, err)
+		}
+		names = append(names, meta.Name)
+	}
+}
+
+// TestDeepSeekSearchToolAdvertising covers the startup key selection: the tool
+// advertises search and fetch only when an explicit DeepSeek key is set, or
+// when the main agent key is set and the configured model is a DeepSeek one.
+func TestDeepSeekSearchToolAdvertising(t *testing.T) {
+	tool := deepSeekToolPath(t)
+	cases := []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{"no key", nil, nil},
+		{"explicit search key", map[string]string{
+			"DEEPSEEK_SEARCH_API_KEY": "search",
+		}, []string{"search", "fetch"}},
+		{"explicit deepseek key", map[string]string{
+			"DEEPSEEK_API_KEY": "deepseek",
+		}, []string{"search", "fetch"}},
+		{"explicit key without a deepseek model", map[string]string{
+			"DEEPSEEK_SEARCH_API_KEY": "search",
+			"OPENAI_API_KEY":          "main",
+			"OPENAI_MODEL":            "gpt-4o",
+		}, []string{"search", "fetch"}},
+		{"main key on a deepseek model", map[string]string{
+			"OPENAI_API_KEY": "main",
+			"OPENAI_MODEL":   "deepseek-chat",
+		}, []string{"search", "fetch"}},
+		{"main key on another model", map[string]string{
+			"OPENAI_API_KEY": "main",
+			"OPENAI_MODEL":   "gpt-4o",
+		}, nil},
+		{"main key with no model", map[string]string{
+			"OPENAI_API_KEY": "main",
+		}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearDeepSeekToolEnv(t)
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+
+			res := RunTGITool(context.Background(), filepath.Base(tool), tool, "SCHEMA", nil, nil, nil)
+			if res.Err != nil {
+				t.Fatalf("running schema: %v", res.Err)
+			}
+			if res.Code != 0 {
+				t.Fatalf("schema exited %d: %s", res.Code, res.Stderr)
+			}
+			got := decodedToolNames(t, res.Stdout)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("advertised tools = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeepSeekSearchToolInvoke covers both calls against a local server: the
+// path, bearer key, and request body, plus the raw JSON response on stdout.
+func TestDeepSeekSearchToolInvoke(t *testing.T) {
+	for _, dep := range []string{"curl", "jq"} {
+		if _, err := exec.LookPath(dep); err != nil {
+			t.Skipf("%s is not installed", dep)
+		}
+	}
+	tool := deepSeekToolPath(t)
+
+	type request struct {
+		path string
+		auth string
+		body string
+	}
+	requests := make(chan request, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- request{path: r.URL.Path, auth: r.Header.Get("Authorization"), body: string(body)}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/tools/search":
+			io.WriteString(w, `{"results":[{"title":"T","url":"https://example.com"}]}`)
+		case "/v1/tools/fetch":
+			io.WriteString(w, `{"title":"T","content":"# T"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	clearDeepSeekToolEnv(t)
+	t.Setenv("DEEPSEEK_SEARCH_API_KEY", "search-key")
+	t.Setenv("DEEPSEEK_API_KEY", "other-key")
+	t.Setenv("DEEPSEEK_SEARCH_BASE_URL", srv.URL)
+
+	res := RunTGITool(context.Background(), "search", tool, "INVOKE",
+		strings.NewReader(`{"query":"hello world","count":3,"need_content":true}`), nil, nil)
+	if res.Err != nil {
+		t.Fatalf("running search: %v", res.Err)
+	}
+	if res.Code != 0 {
+		t.Fatalf("search exited %d: %s", res.Code, res.Stderr)
+	}
+	got := <-requests
+	if got.path != "/v1/tools/search" {
+		t.Fatalf("search path = %q, want /v1/tools/search", got.path)
+	}
+	if got.auth != "Bearer search-key" {
+		t.Fatalf("search Authorization = %q, want the search key", got.auth)
+	}
+	if want := `{"query":"hello world","count":3,"need_content":true}`; got.body != want {
+		t.Fatalf("search body = %q, want %q", got.body, want)
+	}
+	if !strings.Contains(res.Stdout, `"results"`) {
+		t.Fatalf("search stdout = %q, want the raw JSON response", res.Stdout)
+	}
+
+	res = RunTGITool(context.Background(), "fetch", tool, "INVOKE",
+		strings.NewReader(`{"url":"https://example.com/article"}`), nil, nil)
+	if res.Err != nil {
+		t.Fatalf("running fetch: %v", res.Err)
+	}
+	if res.Code != 0 {
+		t.Fatalf("fetch exited %d: %s", res.Code, res.Stderr)
+	}
+	got = <-requests
+	if got.path != "/v1/tools/fetch" {
+		t.Fatalf("fetch path = %q, want /v1/tools/fetch", got.path)
+	}
+	if want := `{"url":"https://example.com/article"}`; got.body != want {
+		t.Fatalf("fetch body = %q, want %q", got.body, want)
+	}
+	if !strings.Contains(res.Stdout, `"content"`) {
+		t.Fatalf("fetch stdout = %q, want the raw JSON response", res.Stdout)
 	}
 }

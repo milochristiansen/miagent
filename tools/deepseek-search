@@ -1,0 +1,276 @@
+#!/bin/sh
+# TGI tool: DeepSeek Search and Fetch APIs.
+#
+# SCHEMA  -> print the "search" and "fetch" schemas (JSON Lines) only when a
+#            likely DeepSeek API key is configured. With no key the tool stays
+#            silent, so the harness does not advertise it.
+# INVOKE  -> dispatch on TGI_TOOL, read the JSON arguments from stdin, call the
+#            corresponding API, and print the raw JSON response on stdout.
+#
+# Key selection, highest precedence first:
+#   1. DEEPSEEK_SEARCH_API_KEY
+#   2. DEEPSEEK_API_KEY
+#   3. OPENAI_API_KEY, but only when OPENAI_MODEL names a DeepSeek model
+#
+# DEEPSEEK_SEARCH_BASE_URL (or DEEPSEEK_BASE_URL / DEEPSEEK_API_BASE_URL) can
+# override https://api.deepseek.com, mostly for testing. A value ending in /v1
+# is accepted, as is one without it.
+#
+# Requires curl and jq for INVOKE; SCHEMA needs neither.
+
+set -u
+
+# api_root prints the base URL ending in /v1, from the first override set.
+api_root() {
+	base=${DEEPSEEK_SEARCH_BASE_URL:-${DEEPSEEK_BASE_URL:-${DEEPSEEK_API_BASE_URL:-https://api.deepseek.com}}}
+	while [ "${base%/}" != "$base" ]; do
+		base=${base%/}
+	done
+	case "$base" in
+		*/v1) printf '%s' "$base" ;;
+		*) printf '%s/v1' "$base" ;;
+	esac
+}
+
+# select_key prints the API key to use, or returns non-zero when no likely key
+# is configured. Values are stripped of whitespace because keys never contain
+# it and a stray newline from a dotenv file should not be mistaken for a key.
+select_key() {
+	key=$(printf '%s' "${DEEPSEEK_SEARCH_API_KEY:-}" | tr -d '[:space:]')
+	if [ -n "$key" ]; then
+		printf '%s' "$key"
+		return 0
+	fi
+	key=$(printf '%s' "${DEEPSEEK_API_KEY:-}" | tr -d '[:space:]')
+	if [ -n "$key" ]; then
+		printf '%s' "$key"
+		return 0
+	fi
+	model=$(printf '%s' "${OPENAI_MODEL:-}" | tr '[:upper:]' '[:lower:]')
+	case "$model" in
+		*deepseek*)
+			key=$(printf '%s' "${OPENAI_API_KEY:-}" | tr -d '[:space:]')
+			if [ -n "$key" ]; then
+				printf '%s' "$key"
+				return 0
+			fi
+			;;
+	esac
+	return 1
+}
+
+# post calls one API endpoint and emits its JSON body. Transport failures and
+# non-2xx responses are reported on stderr with the API's error message and a
+# short hint, then exit non-zero.
+post() {
+	action=$1
+	endpoint=$2
+	payload=$3
+
+	bodyfile=$(mktemp "${TMPDIR:-/tmp}/deepseek-${action}.XXXXXX") || {
+		echo "deepseek $action: cannot create a temporary file" >&2
+		exit 1
+	}
+	errfile=$(mktemp "${TMPDIR:-/tmp}/deepseek-${action}-err.XXXXXX") || {
+		rm -f "$bodyfile"
+		echo "deepseek $action: cannot create a temporary file" >&2
+		exit 1
+	}
+	trap 'rm -f "$bodyfile" "$errfile"' 0
+
+	status=$(curl --silent --show-error --connect-timeout 10 --max-time 90 \
+		--output "$bodyfile" --write-out '%{http_code}' \
+		--header "Authorization: Bearer $api_key" \
+		--header 'Accept: application/json' \
+		--header 'Content-Type: application/json' \
+		--request POST --data-binary "$payload" "$endpoint" 2>"$errfile")
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		detail=$(cat "$errfile" 2>/dev/null)
+		if [ -n "$detail" ]; then
+			echo "deepseek $action failed: request error (curl exit $rc): $detail" >&2
+		else
+			echo "deepseek $action failed: request error (curl exit $rc)" >&2
+		fi
+		exit 1
+	fi
+
+	if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+		cat "$bodyfile"
+		return 0
+	fi
+
+	# Prefer the API's error.message; fall back to the raw body so a proxy's
+	# plain-text error is not lost.
+	detail=$(jq -r 'if type == "object" and (.error | type) == "object" and (.error.message | type) == "string" then .error.message else empty end' "$bodyfile" 2>/dev/null)
+	if [ -z "$detail" ]; then
+		detail=$(head -c 1500 "$bodyfile" 2>/dev/null | tr '\n\r' '  ')
+	fi
+
+	hint=""
+	case "$status" in
+		401) hint="the API key is missing or invalid" ;;
+		402) hint="the account has insufficient balance" ;;
+		403) hint="the request was rejected by the security policy" ;;
+		404) hint="no usable page content could be retrieved" ;;
+		408) hint="the request timed out; retry" ;;
+		413) hint="the request body is too large" ;;
+		429) hint="the rate limit was exceeded; wait and retry" ;;
+		5??) hint="the server erred; retry later" ;;
+	esac
+
+	msg="deepseek $action failed: HTTP $status"
+	[ -n "$detail" ] && msg="$msg: $detail"
+	[ -n "$hint" ] && msg="$msg ($hint)"
+	echo "$msg" >&2
+	exit 1
+}
+
+invoke_search() {
+	args=$(cat)
+	if [ -z "$args" ]; then
+		echo "search: expected a JSON object on stdin" >&2
+		exit 2
+	fi
+	if ! printf '%s' "$args" | jq -e 'type == "object"' >/dev/null 2>&1; then
+		echo "search: arguments must be a JSON object" >&2
+		exit 2
+	fi
+
+	qtype=$(printf '%s' "$args" | jq -r '.query | type')
+	if [ "$qtype" != "string" ]; then
+		echo "search: 'query' is required and must be a string" >&2
+		exit 2
+	fi
+	query=$(printf '%s' "$args" | jq -r '.query')
+	qlen=$(jq -nr --arg q "$query" '$q | length')
+	if [ "$qlen" -lt 1 ] || [ "$qlen" -gt 128 ]; then
+		echo "search: 'query' must be between 1 and 128 characters" >&2
+		exit 2
+	fi
+	if [ -z "$(printf '%s' "$query" | tr -d '[:space:]')" ]; then
+		echo "search: 'query' cannot be all whitespace" >&2
+		exit 2
+	fi
+
+	if printf '%s' "$args" | jq -e 'has("count") and (.count != null)' >/dev/null 2>&1; then
+		if ! printf '%s' "$args" | jq -e '(.count | type) == "number" and (.count | floor) == .count and .count >= 1 and .count <= 50' >/dev/null 2>&1; then
+			echo "search: 'count' must be an integer between 1 and 50" >&2
+			exit 2
+		fi
+	fi
+
+	if printf '%s' "$args" | jq -e 'has("ori_question") and (.ori_question != null)' >/dev/null 2>&1; then
+		if ! printf '%s' "$args" | jq -e '(.ori_question | type) == "string"' >/dev/null 2>&1; then
+			echo "search: 'ori_question' must be a string" >&2
+			exit 2
+		fi
+		oq=$(printf '%s' "$args" | jq -r '.ori_question')
+		oqlen=$(jq -nr --arg q "$oq" '$q | length')
+		if [ "$oqlen" -lt 1 ] || [ "$oqlen" -gt 128 ]; then
+			echo "search: 'ori_question' must be between 1 and 128 characters" >&2
+			exit 2
+		fi
+	fi
+
+	if printf '%s' "$args" | jq -e 'has("localization") and (.localization != null)' >/dev/null 2>&1; then
+		if ! printf '%s' "$args" | jq -e '(.localization | type) == "string"' >/dev/null 2>&1; then
+			echo "search: 'localization' must be a string" >&2
+			exit 2
+		fi
+	fi
+
+	if printf '%s' "$args" | jq -e 'has("need_content") and (.need_content != null)' >/dev/null 2>&1; then
+		if ! printf '%s' "$args" | jq -e '(.need_content | type) == "boolean"' >/dev/null 2>&1; then
+			echo "search: 'need_content' must be a boolean" >&2
+			exit 2
+		fi
+	fi
+
+	payload=$(printf '%s' "$args" | jq -c '
+		{query: .query}
+		+ (if .count? != null then {count: .count} else {} end)
+		+ (if .ori_question? != null then {ori_question: .ori_question} else {} end)
+		+ (if .localization? != null then {localization: .localization} else {} end)
+		+ (if .need_content? != null then {need_content: .need_content} else {} end)
+	')
+	if [ -z "$payload" ]; then
+		echo "search: could not build the request body" >&2
+		exit 2
+	fi
+
+	post search "$(api_root)/tools/search" "$payload"
+}
+
+invoke_fetch() {
+	args=$(cat)
+	if [ -z "$args" ]; then
+		echo "fetch: expected a JSON object on stdin" >&2
+		exit 2
+	fi
+	if ! printf '%s' "$args" | jq -e 'type == "object"' >/dev/null 2>&1; then
+		echo "fetch: arguments must be a JSON object" >&2
+		exit 2
+	fi
+
+	utype=$(printf '%s' "$args" | jq -r '.url | type')
+	if [ "$utype" != "string" ]; then
+		echo "fetch: 'url' is required and must be a string" >&2
+		exit 2
+	fi
+	url=$(printf '%s' "$args" | jq -r '.url')
+	ulen=$(jq -nr --arg u "$url" '$u | length')
+	if [ "$ulen" -lt 1 ] || [ "$ulen" -gt 8192 ]; then
+		echo "fetch: 'url' must be between 1 and 8192 characters" >&2
+		exit 2
+	fi
+	case "$url" in
+		http://?*|https://?*) ;;
+		*)
+			echo "fetch: 'url' must be an HTTP or HTTPS URL" >&2
+			exit 2
+			;;
+	esac
+
+	payload=$(printf '%s' "$args" | jq -c '{url: .url}')
+	post fetch "$(api_root)/tools/fetch" "$payload"
+}
+
+case "${TGI_METHOD:-}" in
+SCHEMA)
+	if ! select_key >/dev/null; then
+		# No likely key: stay silent so this file reports no tools.
+		exit 0
+	fi
+	cat <<'EOF'
+{"name":"search","description":"Search the live web with DeepSeek's Search API. Returns a JSON object with a results array; each result has title, url, snippet, summary, optional content, and metadata such as site_name, date, authority, and rerank_score (1.5 or above is high quality). The query supports site:, -site:, lang:, after:, before:, required terms, excluded terms, and exact phrases in quotes. Set need_content only when summaries are insufficient, because full page content is large. A search with no matches returns an empty results array. On failure, stderr carries the HTTP status and any API error message; retry 408, 429, and 5xx after a pause, but do not retry other 4xx without changing the request.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The search query, 1 to 128 characters. Supports site:, -site:, lang:, after:, before:, required terms, excluded terms, and exact phrases in quotes."},"count":{"type":"integer","minimum":1,"maximum":50,"default":10,"description":"The number of results to return, between 1 and 50. Defaults to 10."},"ori_question":{"type":"string","description":"The user's original question that triggered the search, 1 to 128 characters, to improve query understanding."},"localization":{"type":"string","description":"An optional IP address used to localize search results."},"need_content":{"type":"boolean","default":false,"description":"Return full page content in each result's content field. Defaults to false; full content is large and context-expensive."}},"required":["query"]}}
+{"name":"fetch","description":"Fetch one web page through DeepSeek's Fetch API. Returns a JSON object with the page's title and content, where content is the page converted to Markdown; the content can be large. Use it to read a URL found by search or given by the user. On failure, stderr carries the HTTP status and any API error message; 403 means the security policy blocked the request, 404 means no usable content was retrievable, and 408, 429, and 5xx may be retried after a pause. Do not retry other 4xx without changing the request.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The HTTP or HTTPS URL to fetch, at most 8192 characters."}},"required":["url"]}}
+EOF
+	;;
+INVOKE)
+	if ! command -v curl >/dev/null 2>&1; then
+		echo "deepseek search/fetch: curl not found in PATH" >&2
+		exit 127
+	fi
+	if ! command -v jq >/dev/null 2>&1; then
+		echo "deepseek search/fetch: jq not found in PATH" >&2
+		exit 127
+	fi
+	if ! api_key=$(select_key); then
+		echo "deepseek search/fetch: no API key configured (set DEEPSEEK_SEARCH_API_KEY or DEEPSEEK_API_KEY, or use a DeepSeek model with OPENAI_API_KEY)" >&2
+		exit 2
+	fi
+	case "${TGI_TOOL:-}" in
+		search) invoke_search ;;
+		fetch) invoke_fetch ;;
+		*)
+			echo "deepseek search/fetch: unknown tool '${TGI_TOOL:-}'" >&2
+			exit 2
+			;;
+	esac
+	;;
+*)
+	echo "usage: TGI_METHOD=SCHEMA|INVOKE" >&2
+	exit 2
+	;;
+esac
