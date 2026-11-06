@@ -56,12 +56,15 @@ src/
   app.odin        app state, layout constants, per-project drawer lifecycle
   panels.odin     terminal rail and drawers
   projects.odin   per-project harness/view/shell state + projects pane
-  filepicker.odin async portal picker child process + fallback path entry
+  filepicker.odin async portal folder/multi-file picker child process + fallback path entry
   audio.odin      turn-end tone via dlopen'd ALSA + terminal-bell fallback
   gui_config.odin window metrics + known projects in gui.json
   portal.c       XDG Desktop Portal FileChooser D-Bus/GIO shim
-  conversation.odin  transcript view state + conversation/composer rendering
-  markdown.odin   small Markdown renderer (paragraphs, headings, code, lists, tables)
+  conversation.odin  transcript view state, composer, prompt attachment chips
+  markdown.odin   small Markdown renderer (paragraphs, headings, code, lists, tables, links, images)
+  image.odin      Markdown image cache, worker-thread loading, expanded viewer overlay
+  image.c         stb_image decode + libcurl image fetch shims
+  stb_image.h     vendored public-domain image decoder
   terminal.odin   PTY <- libghostty-vt <- ImGui draw list; state, input, rendering cache
   terminal_effects.odin  terminal effects (queries, bell, clipboard, focus, reset, compression)
   terminal_selection.odin selection gestures, word/line/block selection, OSC 8 links
@@ -76,8 +79,8 @@ src/
     harness.odin  public API, worker thread, event queue, agent loop, nugget dedupe
     config.odin   per-project dotenv map, prompts, paths, environment
     session.odin  CLI-compatible JSONL sessions, context sizing, nugget digests
-    provider.odin Responses API request/SSE/reconstruction, /models
-    tools.odin    TGI tool discovery, execution, attachment/nugget collection
+    provider.odin Responses API request/SSE/reconstruction, /models, prompt/tool attachments
+    tools.odin    TGI tool discovery/execution, prompt + tool attachment collection, nuggets
     http.c        libcurl streaming + buffered GET shim
     archive.odin  tar.gz session archives, naming, and atomic file operations
     session_commands.odin  /new, /sessions, /load, /compact, /desc

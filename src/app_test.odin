@@ -31,3 +31,24 @@ test_ui_text_sizes_are_integral :: proc(t: ^testing.T) {
 			"ui_text_px(%.1f) should be a whole pixel, got %.3f", size, px)
 	}
 }
+
+@(test)
+test_conversation_tab_attachments :: proc(t: ^testing.T) {
+	tab: Conversation_Tab
+	conversation_tab_init(&tab, "/tmp/session.jsonl", "test")
+	defer conversation_tab_destroy(&tab)
+
+	testing.expect(t, conversation_tab_add_attachment(&tab, "/tmp/a.png"))
+	testing.expect(t, !conversation_tab_add_attachment(&tab, "/tmp/a.png"))
+	testing.expect(t, conversation_tab_add_attachment(&tab, "/tmp/b.md"))
+	testing.expect_value(t, len(tab.attachments), 2)
+	testing.expect_value(t, tab.attachments[0], "/tmp/a.png")
+	testing.expect_value(t, tab.attachments[1], "/tmp/b.md")
+
+	conversation_tab_remove_attachment(&tab, 0)
+	testing.expect_value(t, len(tab.attachments), 1)
+	testing.expect_value(t, tab.attachments[0], "/tmp/b.md")
+
+	conversation_tab_clear_attachments(&tab)
+	testing.expect_value(t, len(tab.attachments), 0)
+}

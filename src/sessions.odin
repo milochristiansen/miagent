@@ -28,22 +28,50 @@ Conversation_Tab :: struct {
 
 	composer:         [4096]u8,
 	composer_refocus: bool,
+	// Files chosen for the next prompt. The full path is both the chip label
+	// and the argument passed to the harness when the prompt is sent.
+	attachments:      [dynamic]string,
 
 	details_open: bool,
 	details:      Details_State,
 }
 
+ATTACHMENT_MAX :: 16
+
 conversation_tab_init :: proc(t: ^Conversation_Tab, session_path, name: string) {
 	t.session_path = strings.clone(session_path)
 	t.name = strings.clone(name)
+	t.attachments = make([dynamic]string, 0, 4)
 	view_init(&t.view)
 	details_init(&t.details)
+}
+
+conversation_tab_clear_attachments :: proc(t: ^Conversation_Tab) {
+	for path in t.attachments do delete(path)
+	clear(&t.attachments)
+}
+
+conversation_tab_add_attachment :: proc(t: ^Conversation_Tab, path: string) -> bool {
+	if t == nil || len(path) == 0 || len(t.attachments) >= ATTACHMENT_MAX do return false
+	for existing in t.attachments {
+		if existing == path do return false
+	}
+	append(&t.attachments, strings.clone(path))
+	return true
+}
+
+conversation_tab_remove_attachment :: proc(t: ^Conversation_Tab, index: int) {
+	if t == nil || index < 0 || index >= len(t.attachments) do return
+	delete(t.attachments[index])
+	ordered_remove(&t.attachments, index)
 }
 
 conversation_tab_destroy :: proc(t: ^Conversation_Tab) {
 	if t.harness_ready do harness.harness_destroy(&t.harness)
 	view_destroy(&t.view)
 	details_destroy(&t.details)
+	conversation_tab_clear_attachments(t)
+	delete(t.attachments)
 	delete(t.session_path)
 	delete(t.name)
 	t^ = {}

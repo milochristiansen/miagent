@@ -199,6 +199,32 @@ function_call_input :: proc(it: StoredItem) -> json.Value {
 	return o
 }
 
+// append_attachment_parts emits the same attachment representation for tool
+// results and user prompts: images become input_image, text files become an
+// input_text part, and other files become input_file data URLs.
+append_attachment_parts :: proc(parts: ^json.Array, attachments: []Attachment) {
+	for att in attachments {
+		switch att.kind {
+		case "image":
+			p := make(json.Object)
+			obj_set(&p, "type", str_value("input_image"))
+			obj_set(&p, "detail", str_value("high"))
+			obj_set(&p, "image_url", str_value(att.url))
+			append(parts, p)
+		case "text":
+			file_text := fmt.aprintf("[Attached file: %s]\n%s", att.name, att.text)
+			append(parts, text_part("input_text", file_text))
+			delete(file_text)
+		case "binary":
+			p := make(json.Object)
+			obj_set(&p, "type", str_value("input_file"))
+			obj_set(&p, "filename", str_value(att.name))
+			obj_set(&p, "file_data", str_value(att.url))
+			append(parts, p)
+		}
+	}
+}
+
 function_output_input :: proc(it: StoredItem) -> json.Value {
 	o := make(json.Object)
 	obj_set(&o, "type", str_value("function_call_output"))
@@ -211,27 +237,21 @@ function_output_input :: proc(it: StoredItem) -> json.Value {
 	if len(it.output) > 0 {
 		append(&parts, text_part("input_text", it.output))
 	}
-	for att in it.attachments {
-		switch att.kind {
-		case "image":
-			p := make(json.Object)
-			obj_set(&p, "type", str_value("input_image"))
-			obj_set(&p, "detail", str_value("high"))
-			obj_set(&p, "image_url", str_value(att.url))
-			append(&parts, p)
-		case "text":
-			file_text := fmt.aprintf("[Attached file: %s]\n%s", att.name, att.text)
-			append(&parts, text_part("input_text", file_text))
-			delete(file_text)
-		case "binary":
-			p := make(json.Object)
-			obj_set(&p, "type", str_value("input_file"))
-			obj_set(&p, "filename", str_value(att.name))
-			obj_set(&p, "file_data", str_value(att.url))
-			append(&parts, p)
-		}
-	}
+	append_attachment_parts(&parts, it.attachments)
 	obj_set(&o, "output", parts)
+	return o
+}
+
+// user_input keeps the prompt first and places the files immediately after it
+// in the same message content array.
+user_input :: proc(it: StoredItem) -> json.Value {
+	o := make(json.Object)
+	obj_set(&o, "type", str_value("message"))
+	obj_set(&o, "role", str_value("user"))
+	parts := make(json.Array, 0, len(it.attachments) + 1)
+	if len(it.content) > 0 do append(&parts, text_part("input_text", it.content))
+	append_attachment_parts(&parts, it.attachments)
+	obj_set(&o, "content", parts)
 	return o
 }
 
@@ -246,7 +266,7 @@ nugget_input :: proc(it: StoredItem) -> json.Value {
 item_to_input :: proc(it: StoredItem) -> json.Value {
 	switch it.role {
 	case "user":
-		return message_input("user", "input_text", it.content)
+		return user_input(it)
 	case "compaction":
 		return message_input("user", "input_text", fmt.aprintf("%s%s%s", COMPACTION_PREFIX, it.content, COMPACTION_SUFFIX))
 	case "assistant":

@@ -49,6 +49,7 @@ foreign cimgui {
 	igEndFrame :: proc() ---
 	igGetDrawData :: proc() -> ^ImDrawData ---
 	igGetWindowDrawList :: proc() -> ^ImDrawList ---
+	igGetForegroundDrawList_Nil :: proc() -> ^ImDrawList ---
 
 	// --- windows -----------------------------------------------------------
 	igBegin :: proc(name: cstring, p_open: ^bool, flags: ImGuiWindowFlags) -> bool ---
@@ -128,6 +129,7 @@ foreign cimgui {
 
 	mi_set_next_window_rect :: proc(x, y, w, h: f32) ---
 	mi_begin_panel :: proc(name: cstring, x, y, w, h: f32, interactive: bool) -> bool ---
+	mi_begin_overlay :: proc(name: cstring, x, y, w, h: f32) -> bool ---
 
 	mi_draw_rect :: proc(list: ^ImDrawList, x0, y0, x1, y1: f32, col: ImU32, rounding: f32) ---
 	mi_draw_rect_stroke :: proc(list: ^ImDrawList, x0, y0, x1, y1: f32, col: ImU32, rounding: f32, thickness: f32) ---
@@ -135,6 +137,7 @@ foreign cimgui {
 	mi_draw_line :: proc(list: ^ImDrawList, x0, y0, x1, y1: f32, col: ImU32, thickness: f32) ---
 	mi_draw_circle :: proc(list: ^ImDrawList, x, y, r: f32, col: ImU32) ---
 	mi_draw_triangle :: proc(list: ^ImDrawList, ax, ay, bx, by, cx, cy: f32, col: ImU32) ---
+	mi_draw_image :: proc(list: ^ImDrawList, texture: u64, x0, y0, x1, y1, u0, v0, u1, v1: f32, col: ImU32, rounding: f32) ---
 	mi_clip_push :: proc(list: ^ImDrawList, x0, y0, x1, y1: f32) ---
 	mi_clip_pop :: proc(list: ^ImDrawList) ---
 

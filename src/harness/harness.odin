@@ -58,8 +58,17 @@ event_destroy :: proc(ev: ^Event) {
 // their target separate from prompt text so a GUI action can pass an absolute
 // path (including spaces) without going through slash-command word splitting.
 Work_Item :: struct {
-	prompt:  string,
-	archive: string,
+	prompt:      string,
+	archive:     string,
+	attachments: []string,
+}
+
+work_item_destroy :: proc(w: ^Work_Item) {
+	delete(w.prompt)
+	delete(w.archive)
+	for path in w.attachments do delete(path)
+	delete(w.attachments)
+	w^ = {}
 }
 
 Harness :: struct {
@@ -327,10 +336,7 @@ harness_destroy :: proc(h: ^Harness) {
 	sync.mutex_unlock(&h.work_mutex)
 	if h.worker != nil do thread.join(h.worker)
 
-	for &w in h.work {
-		delete(w.prompt)
-		delete(w.archive)
-	}
+	for &w in h.work do work_item_destroy(&w)
 	delete(h.work)
 	for &ev in h.events do event_destroy(&ev)
 	delete(h.events)
@@ -348,6 +354,13 @@ harness_reset_live :: proc(h: ^Harness) {
 }
 
 harness_submit :: proc(h: ^Harness, prompt: string) -> bool {
+	return harness_submit_files(h, prompt, nil)
+}
+
+// harness_submit_files queues a prompt together with local file paths. The
+// paths are read on the worker and attached directly after the prompt in the
+// user message. The caller may free its path strings after this returns.
+harness_submit_files :: proc(h: ^Harness, prompt: string, files: []string) -> bool {
 	trimmed := strings.trim_space(prompt)
 	if len(trimmed) == 0 do return false
 	sync.mutex_lock(&h.work_mutex)
@@ -355,7 +368,9 @@ harness_submit :: proc(h: ^Harness, prompt: string) -> bool {
 		sync.mutex_unlock(&h.work_mutex)
 		return false
 	}
-	append(&h.work, Work_Item{prompt = strings.clone(trimmed)})
+	attachments := make([]string, len(files))
+	for path, i in files do attachments[i] = strings.clone(path)
+	append(&h.work, Work_Item{prompt = strings.clone(trimmed), attachments = attachments})
 	sync.cond_signal(&h.work_cond)
 	sync.mutex_unlock(&h.work_mutex)
 	return true
@@ -418,10 +433,9 @@ worker_loop :: proc(h: ^Harness) {
 		if len(item.archive) > 0 {
 			h_run_archive_load(h, item.archive)
 		} else {
-			h_run_prompt(h, item.prompt)
+			h_run_prompt(h, item.prompt, item.attachments)
 		}
-		delete(item.prompt)
-		delete(item.archive)
+		work_item_destroy(&item)
 
 		sync.mutex_lock(&h.work_mutex)
 		h.running = false
@@ -608,11 +622,12 @@ h_run_archive_load :: proc(h: ^Harness, target: string) {
 	h_emit(h, Event{kind = .Action_End})
 }
 
-h_run_prompt :: proc(h: ^Harness, prompt: string) {
+h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 	command := strings.has_prefix(prompt, "/")
 	if len(h.config.project_dir) > 0 do h_reload_runtime(h, !command)
 	harness_reset_live(h)
 	if command {
+		if len(files) > 0 do h_emit_note(h, "attachments are ignored for slash commands")
 		h_run_command(h, prompt)
 		h_emit(h, Event{kind = .Action_End})
 		return
@@ -654,12 +669,41 @@ h_run_prompt :: proc(h: ^Harness, prompt: string) {
 		}
 	}
 
+	attachments := make([dynamic]Attachment, 0, len(files))
+	total := i64(0)
+	for path in files {
+		att, err := attachment_from_path(path)
+		if len(err) > 0 {
+			note := fmt.aprintf("attachment skipped: %s", err)
+			h_emit_note(h, note)
+			delete(note)
+			delete(err)
+			continue
+		}
+		total += i64(att.size)
+		if total > PROMPT_ATTACHMENT_TOTAL_BYTES {
+			attachment_destroy(&att)
+			h_emit_note(h, "attachment total exceeds 48 MB; further files skipped")
+			break
+		}
+		append(&attachments, att)
+	}
+
 	sync.mutex_lock(&h.state_mutex)
-	session_append_item(&h.session, StoredItem{role = "user", content = strings.clone(prompt)})
+	session_append_item(&h.session, StoredItem{
+		role = "user",
+		content = strings.clone(prompt),
+		attachments = attachments[:],
+	})
 	sync.mutex_unlock(&h.state_mutex)
 	turn_info_begin(h, prompt)
 	defer turn_info_auto_finish(h)
-	h_emit(h, Event{kind = .User, text = prompt})
+	meta := ""
+	if len(attachments) > 0 {
+		meta = fmt.aprintf("%d attachment%s", len(attachments), len(attachments) == 1 ? "" : "s")
+	}
+	h_emit(h, Event{kind = .User, text = prompt, meta = meta})
+	delete(meta)
 
 	// Nuggets are hard, unchanging context, so one copy per unique content is
 	// enough. Seed the set from the whole session and keep it current as this

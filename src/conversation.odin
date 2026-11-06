@@ -83,6 +83,21 @@ Conversation_View :: struct {
 	reflow_pending:      bool,
 	reflow_from_bottom:  f32,
 	sel:                Sel_State,
+
+	// A press that began on a link is held until release so dragging can still
+	// select text over a link without opening it. The URL is cloned because the
+	// frame-local link record it came from is gone by the next frame.
+	link_press_url:    string,
+	link_press_x:      f32,
+	link_press_y:      f32,
+	link_press_active: bool,
+
+	// Image clicks open a viewer on release. The cache entry pointer is stable
+	// for the lifetime of the cache, so it is safe to hold across frames.
+	image_press_asset:  ^Image_Entry,
+	image_press_x:      f32,
+	image_press_y:      f32,
+	image_press_active: bool,
 }
 
 view_init :: proc(v: ^Conversation_View) {
@@ -148,6 +163,11 @@ view_clear_messages :: proc(v: ^Conversation_View) {
 	v.reflow_pending = false
 	v.reflow_from_bottom = 0
 	v.turn_running = false
+	delete(v.link_press_url)
+	v.link_press_url = ""
+	v.link_press_active = false
+	v.image_press_asset = nil
+	v.image_press_active = false
 	sel_clear(&v.sel)
 }
 
@@ -190,6 +210,7 @@ view_destroy :: proc(v: ^Conversation_View) {
 	delete(v.messages)
 	delete(v.model)
 	delete(v.session_path)
+	delete(v.link_press_url)
 	sel_destroy(&v.sel)
 }
 
@@ -217,6 +238,11 @@ view_add_error :: proc(v: ^Conversation_View, text: string) {
 
 view_add_user :: proc(v: ^Conversation_View, text: string) {
 	view_append(v, View_Message{kind = .User, text = text})
+	v.follow = true
+}
+
+view_add_user_meta :: proc(v: ^Conversation_View, text, meta: string) {
+	view_append(v, View_Message{kind = .User, text = text, meta = meta})
 	v.follow = true
 }
 
@@ -289,7 +315,13 @@ view_load_history :: proc(v: ^Conversation_View, items: []harness.StoredItem, se
 	for it in items {
 		switch it.role {
 		case "user":
-			view_add_user(v, it.content)
+			if len(it.attachments) > 0 {
+				meta := fmt.aprintf("%d attachment%s", len(it.attachments), len(it.attachments) == 1 ? "" : "s")
+				view_add_user_meta(v, it.content, meta)
+				delete(meta)
+			} else {
+				view_add_user(v, it.content)
+			}
 		case "assistant":
 			view_append(v, View_Message{kind = .Assistant, text = it.content, name = "MiAgent"})
 		case "reasoning":
@@ -350,7 +382,7 @@ view_apply_event :: proc(v: ^Conversation_View, ev: ^harness.Event) {
 		view_add_error(v, ev.text)
 	case .User:
 		v.turn_running = true
-		view_add_user(v, ev.text)
+		view_add_user_meta(v, ev.text, ev.meta)
 	case .Assistant_Start:
 		view_append(v, View_Message{kind = .Assistant, name = len(ev.name) > 0 ? ev.name : "MiAgent"})
 		v.assistant_index = len(v.messages) - 1
@@ -479,7 +511,17 @@ conversation_poll :: proc(v: ^Conversation_View, h: ^harness.Harness) -> bool {
 	return agent_turn_ended
 }
 
-draw_message :: proc(app: ^App, list: ^ImDrawList, m: ^View_Message, index: int, x, y, w: f32, sel: ^Sel_State, active: bool = false) -> f32 {
+draw_message :: proc(
+	app: ^App,
+	list: ^ImDrawList,
+	m: ^View_Message,
+	index: int,
+	x, y, w: f32,
+	sel: ^Sel_State,
+	active: bool = false,
+	links: ^[dynamic]Md_Link_Rect = nil,
+	images: ^Md_Image_Context = nil,
+) -> f32 {
 	th := app.th
 	rec_local: Sel_Recorder
 	rec: ^Sel_Recorder
@@ -506,10 +548,14 @@ draw_message :: proc(app: ^App, list: ^ImDrawList, m: ^View_Message, index: int,
 		tw, _ := measure(app.f.ui, 15.0, m.text)
 		bubble_w := min(tw + 28, max_bubble)
 		tht := plain_wrapped_height(app.f.ui, 15.0, bubble_w - 28, m.text)
+		meta_h: f32 = len(m.meta) > 0 ? 16 : 0
 		bx := x + w - bubble_w
-		br := rect(bx, y, bubble_w, tht + 22)
+		br := rect(bx, y, bubble_w, tht + 22 + meta_h)
 		panel(list, br, over(th.bg, alpha(th.accent, 0.16)), 10, alpha(th.accent, 0.22), 1)
-		draw_plain_wrapped(list, app.f.ui, 15.0, br.x + 14, br.y + 11, bubble_w - 28, th.fg, m.text, rec)
+		if meta_h > 0 {
+			text_font(list, app.f.ui, 10.5, br.x + 14, br.y + 7, th.fg_faint, m.meta)
+		}
+		draw_plain_wrapped(list, app.f.ui, 15.0, br.x + 14, br.y + 11 + meta_h, bubble_w - 28, th.fg, m.text, rec)
 		return br.h + 18
 
 	case .Assistant:
@@ -520,7 +566,7 @@ draw_message :: proc(app: ^App, list: ^ImDrawList, m: ^View_Message, index: int,
 			text_font(list, app.f.ui, 11.5, x + 13 + lw + 8, y + 0.5, th.fg_faint, m.meta)
 		}
 		body_w := w * 0.90
-		bh := draw_markdown(list, app.f.ui, app.f.mono, 15.0, x + 13, y + 20, body_w, th, m.text, mix(th.fg, th.bg, 0.04), rec)
+		bh := draw_markdown(list, app.f.ui, app.f.mono, 15.0, x + 13, y + 20, body_w, th, m.text, mix(th.fg, th.bg, 0.04), rec, links, images)
 		return 20 + bh + 18
 
 	case .Reasoning:
@@ -537,7 +583,7 @@ draw_message :: proc(app: ^App, list: ^ImDrawList, m: ^View_Message, index: int,
 		text_font(list, app.f.ui, 11.5, x + 18, y + 5, th.fg_faint, "Thinking")
 		if !m.open do return 34
 		body_y := y + 26
-		bh := draw_markdown(list, app.f.ui, app.f.mono, 13.0, x + 4, body_y, w - 10, th, m.text, mix(th.fg, th.bg, 0.38), rec)
+		bh := draw_markdown(list, app.f.ui, app.f.mono, 13.0, x + 4, body_y, w - 10, th, m.text, mix(th.fg, th.bg, 0.38), rec, links, images)
 		vrule(list, x + 1, body_y - 4, body_y + bh, th.border_soft)
 		return 26 + bh + 12
 
@@ -617,6 +663,63 @@ draw_message :: proc(app: ^App, list: ^ImDrawList, m: ^View_Message, index: int,
 		return card.h + 16
 	}
 	return 0
+}
+
+
+ATTACHMENT_CHIP_H :: f32(22)
+ATTACHMENT_CHIP_GAP :: f32(6)
+ATTACHMENT_CHIP_MAX_W :: f32(460)
+
+attachment_chip_width :: proc(font: ^ImFont, path: string, max_w: f32) -> f32 {
+	tw, _ := measure(font, 11.5, path)
+	return min(tw + 34, max_w)
+}
+
+attachment_chips_height :: proc(font: ^ImFont, width: f32, paths: []string) -> f32 {
+	if len(paths) == 0 || width <= 0 do return 0
+	max_w := min(width, ATTACHMENT_CHIP_MAX_W)
+	rows := 1
+	cx: f32 = 0
+	for path in paths {
+		w := attachment_chip_width(font, path, max_w)
+		if cx > 0 && cx + w > width {
+			rows += 1
+			cx = 0
+		}
+		cx += w + ATTACHMENT_CHIP_GAP
+	}
+	return f32(rows) * ATTACHMENT_CHIP_H + f32(rows - 1) * ATTACHMENT_CHIP_GAP + 12
+}
+
+draw_attachment_chips :: proc(app: ^App, list: ^ImDrawList, tab: ^Conversation_Tab, x, y, width: f32) {
+	th := app.th
+	max_w := min(width, ATTACHMENT_CHIP_MAX_W)
+	cx, cy := x, y + 6
+	for path, i in tab.attachments {
+		chip_w := attachment_chip_width(app.f.ui, path, max_w)
+		if cx > x && cx + chip_w > x + width {
+			cx = x
+			cy += ATTACHMENT_CHIP_H + ATTACHMENT_CHIP_GAP
+		}
+		chip := rect(cx, cy, chip_w, ATTACHMENT_CHIP_H)
+		panel(list, chip, mix(th.bg_raised, th.fg, 0.035), 5, th.border_soft, 1)
+		text_elided(list, app.f.ui, 11.5, chip.x + 8, chip.y + (ATTACHMENT_CHIP_H - ui_text_px(11.5)) * 0.5 - 1,
+			max(chip.w - 30, 4), th.fg_dim, path)
+
+		idbuf: [64]u8
+		close_r := rect(chip.x + chip.w - 20, chip.y, 20, ATTACHMENT_CHIP_H)
+		remove_clicked := hit(id_cstr(idbuf[:], "attachmentremove%d", i), close_r)
+		remove_hovered := mi_hit_hovered()
+		if remove_hovered do panel(list, rect(close_r.x + 3, close_r.y + 3, 14, 16), th.bg_hover, 4)
+		glyph_close(list, close_r.x + 10, close_r.y + ATTACHMENT_CHIP_H * 0.5, 3.1,
+			remove_hovered ? th.fg : th.fg_faint, 1.3)
+		if rect_contains(chip, app.mouse.x, app.mouse.y) && !remove_hovered do tooltip(path)
+		if remove_clicked {
+			conversation_tab_remove_attachment(tab, i)
+			return
+		}
+		cx += chip_w + ATTACHMENT_CHIP_GAP
+	}
 }
 
 draw_conversation :: proc(app: ^App) {
@@ -738,7 +841,9 @@ draw_conversation :: proc(app: ^App) {
 		return
 	}
 
-	composer_h: f32 = 118
+	chip_width := r.w - 44 - 28
+	chips_h := live && tab != nil ? attachment_chips_height(app.f.ui, chip_width, tab.attachments[:]) : 0
+	composer_h: f32 = 118 + chips_h
 	composer := rect(r.x + 22, r.y + r.h - 20 - composer_h, r.w - 44, composer_h)
 
 	tx := r.x + 22
@@ -751,7 +856,7 @@ draw_conversation :: proc(app: ^App) {
 	if igBeginChild_Str("##transcript", ivec2(tw, tth), CHILD_NONE, ImGuiWindowFlags(0)) {
 		child_list := igGetWindowDrawList()
 		transcript_rect := rect(tx, ty, tw, tth)
-		hover_transcript := rect_contains(transcript_rect, app.mouse.x, app.mouse.y)
+		hover_transcript := !app.image_viewer.open && rect_contains(transcript_rect, app.mouse.x, app.mouse.y)
 		if hover_transcript {
 			wheel := mi_io_wheel()
 			if wheel > 0 do view.follow = false
@@ -811,6 +916,12 @@ draw_conversation :: proc(app: ^App) {
 			}
 		}
 
+		links := make([dynamic]Md_Link_Rect, 0, 32)
+		defer delete(links)
+		image_rects := make([dynamic]Md_Image_Rect, 0, 8)
+		defer delete(image_rects)
+		image_base := project != nil ? project.path : app.cwd
+		image_ctx := Md_Image_Context{cache = &app.image_cache, base_dir = image_base, rects = &image_rects}
 		sel_interest := view.layout_ready &&
 			(hover_transcript || view.sel.dragging || sel_has_selection(&view.sel))
 		sel_begin_frame(&view.sel)
@@ -850,7 +961,7 @@ draw_conversation :: proc(app: ^App) {
 				continue
 			}
 			was_open := m.open
-			h = draw_message(app, child_list, &m, i, sx + 2, y, content_w, sel_interest ? &view.sel : nil, active)
+			h = draw_message(app, child_list, &m, i, sx + 2, y, content_w, sel_interest ? &view.sel : nil, active, &links, &image_ctx)
 			// Expanding a block is an explicit exception to bottom anchoring:
 			// keep its header where the pointer clicked it while the body grows
 			// downward, so stop following the live bottom.
@@ -878,9 +989,87 @@ draw_conversation :: proc(app: ^App) {
 		mi_set_cursor_screen(sx, y)
 		igDummy(ivec2(1, 1))
 
-		sel_process_mouse(&view.sel, transcript_rect, app.mouse)
+		// Links and images are drawn manually, so hit-test the recorded
+		// rectangles after the transcript has been laid out.
+		hovered_link := -1
+		hovered_image := -1
+		if hover_transcript {
+			for link, li in links {
+				if rect_contains(link.rect, app.mouse.x, app.mouse.y) {
+					hovered_link = li
+					break
+				}
+			}
+			for image, ii in image_rects {
+				if rect_contains(image.rect, app.mouse.x, app.mouse.y) {
+					hovered_image = ii
+					break
+				}
+			}
+		}
+
+		if igIsMouseClicked_Bool(0, false) {
+			delete(view.link_press_url)
+			view.link_press_url = ""
+			view.link_press_active = false
+			view.image_press_asset = nil
+			view.image_press_active = false
+			if hovered_image >= 0 {
+				view.image_press_asset = image_rects[hovered_image].asset
+				view.image_press_x = app.mouse.x
+				view.image_press_y = app.mouse.y
+				view.image_press_active = true
+			} else if hovered_link >= 0 {
+				view.link_press_url = strings.clone(links[hovered_link].url)
+				view.link_press_x = app.mouse.x
+				view.link_press_y = app.mouse.y
+				view.link_press_active = true
+			}
+		}
+
+		// A press that started on an image never anchors a text selection;
+		// the image is a self-contained click target.
+		suppress_selection := view.image_press_active || app.image_viewer.open
+		if !suppress_selection {
+			sel_process_mouse(&view.sel, transcript_rect, app.mouse)
+		} else {
+			view.sel.mouse_was_down = igIsMouseDown_Nil(0)
+		}
+
+		if igIsMouseReleased_Nil(0) {
+			if view.link_press_active {
+				moved_x := math.abs(app.mouse.x - view.link_press_x)
+				moved_y := math.abs(app.mouse.y - view.link_press_y)
+				if hovered_link >= 0 && moved_x <= 4 && moved_y <= 4 &&
+				   links[hovered_link].url == view.link_press_url {
+					mi_open_uri(zstr(links[hovered_link].url))
+				}
+				delete(view.link_press_url)
+				view.link_press_url = ""
+				view.link_press_active = false
+			}
+			if view.image_press_active {
+				moved_x := math.abs(app.mouse.x - view.image_press_x)
+				moved_y := math.abs(app.mouse.y - view.image_press_y)
+				if hovered_image >= 0 && moved_x <= 4 && moved_y <= 4 &&
+				   image_rects[hovered_image].asset == view.image_press_asset {
+					image_viewer_open(&app.image_viewer, view.image_press_asset)
+				}
+				view.image_press_asset = nil
+				view.image_press_active = false
+			}
+		}
+
 		if hover_transcript && sel_hovered(&view.sel, app.mouse.x, app.mouse.y) {
 			mi_io_set_mouse_cursor(i32(CURSOR_TEXT))
+		}
+		if hovered_link >= 0 {
+			mi_io_set_mouse_cursor(i32(CURSOR_HAND))
+			if len(links[hovered_link].tip) > 0 do tooltip(links[hovered_link].tip)
+		}
+		if hovered_image >= 0 {
+			mi_io_set_mouse_cursor(i32(CURSOR_HAND))
+			if len(image_rects[hovered_image].alt) > 0 do tooltip(image_rects[hovered_image].alt)
 		}
 		if mi_io_key_ctrl() != 0 && mi_io_key_shift() == 0 && mi_io_want_text_input() == 0 &&
 		   igIsKeyPressed_Bool(KEY_C, false) && (sel_has_selection(&view.sel) || hover_transcript) {
@@ -904,6 +1093,9 @@ draw_conversation :: proc(app: ^App) {
 
 	// Composer.
 	panel(list, composer, th.bg_panel, 12, th.border, 1)
+	if live && tab != nil && chips_h > 0 {
+		draw_attachment_chips(app, list, tab, composer.x + 14, composer.y + 6, composer.w - 28)
+	}
 	if !live {
 		preview := app.preview_active
 		dot(list, composer.x + 24, composer.y + composer.h * 0.5 - 10, 3.6, th.fg_faint)
@@ -937,7 +1129,7 @@ draw_conversation :: proc(app: ^App) {
 		igEnd()
 		return
 	}
-	input_r := rect(composer.x + 14, composer.y + 10, composer.w - 28, 52)
+	input_r := rect(composer.x + 14, composer.y + 10 + chips_h, composer.w - 28, 52)
 	igPushStyleColor_Vec4(COL_FRAME_BG, ImVec4{0, 0, 0, 0})
 	igPushStyleColor_Vec4(COL_FRAME_BG_HOVERED, ImVec4{0, 0, 0, 0})
 	igPushStyleColor_Vec4(COL_FRAME_BG_ACTIVE, ImVec4{0, 0, 0, 0})
@@ -971,9 +1163,10 @@ draw_conversation :: proc(app: ^App) {
 		s := string(cstring(&t.composer[0]))
 		trimmed := strings.trim_space(s)
 		if len(trimmed) == 0 do return
-		if harness.harness_submit(&t.harness, trimmed) {
+		if harness.harness_submit_files(&t.harness, trimmed, t.attachments[:]) {
 			t.composer[0] = 0
 			t.composer_refocus = true
+			conversation_tab_clear_attachments(t)
 			// The input widget keeps its own text buffer while active; dropping
 			// the active id makes it re-read the cleared buffer next frame.
 			igClearActiveID()
@@ -983,7 +1176,7 @@ draw_conversation :: proc(app: ^App) {
 
 	entered := igIsKeyPressed_Bool(KEY_ENTER, false) && mi_io_key_shift() == 0
 	if active && entered do submit(app)
-	if igIsKeyPressed_Bool(KEY_ESCAPE, false) && active_harness != nil && harness.harness_is_running(active_harness) {
+	if !app.image_viewer.open && igIsKeyPressed_Bool(KEY_ESCAPE, false) && active_harness != nil && harness.harness_is_running(active_harness) {
 		harness.harness_cancel(active_harness)
 	}
 
@@ -1010,11 +1203,25 @@ draw_conversation :: proc(app: ^App) {
 		panel(list, rect(stop_r.x + 10, stop_r.y + 10, 10, 10), th.red, 2)
 	}
 
+	attach_r := rect(composer.x + 14, row_y + 4, 30, 30)
+	attach_clicked := icon_button(list, cstr("##attachfiles"), attach_r, "", app.f.ui, 12.0, th.fg_faint, th.bg_hover, 6)
+	attach_hovered := mi_hit_hovered()
+	glyph_paperclip(list, attach_r.x + 15, attach_r.y + 15, 5.2, attach_hovered ? th.fg : th.fg_faint)
+	if attach_hovered {
+		mi_io_set_mouse_cursor(i32(CURSOR_HAND))
+		tooltip(app.attachment_picker.running ? "Choosing files..." : "Attach files")
+	}
+	if attach_clicked && !app.attachment_picker.running {
+		if !attachment_picker_start(app, FILES_PICKER_TITLE) {
+			view_add_error(&tab.view, "could not open the system file chooser")
+		}
+	}
+
 	hint := "Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"
 	hint_w, _ := measure(app.f.ui, 11.0, hint)
 	right_limit := running ? stop_r.x : send_r.x
-	if composer.x + 14 + hint_w < right_limit - 12 {
-		text_font(list, app.f.ui, 11.0, composer.x + 14, row_y + 7, th.fg_faint, hint)
+	if composer.x + 52 + hint_w < right_limit - 12 {
+		text_font(list, app.f.ui, 11.0, composer.x + 52, row_y + 7, th.fg_faint, hint)
 	}
 
 	draw_view_strip(app, tab, r)

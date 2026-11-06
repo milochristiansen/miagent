@@ -29,7 +29,7 @@ PORTAL_CFLAGS := $(CFLAGS) $(GIO_CFLAGS)
 
 LDFLAGS  := -lstdc++ -lm -lpthread -lutil -lGL -ldl -lcurl -lz $(GIO_LIBS)
 
-SHIMS := $(BUILD)/bridge.o $(BUILD)/pty.o $(BUILD)/portal.o
+SHIMS := $(BUILD)/bridge.o $(BUILD)/pty.o $(BUILD)/portal.o $(BUILD)/image.o
 HARNESS_SHIMS := $(BUILD)/http.o $(BUILD)/archive.o
 MCP_SHIMS := $(BUILD)/mcp_transport.o
 LIBS  := $(CIMGUI)/lib/libcimgui.a $(GHOSTTY)/lib/libghostty-vt.a
@@ -73,6 +73,9 @@ $(BUILD)/pty.o: src/pty.c | $(BUILD)
 
 $(BUILD)/portal.o: src/portal.c | $(BUILD)
 	$(CC) $(PORTAL_CFLAGS) -c $< -o $@
+
+$(BUILD)/image.o: src/image.c src/stb_image.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/http.o: src/harness/http.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@

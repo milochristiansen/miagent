@@ -197,9 +197,9 @@ terminal_effect_clipboard_write :: proc "c" (gt: GhosttyTerminal, userdata: rawp
 terminal_apply_pending_effects :: proc(t: ^Terminal) {
 	if t.clip_pending_set {
 		if t.clip_pending_clear {
-			mi_set_clipboard(cstr(""))
+			mi_set_clipboard(zstr(""))
 		} else {
-			mi_set_clipboard(cstr(t.clip_pending))
+			mi_set_clipboard(zstr(t.clip_pending))
 		}
 		delete(t.clip_pending)
 		t.clip_pending = ""

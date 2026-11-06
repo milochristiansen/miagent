@@ -239,5 +239,5 @@ terminal_link_allowed :: proc(uri: string) -> bool {
 
 terminal_open_link :: proc(t: ^Terminal) -> bool {
 	if len(t.hover_link_uri) == 0 || !terminal_link_allowed(t.hover_link_uri) do return false
-	return mi_open_uri(cstr(t.hover_link_uri)) >= 0
+	return mi_open_uri(zstr(t.hover_link_uri)) >= 0
 }

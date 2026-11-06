@@ -162,13 +162,14 @@ draw_one_drawer :: proc(app: ^App, list: ^ImDrawList, p: ^Project, d: ^Drawer, i
 	term_hit := term_area
 	if has_sb do term_hit.w = max(term_hit.w - 12, 0)
 
-	hovered := rect_contains(term_area, app.mouse.x, app.mouse.y)
+	ui_active := !app.image_viewer.open
+	hovered := ui_active && rect_contains(term_area, app.mouse.x, app.mouse.y)
 	termid: [32]u8
 	clicked := hit(id_cstr(termid[:], "drawerterm%d", index), term_hit)
 	// Focus on the press edge too: an application that captures the mouse
 	// needs the drawer selected before its press sequence is delivered, and
 	// hit() only reports on release.
-	if rect_contains(term_hit, app.mouse.x, app.mouse.y) && igIsMouseClicked_Bool(0, false) {
+	if ui_active && rect_contains(term_hit, app.mouse.x, app.mouse.y) && igIsMouseClicked_Bool(0, false) {
 		p.focus_drawer = index
 		focused = true
 		border = alpha(th.accent, 0.75)
@@ -196,7 +197,7 @@ draw_one_drawer :: proc(app: ^App, list: ^ImDrawList, p: ^Project, d: ^Drawer, i
 		mw, mh := measure(app.f.ui, 12.5, msg)
 		text_font(list, app.f.ui, 12.5, term_area.x + (term_area.w - mw) * 0.5, term_area.y + (term_area.h - mh) * 0.5, th.fg_faint, msg)
 	} else {
-		over_body := rect_contains(term_hit, app.mouse.x, app.mouse.y)
+		over_body := ui_active && rect_contains(term_hit, app.mouse.x, app.mouse.y)
 		terminal_update_hover_cell(d.term, term_area, app.f, app.mouse, over_body)
 		shift := mi_io_key_shift() != 0
 		tracking := terminal_mouse_tracking(d.term)

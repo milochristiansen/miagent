@@ -223,6 +223,19 @@ void mi_set_next_window_rect(float x, float y, float w, float h) {
   igSetNextWindowSize((ImVec2_c){w, h}, ImGuiCond_Always);
 }
 
+bool mi_begin_overlay(const char *name, float x, float y, float w, float h) {
+  mi_set_next_window_rect(x, y, w, h);
+  igSetNextWindowBgAlpha(0.0f);
+  igSetNextWindowFocus();
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                           ImGuiWindowFlags_NoMove |
+                           ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoScrollbar |
+                           ImGuiWindowFlags_NoScrollWithMouse |
+                           ImGuiWindowFlags_NoNavFocus;
+  return igBegin(name, NULL, flags);
+}
+
 bool mi_begin_panel(const char *name, float x, float y, float w, float h,
                     bool interactive) {
   mi_set_next_window_rect(x, y, w, h);
@@ -266,6 +279,17 @@ void mi_draw_line(ImDrawList *l, float x0, float y0, float x1, float y1,
 
 void mi_draw_circle(ImDrawList *l, float x, float y, float r, unsigned int col) {
   ImDrawList_AddCircleFilled(l, (ImVec2_c){x, y}, r, (ImU32)col, 0);
+}
+
+void mi_draw_image(ImDrawList *l, ImTextureID tex, float x0, float y0,
+                   float x1, float y1, float u0, float v0, float u1, float v1,
+                   unsigned int col, float rounding) {
+  ImTextureRef_c ref = {};
+  ref._TexID = tex;
+  ImDrawList_AddImageRounded(l, ref,
+                             (ImVec2_c){x0, y0}, (ImVec2_c){x1, y1},
+                             (ImVec2_c){u0, v0}, (ImVec2_c){u1, v1},
+                             (ImU32)col, rounding, ImDrawFlags_RoundAll);
 }
 
 void mi_draw_triangle(ImDrawList *l, float ax, float ay, float bx, float by,

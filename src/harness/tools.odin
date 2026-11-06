@@ -802,3 +802,66 @@ image_mime :: proc(data: []byte) -> string {
 	if len(data) >= 12 && string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" do return "image/webp"
 	return ""
 }
+
+// Prompt attachments are ordinary files the user selected in the desktop UI.
+// They use the same Attachment shape as tool results, but are read on the
+// harness worker so a large file cannot stall the GUI.
+PROMPT_ATTACHMENT_MAX_BYTES :: i64(32 << 20)
+PROMPT_ATTACHMENT_TOTAL_BYTES :: i64(48 << 20)
+
+attachment_destroy :: proc(att: ^Attachment) {
+	delete(att.name)
+	delete(att.mime)
+	delete(att.kind)
+	delete(att.text)
+	delete(att.url)
+	att^ = {}
+}
+
+attachment_from_path :: proc(path: string) -> (att: Attachment, err: string) {
+	fi, serr := os.stat(path, context.temp_allocator)
+	if serr != nil do return {}, fmt.aprintf("%s: %v", path, serr)
+	if fi.type != .Regular do return {}, fmt.aprintf("%s: not a regular file", path)
+	if fi.size > PROMPT_ATTACHMENT_MAX_BYTES {
+		return {}, fmt.aprintf("%s: file is too large", path)
+	}
+	data, rerr := os.read_entire_file(path, context.allocator)
+	if rerr != nil do return {}, fmt.aprintf("%s: %v", path, rerr)
+	defer delete(data)
+
+	name := strings.clone(os.base(path))
+	att.name = name
+	att.size = int(fi.size)
+
+	if mime := image_mime(data); len(mime) > 0 {
+		encoded, enc_err := base64.encode(data)
+		if enc_err != nil {
+			attachment_destroy(&att)
+			return {}, fmt.aprintf("%s: %v", path, enc_err)
+		}
+		defer delete(encoded)
+		att.mime = strings.clone(mime)
+		att.kind = strings.clone("image")
+		att.url = fmt.aprintf("data:%s;base64,%s", mime, encoded)
+		return att, ""
+	}
+
+	if is_text_data(data) {
+		att.mime = strings.clone(text_mime(name))
+		att.kind = strings.clone("text")
+		att.text = strings.clone(string(data))
+		return att, ""
+	}
+
+	encoded, enc_err := base64.encode(data)
+	if enc_err != nil {
+		attachment_destroy(&att)
+		return {}, fmt.aprintf("%s: %v", path, enc_err)
+	}
+	defer delete(encoded)
+	mime := binary_mime(name)
+	att.mime = strings.clone(mime)
+	att.kind = strings.clone("binary")
+	att.url = fmt.aprintf("data:%s;base64,%s", mime, encoded)
+	return att, ""
+}

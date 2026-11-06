@@ -12,12 +12,15 @@ import "core:time"
 
 FOLDER_PICKER_FLAG :: "--miagent-pick-folder"
 FOLDER_PICKER_TITLE :: "Add project"
+FILES_PICKER_FLAG :: "--miagent-pick-files"
+FILES_PICKER_TITLE :: "Attach files"
 
 foreign import filepicker_portal "../build/libmiagent.a"
 
 @(default_calling_convention = "c")
 foreign filepicker_portal {
 	mi_portal_pick_folder :: proc(title: cstring, out: [^]u8, out_size: uint) -> i32 ---
+	mi_portal_pick_files :: proc(title: cstring, out: [^]u8, out_size: uint) -> i32 ---
 }
 
 Folder_Picker :: struct {
@@ -42,6 +45,22 @@ Folder_Picker_Reader :: struct {
 // to stdout and exits 0, exits 1 when the user cancels, and exits 2 when the
 // portal is unavailable or fails.
 folder_picker_helper :: proc(args: []string) {
+	if len(args) >= 2 && args[1] == FILES_PICKER_FLAG {
+		title := len(args) >= 3 ? args[2] : FILES_PICKER_TITLE
+		buf: [65536]u8
+		rc := mi_portal_pick_files(zstr(title), &buf[0], uint(len(buf)))
+		switch rc {
+		case 0:
+			paths := string(cstring(&buf[0]))
+			if len(paths) == 0 do os.exit(2)
+			fmt.printf("%s\n", paths)
+			os.exit(0)
+		case 1:
+			os.exit(1)
+		case:
+			os.exit(2)
+		}
+	}
 	title := len(args) >= 3 ? args[2] : "Choose a project folder"
 	buf: [4096]u8
 	rc := mi_portal_pick_folder(zstr(title), &buf[0], uint(len(buf)))
@@ -272,4 +291,245 @@ app_set_project_input :: proc(app: ^App, text: string) {
 	n := min(len(text), len(app.project_input) - 1)
 	copy(app.project_input[:n], text[:n])
 	app.project_input[n] = 0
+}
+
+// --- prompt attachments ----------------------------------------------------
+
+// Attachment_Picker is the multi-select sibling of Folder_Picker. It runs the
+// same hidden child process but asks the portal for regular files and returns
+// newline-separated paths.
+Attachment_Picker :: struct {
+	running:   bool,
+	process:   os.Process,
+	stdout:    ^os.File,
+	stderr:    ^os.File,
+	thread:    ^thread.Thread,
+	mutex:     sync.Mutex,
+	done:      bool,
+	cancelled: bool,
+	paths:     []string,
+	error:     string,
+
+	// Where the result belongs. Paths are stored instead of pointers so a
+	// project/tab can close while the portal dialog is open without leaving a
+	// dangling reference.
+	target_project_path: string,
+	target_session_path: string,
+}
+
+attachment_picker_worker :: proc(fp: ^Attachment_Picker) {
+	out_buf := strings.builder_make()
+	err_buf := strings.builder_make()
+
+	out_ctx := Folder_Picker_Reader{file = fp.stdout, buf = &out_buf}
+	err_ctx := Folder_Picker_Reader{file = fp.stderr, buf = &err_buf}
+	out_thread := thread.create_and_start_with_poly_data(&out_ctx, folder_picker_read)
+	err_thread := thread.create_and_start_with_poly_data(&err_ctx, folder_picker_read)
+
+	state: os.Process_State
+	wait_error: os.Error
+	for {
+		s, err := os.process_wait(fp.process, 100 * time.Millisecond)
+		if err == nil && s.exited {
+			state = s
+			break
+		}
+		if err != nil {
+			if ge, is_general := err.(os.General_Error); is_general && ge == .Timeout {
+				continue
+			}
+			wait_error = err
+			break
+		}
+	}
+
+	if out_thread != nil do thread.join(out_thread)
+	if err_thread != nil do thread.join(err_thread)
+	if fp.stdout != nil do os.close(fp.stdout)
+	if fp.stderr != nil do os.close(fp.stderr)
+
+	out_text := strings.trim_right(strings.to_string(out_buf), "\r\n")
+	err_text := strings.trim_space(strings.to_string(err_buf))
+
+	paths := make([dynamic]string, 0, 8)
+	if state.exit_code == 0 {
+		lines := strings.split(out_text, "\n")
+		for line in lines {
+			p := strings.trim_space(line)
+			if len(p) > 0 do append(&paths, strings.clone(p))
+		}
+		delete(lines)
+	}
+
+	keep_paths := false
+	sync.mutex_lock(&fp.mutex)
+	fp.done = true
+	switch {
+	case wait_error != nil:
+		fp.error = fmt.aprintf("file picker: %v", wait_error)
+	case state.exit_code == 0 && len(paths) > 0:
+		fp.paths = paths[:]
+		keep_paths = true
+	case state.exit_code == 1:
+		fp.cancelled = true
+	case len(err_text) > 0:
+		fp.error = strings.clone(err_text)
+	case state.exit_code == 0:
+		fp.error = strings.clone("file picker returned no files")
+	case:
+		fp.error = fmt.aprintf("file picker exited %d without files", state.exit_code)
+	}
+	sync.mutex_unlock(&fp.mutex)
+
+	if !keep_paths {
+		for p in paths do delete(p)
+		delete(paths)
+	}
+	delete(out_buf.buf)
+	delete(err_buf.buf)
+}
+
+attachment_picker_start :: proc(app: ^App, title: string) -> bool {
+	fp := &app.attachment_picker
+	if fp.running do return false
+	tab := app_active_tab(app)
+	if tab == nil do return false
+
+	for path in fp.paths do delete(path)
+	delete(fp.paths)
+	fp.paths = nil
+	delete(fp.error)
+	fp.error = ""
+	delete(fp.target_project_path)
+	fp.target_project_path = ""
+	delete(fp.target_session_path)
+	fp.target_session_path = ""
+	fp.done = false
+	fp.cancelled = false
+
+	if p := app_active_project(app); p != nil {
+		fp.target_project_path = strings.clone(p.path)
+	}
+	fp.target_session_path = strings.clone(tab.session_path)
+
+	stdout_r, stdout_w, stdout_err := os.pipe()
+	if stdout_err != nil do return false
+	stderr_r, stderr_w, stderr_err := os.pipe()
+	if stderr_err != nil {
+		os.close(stdout_r)
+		os.close(stdout_w)
+		return false
+	}
+
+	exe, exe_err := os.get_executable_path(context.temp_allocator)
+	if exe_err != nil || len(exe) == 0 {
+		if len(os.args) == 0 do return false
+		exe = os.args[0]
+	}
+	command := []string{exe, FILES_PICKER_FLAG, title}
+
+	process, perr := os.process_start({
+		command = command,
+		stdout = stdout_w,
+		stderr = stderr_w,
+	})
+	os.close(stdout_w)
+	os.close(stderr_w)
+	if perr != nil {
+		os.close(stdout_r)
+		os.close(stderr_r)
+		return false
+	}
+
+	fp.process = process
+	fp.stdout = stdout_r
+	fp.stderr = stderr_r
+	fp.running = true
+	fp.thread = thread.create_and_start_with_poly_data(fp, attachment_picker_worker)
+	if fp.thread == nil {
+		fp.running = false
+		_ = os.process_kill(process)
+		os.close(stdout_r)
+		os.close(stderr_r)
+		return false
+	}
+	return true
+}
+
+attachment_picker_target :: proc(app: ^App, fp: ^Attachment_Picker) -> ^Conversation_Tab {
+	for p in app.projects {
+		if p.path != fp.target_project_path do continue
+		for t in p.tabs {
+			if t.session_path == fp.target_session_path do return t
+		}
+		if len(fp.target_session_path) == 0 do return project_active_tab(p)
+		return nil
+	}
+	return nil
+}
+
+// attachment_picker_poll applies a finished multi-file selection. It is called
+// once per frame from app_update.
+attachment_picker_poll :: proc(app: ^App) {
+	fp := &app.attachment_picker
+	if !fp.running do return
+
+	sync.mutex_lock(&fp.mutex)
+	if !fp.done {
+		sync.mutex_unlock(&fp.mutex)
+		return
+	}
+	paths := fp.paths
+	fp.paths = nil
+	err := fp.error
+	fp.error = ""
+	cancelled := fp.cancelled
+	fp.cancelled = false
+	fp.done = false
+	sync.mutex_unlock(&fp.mutex)
+
+	fp.running = false
+	if fp.thread != nil {
+		thread.join(fp.thread)
+		fp.thread = nil
+	}
+
+	target := attachment_picker_target(app, fp)
+	for path in paths {
+		if target != nil do conversation_tab_add_attachment(target, path)
+		delete(path)
+	}
+	if paths != nil do delete(paths)
+
+	if len(err) > 0 && !cancelled {
+		if target != nil {
+			msg := fmt.aprintf("attachments: %s", err)
+			view_add_error(&target.view, msg)
+			delete(msg)
+		}
+	}
+	delete(err)
+
+	delete(fp.target_project_path)
+	fp.target_project_path = ""
+	delete(fp.target_session_path)
+	fp.target_session_path = ""
+}
+
+attachment_picker_destroy :: proc(fp: ^Attachment_Picker) {
+	if fp.running {
+		_ = os.process_kill(fp.process)
+		if fp.thread != nil do thread.join(fp.thread)
+		fp.thread = nil
+		fp.running = false
+	}
+	for path in fp.paths do delete(path)
+	delete(fp.paths)
+	fp.paths = nil
+	delete(fp.error)
+	fp.error = ""
+	delete(fp.target_project_path)
+	fp.target_project_path = ""
+	delete(fp.target_session_path)
+	fp.target_session_path = ""
 }

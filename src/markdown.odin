@@ -1,6 +1,7 @@
 // A small, selection-aware Markdown renderer for the conversation pane. It
 // handles paragraphs, headings, fenced code, bullets, numbered lists,
-// blockquotes, rules, GFM tables, inline code, and **bold**.
+// blockquotes, rules, GFM tables, inline code, **bold**, Markdown links, and
+// bare http(s)/mailto URLs.
 package main
 
 import "core:strings"
@@ -10,24 +11,55 @@ Md_Style :: enum {
 	Text,
 	Bold,
 	Code,
+	Link,
 }
 
 Md_Word :: struct {
 	text:  string,
 	style: Md_Style,
 	space: bool,
+	// url is the clickable destination for a link word. tip is the tooltip
+	// text: Markdown links show their destination, while a bare URL (already
+	// visible as the word itself) leaves it empty.
+	url: string,
+	tip: string,
+}
+
+// Md_Link_Rect is a clickable region recorded while drawing. Strings are views
+// into the message text and stay valid for the frame.
+Md_Link_Rect :: struct {
+	rect: Rect,
+	url:  string,
+	tip:  string,
+}
+
+// Md_Image_Rect is a loaded Markdown image recorded while drawing so the
+// conversation can open it on click.
+Md_Image_Rect :: struct {
+	rect:  Rect,
+	asset:  ^Image_Entry,
+	source: string,
+	alt:    string,
+}
+
+// Md_Image_Context carries the image cache and the base directory used to
+// resolve relative Markdown image paths. Rects is optional.
+Md_Image_Context :: struct {
+	cache:    ^Image_Cache,
+	base_dir: string,
+	rects:    ^[dynamic]Md_Image_Rect,
 }
 
 md_words_destroy :: proc(words: []Md_Word) {
 	delete(words)
 }
 
-append_word_range :: proc(words: ^[dynamic]Md_Word, text: string, start, end: int, style: Md_Style, space: ^bool) {
+append_word_range :: proc(words: ^[dynamic]Md_Word, text: string, start, end: int, style: Md_Style, space: ^bool, url: string = "", tip: string = "") {
 	i, word_start := start, start
 	for i <= end {
 		if i == end || text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r' {
 			if i > word_start {
-				append(words, Md_Word{text = text[word_start:i], style = style, space = space^})
+				append(words, Md_Word{text = text[word_start:i], style = style, space = space^, url = url, tip = tip})
 				space^ = false
 			}
 			if i < end do space^ = true
@@ -39,40 +71,315 @@ append_word_range :: proc(words: ^[dynamic]Md_Word, text: string, start, end: in
 	}
 }
 
-// inline_words tokenizes one paragraph segment into words with style flags.
-// The word strings are views into s, so they stay valid as long as the source
-// text does.
-inline_words :: proc(s: string) -> []Md_Word {
-	words := make([dynamic]Md_Word, 0, 32)
-	space := false
+// --- links ----------------------------------------------------------------
+
+// md_url_authority_valid checks the part after "http://" or "https://". It
+// accepts a host, an optional port, and userinfo, but rejects the empty or
+// punctuation-only fragments that a loose "contains a dot" test would let
+// through.
+md_url_authority_valid :: proc(rest: string) -> bool {
+	if len(rest) == 0 do return false
+	auth_end := len(rest)
+	for i in 0 ..< len(rest) {
+		if rest[i] == '/' || rest[i] == '?' || rest[i] == '#' {
+			auth_end = i
+			break
+		}
+	}
+	auth := rest[:auth_end]
+	if len(auth) == 0 do return false
+
+	// Drop optional userinfo. The last '@' is the delimiter; earlier ones are
+	// legal in the userinfo component.
+	if at := strings.last_index_byte(auth, '@'); at >= 0 {
+		auth = auth[at + 1:]
+		if len(auth) == 0 do return false
+	}
+
+	host := auth
+	if host[0] == '[' {
+		closing := strings.index_byte(host, ']')
+		if closing <= 1 do return false
+		for c in host[1:closing] {
+			if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') &&
+			   !(c >= 'A' && c <= 'F') && c != ':' && c != '.' {
+				return false
+			}
+		}
+		after := host[closing + 1:]
+		if len(after) > 0 {
+			if after[0] != ':' do return false
+			port := after[1:]
+			if len(port) == 0 do return false
+			for c in port {
+				if c < '0' || c > '9' do return false
+			}
+		}
+		return true
+	}
+
+	if colon := strings.last_index_byte(host, ':'); colon >= 0 {
+		port := host[colon + 1:]
+		if len(port) == 0 do return false
+		for c in port {
+			if c < '0' || c > '9' do return false
+		}
+		host = host[:colon]
+	}
+	if len(host) == 0 do return false
+	has_alnum := false
+	for i in 0 ..< len(host) {
+		c := host[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			has_alnum = true
+		case c == '-', c == '_':
+			if i == 0 || i + 1 == len(host) || host[i + 1] == '.' do return false
+		case c == '.':
+			if i == 0 || (i + 1 < len(host) && host[i + 1] == '.') do return false
+		case:
+			return false
+		}
+	}
+	return has_alnum
+}
+
+// md_url_valid is deliberately stricter than "looks like a link": only schemes
+// the desktop is willing to hand to the system opener are accepted, and the
+// URL must not contain whitespace or markup punctuation.
+md_url_valid :: proc(url: string) -> bool {
+	if len(url) == 0 do return false
+	for i in 0 ..< len(url) {
+		c := url[i]
+		if c <= ' ' || c == 0x7f || c == '"' || c == '<' || c == '>' || c == '`' do return false
+	}
+	if strings.has_prefix(url, "https://") do return md_url_authority_valid(url[8:])
+	if strings.has_prefix(url, "http://") do return md_url_authority_valid(url[7:])
+	if strings.has_prefix(url, "mailto:") {
+		addr := url[7:]
+		if len(addr) == 0 do return false
+		at := strings.index_byte(addr, '@')
+		return at > 0 && at + 1 < len(addr)
+	}
+	return false
+}
+
+// md_url_start_boundary keeps bare-URL detection from firing in the middle of
+// a word or an identifier.
+md_url_start_boundary :: proc(s: string, i: int) -> bool {
+	if i <= 0 do return true
+	switch s[i - 1] {
+	case ' ', '\t', '\n', '\r', '(', '[', '{', '<', '>', '=', '|', '"', '\'', '`', '*', '_', '~':
+		return true
+	}
+	return false
+}
+
+md_url_scheme_len :: proc(s: string, i: int) -> int {
+	if strings.has_prefix(s[i:], "https://") do return 8
+	if strings.has_prefix(s[i:], "http://") do return 7
+	if strings.has_prefix(s[i:], "mailto:") do return 7
+	return 0
+}
+
+// md_bare_url_at extracts a bare URL beginning at i. Trailing sentence
+// punctuation and unmatched closing brackets are left out of the URL.
+md_bare_url_at :: proc(s: string, i: int) -> (url: string, end: int, ok: bool) {
+	if !md_url_start_boundary(s, i) do return "", i, false
+	scheme_len := md_url_scheme_len(s, i)
+	if scheme_len == 0 do return "", i, false
+	j := i + scheme_len
+	for j < len(s) {
+		c := s[j]
+		if c <= ' ' || c == 0x7f || c == '"' || c == '<' || c == '>' || c == '`' do break
+		j += 1
+	}
+
+	for j > i {
+		c := s[j - 1]
+		if c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' {
+			j -= 1
+			continue
+		}
+		if c == ')' || c == ']' || c == '}' {
+			open: u8 = c == ')' ? '(' : c == ']' ? '[' : '{'
+			opens, closes := 0, 0
+			for k in i ..< j {
+				if s[k] == open do opens += 1
+				if s[k] == c do closes += 1
+			}
+			if closes > opens {
+				j -= 1
+				continue
+			}
+		}
+		break
+	}
+	if j <= i do return "", i, false
+	candidate := s[i:j]
+	if !md_url_valid(candidate) do return "", i, false
+	return candidate, j, true
+}
+
+// md_markdown_target_at parses [label](url) or [label](<url> "title") without
+// deciding whether the destination is an acceptable link or image source.
+md_markdown_target_at :: proc(s: string, i: int) -> (label: string, url: string, end: int, ok: bool) {
+	if i >= len(s) || s[i] != '[' do return "", "", i, false
+	j := i + 1
+	for j < len(s) && s[j] != ']' {
+		if s[j] == '\\' && j + 1 < len(s) {
+			j += 2
+			continue
+		}
+		j += 1
+	}
+	if j >= len(s) || j + 1 >= len(s) || s[j + 1] != '(' do return "", "", i, false
+
+	k := j + 2
+	for k < len(s) && (s[k] == ' ' || s[k] == '\t' || s[k] == '\n' || s[k] == '\r') do k += 1
+	dest_start := k
+	if k < len(s) && s[k] == '<' {
+		k += 1
+		dest_start = k
+		for k < len(s) && s[k] != '>' do k += 1
+		if k >= len(s) do return "", "", i, false
+		url = s[dest_start:k]
+		k += 1
+	} else {
+		depth := 0
+		for k < len(s) {
+			c := s[k]
+			if c == '\\' && k + 1 < len(s) {
+				k += 2
+				continue
+			}
+			if c == '(' {
+				depth += 1
+			} else if c == ')' {
+				if depth == 0 do break
+				depth -= 1
+			} else if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				break
+			}
+			k += 1
+		}
+		url = s[dest_start:k]
+	}
+	// Skip an optional title and find the closing parenthesis.
+	for k < len(s) && s[k] != ')' {
+		if s[k] == '\\' && k + 1 < len(s) do k += 1
+		k += 1
+	}
+	if k >= len(s) do return "", "", i, false
+	return s[i + 1:j], strings.trim_space(url), k + 1, true
+}
+
+// md_markdown_link_at accepts only destinations the system opener may receive.
+md_markdown_link_at :: proc(s: string, i: int) -> (label: string, url: string, end: int, ok: bool) {
+	label, url, end, ok = md_markdown_target_at(s, i)
+	if !ok || !md_url_valid(url) do return "", "", i, false
+	return label, url, end, true
+}
+
+// md_markdown_image_at parses ![alt](source). Unlike links, local paths,
+// file: URIs, data:image URIs, and http(s) URLs are accepted.
+md_markdown_image_at :: proc(s: string, i: int) -> (alt: string, src: string, end: int, ok: bool) {
+	if i + 1 >= len(s) || s[i] != '!' || s[i + 1] != '[' do return "", "", i, false
+	alt, src, end, ok = md_markdown_target_at(s, i + 1)
+	if !ok || !image_source_supported(src) do return "", "", i, false
+	return alt, src, end, true
+}
+
+// md_find_image locates the first image outside an inline code span. It lets
+// draw_markdown split a line such as "diagram: ![x](p)" into a text run and an
+// image block instead of silently dropping the image.
+md_find_image :: proc(s: string) -> int {
+	i := 0
+	for i < len(s) {
+		if s[i] == '`' {
+			if close := strings.index_byte(s[i + 1:], '`'); close >= 0 {
+				i += close + 2
+				continue
+			}
+		}
+		if s[i] == '!' {
+			if _, _, _, ok := md_markdown_image_at(s, i); ok do return i
+		}
+		i += 1
+	}
+	return -1
+}
+
+// inline_words_range tokenizes a segment with a base style. Links can appear
+// inside bold text, so bold is handled by recursing over its contents instead
+// of blindly copying the range. Word strings are views into s and stay valid
+// for as long as the source text does.
+inline_words_range :: proc(words: ^[dynamic]Md_Word, s: string, base: Md_Style, space: ^bool) {
 	normal_start := 0
 	i := 0
 	for i < len(s) {
 		if s[i] == '`' {
 			if close := strings.index_byte(s[i + 1:], '`'); close >= 0 {
-				append_word_range(&words, s, normal_start, i, .Text, &space)
+				append_word_range(words, s, normal_start, i, base, space)
 				txt := s[i + 1:i + 1 + close]
 				if len(txt) > 0 {
-					append(&words, Md_Word{text = txt, style = .Code, space = space})
-					space = false
+					append(words, Md_Word{text = txt, style = .Code, space = space^})
+					space^ = false
 				}
 				i += close + 2
 				normal_start = i
 				continue
 			}
 		}
-		if i + 1 < len(s) && s[i] == '*' && s[i + 1] == '*' {
+		if base == .Text && i + 1 < len(s) && s[i] == '*' && s[i + 1] == '*' {
 			if close := strings.index(s[i + 2:], "**"); close >= 0 {
-				append_word_range(&words, s, normal_start, i, .Text, &space)
-				append_word_range(&words, s, i + 2, i + 2 + close, .Bold, &space)
+				append_word_range(words, s, normal_start, i, .Text, space)
+				inline_words_range(words, s[i + 2:i + 2 + close], .Bold, space)
 				i += close + 4
+				normal_start = i
+				continue
+			}
+		}
+		if base != .Code && s[i] == '!' && i + 1 < len(s) && s[i + 1] == '[' {
+			if alt, _, end, ok := md_markdown_image_at(s, i); ok {
+				append_word_range(words, s, normal_start, i, base, space)
+				label := len(alt) > 0 ? alt : "[image]"
+				append_word_range(words, label, 0, len(label), base, space)
+				i = end
+				normal_start = i
+				continue
+			}
+		}
+		if base != .Code && s[i] == '[' && (i == 0 || s[i - 1] != '!') {
+			if label, url, end, ok := md_markdown_link_at(s, i); ok {
+				append_word_range(words, s, normal_start, i, base, space)
+				text := len(label) > 0 ? label : url
+				append_word_range(words, text, 0, len(text), .Link, space, url, url)
+				i = end
+				normal_start = i
+				continue
+			}
+		}
+		if base != .Code && (s[i] == 'h' || s[i] == 'm') {
+			if url, end, ok := md_bare_url_at(s, i); ok {
+				append_word_range(words, s, normal_start, i, base, space)
+				append(words, Md_Word{text = url, style = .Link, space = space^, url = url})
+				space^ = false
+				i = end
 				normal_start = i
 				continue
 			}
 		}
 		i += 1
 	}
-	append_word_range(&words, s, normal_start, len(s), .Text, &space)
+	append_word_range(words, s, normal_start, len(s), base, space)
+}
+
+// inline_words tokenizes one paragraph segment into words with style flags.
+inline_words :: proc(s: string) -> []Md_Word {
+	words := make([dynamic]Md_Word, 0, 32)
+	space := false
+	inline_words_range(&words, s, .Text, &space)
 	return words[:]
 }
 
@@ -82,6 +389,8 @@ md_word_style :: proc(style: Md_Style, font: ^ImFont, mono: ^ImFont, size: f32, 
 		return mono, size - 1.5, mix(th.fg, th.accent, 0.18)
 	case .Bold:
 		return font, size, th.fg
+	case .Link:
+		return font, size, mix(th.accent, th.fg, 0.22)
 	case .Text:
 		return font, size, mix(th.fg, th.bg, 0.04)
 	}
@@ -176,6 +485,9 @@ md_ends_table :: proc(lines: []string, i: int) -> bool {
 	if len(cur) == 0 do return true
 	if strings.has_prefix(cur, "```") do return true
 	if _, _, ok := md_heading(cur); ok do return true
+	if _, _, image_end, is_image := md_markdown_image_at(cur, 0); is_image && image_end == len(cur) {
+		return true
+	}
 	if cur == "---" || cur == "***" || cur == "___" do return true
 	if strings.has_prefix(cur, ">") do return true
 	if strings.has_prefix(cur, "- ") || strings.has_prefix(cur, "* ") ||
@@ -190,7 +502,7 @@ md_word_font :: proc(style: Md_Style, font: ^ImFont, mono: ^ImFont, size: f32) -
 	switch style {
 	case .Code:
 		return mono, size - 1.5
-	case .Bold, .Text:
+	case .Bold, .Link, .Text:
 		return font, size
 	}
 	return font, size
@@ -308,7 +620,7 @@ md_inline_layout :: proc(text: string, font: ^ImFont, mono: ^ImFont, size: f32, 
 		}
 		x := line_w + space_w
 		append(&items, Md_Inline_Item {
-			word = Md_Word{text = word.text, style = style, space = word.space},
+			word = Md_Word{text = word.text, style = style, space = word.space, url = word.url, tip = word.tip},
 			line = line,
 			x = x,
 			space_before = space_w > 0,
@@ -335,6 +647,24 @@ md_align_offset :: proc(align: Md_Align, width, line_w: f32) -> f32 {
 	return 0
 }
 
+// md_draw_link_decoration underlines a link and records its clickable area.
+md_draw_link_decoration :: proc(
+	list: ^ImDrawList,
+	x, y, w: f32,
+	size: f32,
+	col: Color,
+	word: Md_Word,
+	line_h: f32,
+	links: ^[dynamic]Md_Link_Rect,
+) {
+	if len(word.url) == 0 do return
+	uy := y + ui_text_px(size) + 1.0
+	mi_draw_line(list, x, uy, x + w, uy, color_u32(alpha(col, 0.55)), 1.0)
+	if links != nil {
+		append(links, Md_Link_Rect{rect = rect(x, y, w, line_h), url = word.url, tip = word.tip})
+	}
+}
+
 md_draw_inline_layout :: proc(
 	list: ^ImDrawList,
 	font: ^ImFont,
@@ -346,7 +676,9 @@ md_draw_inline_layout :: proc(
 	layout: Md_Inline_Layout,
 	align: Md_Align,
 	rec: ^Sel_Recorder,
+	links: ^[dynamic]Md_Link_Rect = nil,
 ) {
+	prev_url := ""
 	for item in layout.items {
 		line_w := layout.line_widths[item.line]
 		wx := x + md_align_offset(align, width, line_w) + item.x
@@ -364,7 +696,15 @@ md_draw_inline_layout :: proc(
 		if item.word.style == .Bold {
 			text_font(list, f, fs, wx + 0.4, wy, wc, item.word.text)
 		}
+		link_x, link_w := wx, item.width
+		if len(item.word.url) > 0 && item.space_before && item.word.url == prev_url {
+			sw, _ := measure(font, size, " ")
+			link_x -= sw
+			link_w += sw
+		}
+		md_draw_link_decoration(list, link_x, wy, link_w, fs, wc, item.word, layout.line_h, links)
 		record_runes(rec, item.word.text, wx, wy, item.width, f, fs, layout.line_h)
+		prev_url = item.word.url
 	}
 }
 
@@ -422,6 +762,7 @@ draw_md_table :: proc(
 	lines: []string,
 	start: int,
 	rec: ^Sel_Recorder = nil,
+	links: ^[dynamic]Md_Link_Rect = nil,
 ) -> (height: f32, next: int) {
 	header := md_split_table_row(lines[start])
 	aligns, ok := md_table_delimiter(lines[start + 1])
@@ -515,6 +856,7 @@ draw_md_table :: proc(
 				layout,
 				c < len(aligns) ? aligns[c] : .Left,
 				rec,
+				links,
 			)
 			md_inline_layout_destroy(&layout)
 			mi_clip_pop(list)
@@ -572,6 +914,7 @@ draw_inline :: proc(
 	th: Theme,
 	text: string,
 	rec: ^Sel_Recorder = nil,
+	links: ^[dynamic]Md_Link_Rect = nil,
 ) -> f32 {
 	words := inline_words(text)
 	defer md_words_destroy(words)
@@ -581,6 +924,7 @@ draw_inline :: proc(
 	x0 := x
 	cx, cy := x, y
 	first := true
+	prev_url := ""
 	for word in words {
 		f, fs, wc := md_word_style(word.style, font, mono, size, th)
 		if word.style == .Text do wc = col
@@ -614,9 +958,16 @@ draw_inline :: proc(
 		if word.style == .Bold {
 			text_font(list, f, fs, cx + 0.4, cy, wc, word.text)
 		}
+		link_x, link_w := cx, ww
+		if len(word.url) > 0 && space_before && word.url == prev_url {
+			link_x -= space_w
+			link_w += space_w
+		}
+		md_draw_link_decoration(list, link_x, cy, link_w, fs, wc, word, line_h, links)
 		record_runes(rec, word.text, cx, cy, ww, f, fs, line_h)
 		cx += ww
 		first = false
+		prev_url = word.url
 	}
 	return (cy - y) + line_h
 }
@@ -850,6 +1201,8 @@ draw_markdown :: proc(
 	text: string,
 	col: Color,
 	rec: ^Sel_Recorder = nil,
+	links: ^[dynamic]Md_Link_Rect = nil,
+	images: ^Md_Image_Context = nil,
 ) -> f32 {
 	lines := strings.split(text, "\n")
 	defer delete(lines)
@@ -883,10 +1236,35 @@ draw_markdown :: proc(
 			continue
 		}
 
+		if alt, src, end, ok := md_markdown_image_at(trimmed, 0); ok && end == len(trimmed) {
+			if h := image_draw_markdown(list, font, alt, src, x, cy, w, th, images); h > 0 {
+				cy += h + 12
+			}
+			i += 1
+			continue
+		}
+
 		if md_is_table_start(lines, i) {
-			table_h, next := draw_md_table(list, font, mono, size, x, cy, w, th, col, lines, i, rec)
+			table_h, next := draw_md_table(list, font, mono, size, x, cy, w, th, col, lines, i, rec, links)
 			cy += table_h + 12
 			i = max(next, i + 2)
+			continue
+		}
+
+		// An image embedded in a text line becomes a text run, an image
+		// block, and any trailing text. Full-line images were handled above.
+		if img_i := md_find_image(trimmed); img_i >= 0 {
+			if before := strings.trim_space(trimmed[:img_i]); len(before) > 0 {
+				cy += draw_inline(list, font, mono, size, x, cy, w, col, th, before, rec, links) + 6
+			}
+			alt, src, end, _ := md_markdown_image_at(trimmed, img_i)
+			if h := image_draw_markdown(list, font, alt, src, x, cy, w, th, images); h > 0 {
+				cy += h + 8
+			}
+			if rest := strings.trim_space(trimmed[end:]); len(rest) > 0 {
+				cy += draw_inline(list, font, mono, size, x, cy, w, col, th, rest, rec, links) + 8
+			}
+			i += 1
 			continue
 		}
 
@@ -899,14 +1277,22 @@ draw_markdown :: proc(
 
 		if heading, level, ok := md_heading(trimmed); ok {
 			hsize := size + f32(8 - level)
-			cy += draw_inline(list, font, mono, hsize, x, cy, w, th.fg, th, heading, rec) + 10
+			cy += draw_inline(list, font, mono, hsize, x, cy, w, th.fg, th, heading, rec, links) + 10
 			i += 1
 			continue
 		}
 
 		if strings.has_prefix(trimmed, ">") {
 			quote := strings.trim_space(trimmed[1:])
-			qh := draw_inline(list, font, mono, size, x + 16, cy, w - 16, th.fg_dim, th, quote, rec)
+			if alt, src, end, ok := md_markdown_image_at(quote, 0); ok && end == len(quote) {
+				if h := image_draw_markdown(list, font, alt, src, x + 16, cy, w - 16, th, images); h > 0 {
+					vrule(list, x + 3, cy, cy + h, th.border)
+					cy += h + 8
+				}
+				i += 1
+				continue
+			}
+			qh := draw_inline(list, font, mono, size, x + 16, cy, w - 16, th.fg_dim, th, quote, rec, links)
 			vrule(list, x + 3, cy, cy + qh, th.border)
 			cy += qh + 8
 			i += 1
@@ -916,14 +1302,23 @@ draw_markdown :: proc(
 		if strings.has_prefix(trimmed, "- ") || strings.has_prefix(trimmed, "* ") || strings.has_prefix(trimmed, "+ ") {
 			item := trimmed[2:]
 			dot(list, x + 5, cy + ui_text_px(size) * 0.55, 2.4, th.accent)
-			cy += draw_inline(list, font, mono, size, x + 18, cy, w - 18, col, th, item, rec) + 6
+			if alt, src, end, ok := md_markdown_image_at(item, 0); ok && end == len(item) {
+				cy += image_draw_markdown(list, font, alt, src, x + 18, cy, w - 18, th, images) + 6
+			} else {
+				cy += draw_inline(list, font, mono, size, x + 18, cy, w - 18, col, th, item, rec, links) + 6
+			}
 			i += 1
 			continue
 		}
 		if _, after, ok := numbered_prefix(trimmed); ok {
 			label := trimmed[:after]
 			text_font(list, font, size, x, cy, th.accent, label)
-			cy += draw_inline(list, font, mono, size, x + 22, cy, w - 22, col, th, strings.trim_space(trimmed[after:]), rec) + 6
+			rest := strings.trim_space(trimmed[after:])
+			if alt, src, end, ok := md_markdown_image_at(rest, 0); ok && end == len(rest) {
+				cy += image_draw_markdown(list, font, alt, src, x + 22, cy, w - 22, th, images) + 6
+			} else {
+				cy += draw_inline(list, font, mono, size, x + 22, cy, w - 22, col, th, rest, rec, links) + 6
+			}
 			i += 1
 			continue
 		}
@@ -933,7 +1328,9 @@ draw_markdown :: proc(
 		for i < len(lines) {
 			cur := strings.trim_space(lines[i])
 			_, _, is_heading := md_heading(cur)
+			_, _, image_end, is_image := md_markdown_image_at(cur, 0)
 			if len(cur) == 0 || strings.has_prefix(cur, "```") || is_heading ||
+			   (is_image && image_end == len(cur)) || md_find_image(cur) >= 0 ||
 			   strings.has_prefix(cur, ">") || strings.has_prefix(cur, "- ") ||
 			   strings.has_prefix(cur, "* ") || strings.has_prefix(cur, "+ ") || cur == "---" ||
 			   md_is_table_start(lines, i) {
@@ -952,7 +1349,7 @@ draw_markdown :: proc(
 			i += 1
 		}
 		para := strings.to_string(b)
-		cy += draw_inline(list, font, mono, size, x, cy, w, col, th, para, rec) + 8
+		cy += draw_inline(list, font, mono, size, x, cy, w, col, th, para, rec, links) + 8
 	}
 	return cy - start_y
 }

@@ -177,6 +177,17 @@ glyph_search :: proc(list: ^ImDrawList, cx, cy, s: f32, col: Color) {
 	mi_draw_line(list, cx + s * 0.15, cy + s * 0.15, cx + s, cy + s, color_u32(col), 1.4)
 }
 
+glyph_paperclip :: proc(list: ^ImDrawList, cx, cy, s: f32, col: Color) {
+	// A slim diagonal clip: an outer loop and a shorter inner return.
+	mi_draw_line(list, cx - s * 0.45, cy + s * 0.75, cx + s * 0.55, cy - s * 0.35, color_u32(col), 1.25)
+	mi_draw_line(list, cx + s * 0.55, cy - s * 0.35, cx + s * 0.55, cy - s * 0.75, color_u32(col), 1.25)
+	mi_draw_line(list, cx + s * 0.55, cy - s * 0.75, cx + s * 0.15, cy - s * 1.0, color_u32(col), 1.25)
+	mi_draw_line(list, cx + s * 0.15, cy - s * 1.0, cx - s * 0.75, cy - 0.1 * s, color_u32(col), 1.25)
+	mi_draw_line(list, cx - s * 0.75, cy - 0.1 * s, cx - s * 0.75, cy + s * 0.55, color_u32(col), 1.25)
+	mi_draw_line(list, cx - s * 0.75, cy + s * 0.55, cx - s * 0.35, cy + s * 0.95, color_u32(col), 1.25)
+	mi_draw_line(list, cx - s * 0.35, cy + s * 0.95, cx + s * 0.2, cy + s * 0.4, color_u32(col), 1.25)
+}
+
 glyph_pencil :: proc(list: ^ImDrawList, cx, cy, s: f32, col: Color) {
 	// Two parallel body edges, a pointed tip, and a short eraser cap.
 	mi_draw_line(list, cx - s * 0.8, cy + s * 0.45, cx + s * 0.45, cy - s * 0.8, color_u32(col), 1.3)

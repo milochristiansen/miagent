@@ -140,13 +140,7 @@ item_destroy :: proc(it: ^StoredItem) {
 	delete(it.output)
 	delete(it.source)
 	delete(it.nugget_id)
-	for &att in it.attachments {
-		delete(att.name)
-		delete(att.mime)
-		delete(att.kind)
-		delete(att.text)
-		delete(att.url)
-	}
+	for &att in it.attachments do attachment_destroy(&att)
 	delete(it.attachments)
 	if r, ok := it.reasoning.?; ok {
 		delete(r.id)

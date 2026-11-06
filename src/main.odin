@@ -112,7 +112,7 @@ main :: proc() {
 	// Hidden child mode for the XDG portal folder picker. This runs before
 	// GLFW is initialized, so the helper has no window or other GUI state.
 	args := os.args
-	if len(args) >= 2 && args[1] == FOLDER_PICKER_FLAG {
+	if len(args) >= 2 && (args[1] == FOLDER_PICKER_FLAG || args[1] == FILES_PICKER_FLAG) {
 		folder_picker_helper(args)
 		return
 	}

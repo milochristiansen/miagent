@@ -58,9 +58,14 @@ App :: struct {
 	preview_active:   bool,
 	preview_title:    string,
 	preview_subtitle: string,
+
+	// Markdown image textures and the optional expanded image overlay.
+	image_cache:  Image_Cache,
+	image_viewer: Image_Viewer,
 	blank_view:       Conversation_View,
 
-	folder_picker: Folder_Picker,
+	folder_picker:     Folder_Picker,
+	attachment_picker: Attachment_Picker,
 
 	// The MCP status card is only shown when the active project has MCP
 	// configuration. It is refreshed at a low frequency so a dead host never
@@ -113,6 +118,7 @@ app_init :: proc(app: ^App, f: Fonts, th: Theme, gui: ^Gui_Config, extra_note: s
 
 	view_init(&app.preview)
 	view_init(&app.blank_view)
+	image_cache_init(&app.image_cache)
 	app_projects_init(app, gui)
 	if app.selected_project >= 0 do app_select_project(app, app.selected_project)
 
@@ -147,9 +153,12 @@ app_destroy :: proc(app: ^App) {
 	app_projects_destroy(app)
 	view_destroy(&app.preview)
 	view_destroy(&app.blank_view)
+	image_viewer_close(&app.image_viewer)
+	image_cache_destroy(&app.image_cache)
 	delete(app.preview_title)
 	delete(app.preview_subtitle)
 	folder_picker_destroy(&app.folder_picker)
+	attachment_picker_destroy(&app.attachment_picker)
 	app_clear_mcp_status(app)
 	delete(app.project_input_error)
 	delete(app.shell)
@@ -239,6 +248,12 @@ drawer_region_width :: proc(app: ^App) -> f32 {
 // the shell drawers. It runs before drawing, so the conversation pane and the
 // drawer use the new width in the same frame.
 app_update_splitter :: proc(app: ^App) {
+	if app.image_viewer.open {
+		app.splitter_hovered = false
+		app.splitter_dragging = false
+		app.splitter_was_down = igIsMouseDown_Nil(0)
+		return
+	}
 	app.splitter_hovered = false
 	down := igIsMouseDown_Nil(0)
 	defer app.splitter_was_down = down
@@ -358,6 +373,7 @@ app_update :: proc(app: ^App) {
 
 	app.shortcut_fired = app_shortcuts(app)
 	folder_picker_poll(app)
+	attachment_picker_poll(app)
 
 	// Keep every project's shells alive even while that project is not visible,
 	// and animate each project's drawer region independently.
@@ -489,6 +505,7 @@ app_reap_project_drawers :: proc(p: ^Project) {
 }
 
 app_shortcuts :: proc(app: ^App) -> bool {
+	if app.image_viewer.open do return false
 	ctrl := mi_io_key_ctrl() != 0
 	shift := mi_io_key_shift() != 0
 	if !(ctrl && shift) do return false
@@ -521,6 +538,7 @@ app_frame :: proc(app: ^App) {
 	draw_conversation(app)
 	draw_rail(app)
 	draw_drawers(app)
+	draw_image_viewer(app)
 	app_update_terminal_focus(app)
 }
 
@@ -529,9 +547,9 @@ app_update_terminal_focus :: proc(app: ^App) {
 	for p in app.projects {
 		for &d, i in p.drawers {
 			if d.term == nil || !d.spawned do continue
-			want := app.window_focused && p == active && d.open &&
-			        p.focus_drawer == i && mi_io_want_text_input() == 0 &&
-			        !d.term.paste_prompt
+			want := app.window_focused && !app.image_viewer.open && !app.shortcut_fired &&
+			        p == active && d.open && p.focus_drawer == i &&
+			        mi_io_want_text_input() == 0 && !d.term.paste_prompt
 			terminal_update_focus(d.term, want)
 		}
 	}

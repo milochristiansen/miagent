@@ -28,6 +28,23 @@ typedef struct {
 	gboolean timed_out;
 } Picker_State;
 
+// Append one selected path. Multiple selections are newline-separated so the
+// child process can return them through a single NUL-terminated buffer.
+static void picker_append_path(Picker_State *state, const char *path) {
+	if (state->out == NULL || state->out_size == 0 || path == NULL) return;
+	size_t used = strlen(state->out);
+	if (used >= state->out_size - 1) return;
+	if (used > 0) {
+		state->out[used++] = '\n';
+		state->out[used] = 0;
+		if (used >= state->out_size - 1) return;
+	}
+	size_t len = strlen(path);
+	if (len > state->out_size - used - 1) len = state->out_size - used - 1;
+	memcpy(state->out + used, path, len);
+	state->out[used + len] = 0;
+}
+
 static void on_response(
 	GDBusConnection *connection,
 	const char *sender_name,
@@ -52,20 +69,18 @@ static void on_response(
 	if (response == 0 && results != NULL) {
 		GVariant *uris = g_variant_lookup_value(results, "uris", G_VARIANT_TYPE_STRING_ARRAY);
 		if (uris != NULL) {
-			if (g_variant_n_children(uris) > 0) {
+			gsize count = g_variant_n_children(uris);
+			for (gsize i = 0; i < count; i += 1) {
 				const gchar *uri = NULL;
-				g_variant_get_child(uris, 0, "&s", &uri);
-				if (uri != NULL && state->out != NULL && state->out_size > 0) {
-					GError *error = NULL;
-					gchar *path = g_filename_from_uri(uri, NULL, &error);
-					if (path != NULL) {
-						if (strlen(path) < state->out_size) {
-							g_strlcpy(state->out, path, state->out_size);
-						}
-						g_free(path);
-					}
-					if (error != NULL) g_error_free(error);
+				g_variant_get_child(uris, i, "&s", &uri);
+				if (uri == NULL) continue;
+				GError *error = NULL;
+				gchar *path = g_filename_from_uri(uri, NULL, &error);
+				if (path != NULL) {
+					picker_append_path(state, path);
+					g_free(path);
 				}
+				if (error != NULL) g_error_free(error);
 			}
 			g_variant_unref(uris);
 		}
@@ -92,7 +107,8 @@ static char *request_name_component(const char *unique_name) {
 	return g_string_free(s, FALSE);
 }
 
-int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
+static int portal_pick_path(const char *title, char *out, size_t out_size,
+                            gboolean directory, gboolean multiple) {
 	if (out != NULL && out_size > 0) out[0] = 0;
 
 	GError *error = NULL;
@@ -137,8 +153,8 @@ int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
 	GVariantBuilder options;
 	g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
 	g_variant_builder_add(&options, "{sv}", "handle_token", g_variant_new_string(token));
-	g_variant_builder_add(&options, "{sv}", "directory", g_variant_new_boolean(TRUE));
-	g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
+	g_variant_builder_add(&options, "{sv}", "directory", g_variant_new_boolean(directory));
+	g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(multiple));
 	g_variant_builder_add(&options, "{sv}", "modal", g_variant_new_boolean(TRUE));
 
 	GVariant *reply = g_dbus_connection_call_sync(
@@ -147,7 +163,7 @@ int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
 		"/org/freedesktop/portal/desktop",
 		"org.freedesktop.portal.FileChooser",
 		"OpenFile",
-		g_variant_new("(ssa{sv})", "", title != NULL ? title : "Choose a folder", &options),
+		g_variant_new("(ssa{sv})", "", title != NULL ? title : (directory ? "Choose a folder" : "Choose files"), &options),
 		G_VARIANT_TYPE("(o)"),
 		G_DBUS_CALL_FLAGS_NONE,
 		-1,
@@ -203,6 +219,14 @@ int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
 	return -1;
 }
 
+int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
+	return portal_pick_path(title, out, out_size, TRUE, FALSE);
+}
+
+int mi_portal_pick_files(const char *title, char *out, size_t out_size) {
+	return portal_pick_path(title, out, out_size, FALSE, TRUE);
+}
+
 #else
 
 int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
@@ -213,10 +237,47 @@ int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
 	return -1;
 }
 
+int mi_portal_pick_files(const char *title, char *out, size_t out_size) {
+	(void)title;
+	(void)out;
+	(void)out_size;
+	fprintf(stderr, "portal: file chooser support not built (gio-2.0 missing)\n");
+	return -1;
+}
+
 #endif
 
-// Open a URI with the user's default handler. This is intentionally a tiny
-// shim: the GUI validates the scheme before calling it.
+// Open a local path or URI with the user's default handler. These are
+// intentionally tiny shims: the GUI validates image/link inputs before calling.
+int mi_open_path(const char *path) {
+  if (path == NULL || path[0] == 0) return -1;
+#ifndef MIAGENT_NO_PORTAL
+  GError *error = NULL;
+  gchar *uri = g_filename_to_uri(path, NULL, &error);
+  if (uri == NULL) {
+    if (error != NULL) g_error_free(error);
+    return -1;
+  }
+  gboolean ok = g_app_info_launch_default_for_uri(uri, NULL, &error);
+  g_free(uri);
+  if (!ok) {
+    if (error != NULL) g_error_free(error);
+    return -1;
+  }
+  return 0;
+#else
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    execlp("xdg-open", "xdg-open", path, (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) return -1;
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+#endif
+}
+
 int mi_open_uri(const char *uri) {
   if (uri == NULL || uri[0] == 0) return -1;
 #ifndef MIAGENT_NO_PORTAL
