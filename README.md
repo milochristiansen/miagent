@@ -137,41 +137,40 @@ agent.
 
 MiAgent is released under the MIT License. See [LICENSE](LICENSE) for the full text.
 
-It bundles, links, or derives from the third-party work listed below. The copyright lines are reproduced here because
-they have to travel with redistributions; for every entry licensed MIT, the permission notice is the one in `LICENSE`.
+It bundles, links, or derives from the third-party work listed below.
 
 
 ### Bundled source and data
 
-| Component | Where | License | Copyright |
-| --- | --- | --- | --- |
-| stb_image v2.28 | `src/stb_image.h` | Public domain, or MIT at your option | Copyright (c) 2017 Sean Barrett |
-| Noto Emoji Regular | `assets/fonts/` | SIL OFL 1.1, see `assets/fonts/OFL.txt` | Copyright 2013 Google LLC |
+* stb_image v2.28 (`src/stb_image.h`) - Public domain, or MIT at your option - Copyright (c) 2017 Sean Barrett
+* Noto Emoji Regular (`assets/fonts/`) - SIL OFL 1.1, see `assets/fonts/OFL.txt` - Copyright 2013 Google LLC
 
 `NotoEmoji-Regular.ttf` is a modified copy of Google's Noto Emoji: it is instantiated at weight 400 and subset to the
-symbol and emoji ranges. It remains under the OFL rather than the MIT License, and `OFL.txt` ships beside it.
+symbol and emoji ranges.
 
 
 ### Statically linked libraries
 
-| Component | License | Copyright |
-| --- | --- | --- |
-| libghostty-vt (Ghostty) | MIT | Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors |
-| cimgui | MIT | Copyright (c) 2015 Stephan Dilly |
-| Dear ImGui, via cimgui | MIT | Copyright (c) 2014-2026 Omar Cornut |
-| Odin runtime and core library | zlib | Copyright (c) 2016-2025 Ginger Bill |
+These libraries are fetched and built by `scripts/bootstrap.sh`.
 
-These are fetched and built by `scripts/bootstrap.sh` and live in `third_party/`, which is generated and not tracked by
-git. The script copies the upstream license files there, but the notices above are the ones to keep with binary
-distributions.
+* libghostty-vt (Ghostty) - MIT - Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
+* cimgui - MIT - Copyright (c) 2015 Stephan Dilly
+* Dear ImGui, via cimgui - MIT - Copyright (c) 2014-2026 Omar Cornut
+* Odin runtime and core library - zlib - Copyright (c) 2016-2025 Ginger Bill
 
 
 ### Prompt text derived from other agents
 
-| Component | License | Copyright | Used for |
-| --- | --- | --- | --- |
-| DeepSeek Harness | MIT | Copyright (c) 2026 DeepSeek | `prompts/SYSTEM.md` follows its minimal-mode system prompt |
-| Pi | MIT | Copyright (c) 2025 Mario Zechner | `prompts/COMPACT-*.md` follow its compaction prompts |
+Some prompt text was copied or is based on prompts from the following projects:
+
+* DeepSeek Harness - MIT - Copyright (c) 2026 DeepSeek
+* Pi - MIT - Copyright (c) 2025 Mario Zechner
+
+DSH's minimal mode system prompt formed the core of `prompts/SYSTEM.md`. If I wasn't making my own thing, I would
+probably be using DSH.
+
+The compaction process was inspired by how Pi handles it, and most of the compaction prompts are based on those from Pi
+(`prompts/COMPACT-*.md`).
 
 Upstream projects: [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) and
 [earendil-works/pi](https://github.com/earendil-works/pi).
@@ -181,15 +180,7 @@ Upstream projects: [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai
 
 The GUI links against libraries provided by the system: GLFW (zlib/libpng), OpenGL, libcurl (curl license), zlib (zlib
 license), GLib/GIO (LGPL-2.1-or-later), and ALSA (LGPL-2.1-or-later, loaded with `dlopen`). None of their code is
-redistributed in this repository or in its binaries. The same holds for build and runtime tooling: the Odin compiler
-(zlib), Zig (MIT), GCC/G++ (GPLv3 with the runtime exception), Bubblewrap (LGPL-2.0-or-later), `jq` (MIT), and `bash`
-(GPLv3).
+redistributed in this repository or in its binaries.
 
 Fira Code is the default UI font family name, but it is not bundled or installed by this project. Users who install it
 do so under the SIL Open Font License 1.1.
-
-
-### Redistributing binaries
-
-If you ship a compiled build, include `LICENSE`, this section (or a copy of each notice above), and
-`assets/fonts/OFL.txt` alongside the binaries.
