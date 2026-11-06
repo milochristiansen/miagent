@@ -23,7 +23,7 @@ MONO_PX    :: f32(15.0)
 MONO_SMALL :: f32(11.5)
 
 Drawer :: struct {
-	term:    Terminal,
+	term:    ^Terminal,
 	name:    string,
 	open:    bool,
 	anim:    f32,
@@ -36,6 +36,7 @@ App :: struct {
 	f:  Fonts,
 
 	width, height: f32,
+	window_focused: bool,
 	mouse:         ImVec2,
 	now, dt:       f32,
 
@@ -100,6 +101,7 @@ app_init :: proc(app: ^App, f: Fonts, th: Theme, gui: ^Gui_Config, extra_note: s
 	app.mute_audio = gui.mute_audio
 	if gui.drawer_width > 0 do app.drawer_width = f32(gui.drawer_width)
 	audio_alert_init()
+	terminal_runtime_init()
 	home, _ := os.user_home_dir(context.allocator)
 	app.home = home
 	cwd, cwd_err := os.get_working_directory(context.allocator)
@@ -113,6 +115,11 @@ app_init :: proc(app: ^App, f: Fonts, th: Theme, gui: ^Gui_Config, extra_note: s
 	view_init(&app.blank_view)
 	app_projects_init(app, gui)
 	if app.selected_project >= 0 do app_select_project(app, app.selected_project)
+
+	// Dev aid: open one shell drawer on launch for screenshots/smoke tests.
+	if len(os.get_env("MIAGENT_DRAWER", context.temp_allocator)) > 0 {
+		app_new_drawer(app)
+	}
 
 	if len(extra_note) > 0 {
 		view_add_error(app_active_view(app), extra_note)
@@ -156,7 +163,9 @@ app_new_drawer :: proc(app: ^App) {
 	p := app_active_project(app)
 	if p == nil do return
 	name := fmt.tprintf("shell %d", len(p.drawers) + 1)
+	term := new(Terminal)
 	append(&p.drawers, Drawer{
+		term = term,
 		name = strings.clone(name, context.allocator),
 		open = true,
 	})
@@ -361,7 +370,11 @@ app_update :: proc(app: ^App) {
 			// Keep draining closed drawers too: the pty would otherwise fill
 			// its kernel buffer and block the shell.
 			if d.spawned {
-				terminal_pump(&d.term)
+				terminal_pump(d.term)
+				if bells := terminal_take_bell(d.term); bells > 0 && !app.mute_audio {
+					audio_bell_play()
+				}
+				terminal_compression_tick(d.term, app.now)
 			}
 		}
 		app_reap_project_drawers(p)
@@ -449,7 +462,8 @@ app_reap_project_drawers :: proc(p: ^Project) {
 		if idx == old_focus do focus_removed = true
 		if idx < old_focus do removed_before += 1
 		d := &p.drawers[idx]
-		terminal_destroy(&d.term)
+		terminal_destroy(d.term)
+		free(d.term)
 		delete(d.name)
 	}
 	for j := n - 1; j >= 0; j -= 1 {
@@ -489,6 +503,12 @@ app_shortcuts :: proc(app: ^App) -> bool {
 		if p.focus_drawer >= 0 do app_close_drawer(app, p.focus_drawer)
 		return true
 	}
+	if igIsKeyPressed_Bool(ImGuiKey(546 + 17), false) { // R
+		if p.focus_drawer >= 0 && p.focus_drawer < len(p.drawers) && p.drawers[p.focus_drawer].term != nil {
+			terminal_reset(p.drawers[p.focus_drawer].term)
+		}
+		return true
+	}
 	return false
 }
 
@@ -501,4 +521,18 @@ app_frame :: proc(app: ^App) {
 	draw_conversation(app)
 	draw_rail(app)
 	draw_drawers(app)
+	app_update_terminal_focus(app)
+}
+
+app_update_terminal_focus :: proc(app: ^App) {
+	active := app_active_project(app)
+	for p in app.projects {
+		for &d, i in p.drawers {
+			if d.term == nil || !d.spawned do continue
+			want := app.window_focused && p == active && d.open &&
+			        p.focus_drawer == i && mi_io_want_text_input() == 0 &&
+			        !d.term.paste_prompt
+			terminal_update_focus(d.term, want)
+		}
+	}
 }

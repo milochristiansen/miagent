@@ -36,6 +36,8 @@ Theme :: struct {
 	cursor: Color,
 	sel_bg: Color,
 	sel_fg: Color,
+	cursor_style: i32,
+	cursor_blink: bool,
 
 	source: string,
 }
@@ -77,6 +79,8 @@ theme_init :: proc(k: Terminal_Theme, allocator := context.allocator) -> Theme {
 	t.cursor = k.cursor
 	t.sel_bg = k.sel_bg
 	t.sel_fg = k.sel_fg
+	t.cursor_style = k.cursor_style
+	t.cursor_blink = k.cursor_blink
 	t.ansi = k.ansi
 	t.source = k.source
 

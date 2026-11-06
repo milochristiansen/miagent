@@ -12,6 +12,9 @@
 //  -1  the portal is unavailable or failed
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #ifndef MIAGENT_NO_PORTAL
 #include <gio/gio.h>
@@ -211,3 +214,28 @@ int mi_portal_pick_folder(const char *title, char *out, size_t out_size) {
 }
 
 #endif
+
+// Open a URI with the user's default handler. This is intentionally a tiny
+// shim: the GUI validates the scheme before calling it.
+int mi_open_uri(const char *uri) {
+  if (uri == NULL || uri[0] == 0) return -1;
+#ifndef MIAGENT_NO_PORTAL
+  GError *error = NULL;
+  gboolean ok = g_app_info_launch_default_for_uri(uri, NULL, &error);
+  if (!ok) {
+    if (error != NULL) g_error_free(error);
+    return -1;
+  }
+  return 0;
+#else
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    execlp("xdg-open", "xdg-open", uri, (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) return -1;
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+#endif
+}

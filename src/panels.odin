@@ -178,12 +178,12 @@ draw_one_drawer :: proc(app: ^App, list: ^ImDrawList, p: ^Project, d: ^Drawer, i
 		focused = true
 		border = alpha(th.accent, 0.75)
 	}
-	if mi_hit_hovered() do mi_io_set_mouse_cursor(i32(CURSOR_TEXT))
+	if !d.spawned && mi_hit_hovered() do mi_io_set_mouse_cursor(i32(CURSOR_TEXT))
 
 	if !d.spawned && !d.failed && d.anim >= 0.99 {
 		cols, rows := terminal_grid_size(term_area, app.f)
 		if cols > 0 && rows > 0 {
-			res := terminal_init(&d.term, app.shell, p.path, app.th, cols, rows)
+			res := terminal_init(d.term, app.shell, p.path, app.th, cols, rows, app.f.cell_w, app.f.cell_h)
 			if res == .Ok {
 				d.spawned = true
 			} else {
@@ -197,8 +197,12 @@ draw_one_drawer :: proc(app: ^App, list: ^ImDrawList, p: ^Project, d: ^Drawer, i
 		text_font(list, app.f.ui, 12.5, term_area.x + (term_area.w - mw) * 0.5, term_area.y + (term_area.h - mh) * 0.5, th.fg_faint, msg)
 	} else {
 		over_body := rect_contains(term_hit, app.mouse.x, app.mouse.y)
+		terminal_update_hover_cell(d.term, term_area, app.f, app.mouse, over_body)
 		shift := mi_io_key_shift() != 0
-		tracking := terminal_mouse_tracking(&d.term)
+		tracking := terminal_mouse_tracking(d.term)
+		has_link := terminal_update_hover_link(d.term, over_body, (!tracking || shift) && !d.term.paste_prompt)
+		if mi_hit_hovered() do mi_io_set_mouse_cursor(i32(has_link ? CURSOR_HAND : CURSOR_TEXT))
+		if has_link && !tracking && !shift do tooltip(d.term.hover_link_uri)
 		if !tracking {
 			d.term.mouse_grab = false
 			d.term.mouse_have_cell = false
@@ -206,25 +210,55 @@ draw_one_drawer :: proc(app: ^App, list: ^ImDrawList, p: ^Project, d: ^Drawer, i
 		// While the application is tracking the mouse, a plain press/drag is
 		// delivered to it (including motion outside the body once a press has
 		// grabbed the pointer). Shift keeps the usual local text selection.
-		report_mouse := tracking && ((over_body && !shift) || d.term.mouse_grab)
+		report_mouse := !d.term.paste_prompt && tracking && ((over_body && !shift) || d.term.mouse_grab)
 		wheel := hovered ? mi_io_wheel() : 0
 		app_wheel := tracking && over_body && !shift
 		if report_mouse {
-			terminal_mouse_input(&d.term, term_area, app.f, app.mouse, over_body, shift,
+			terminal_mouse_input(d.term, term_area, app.f, app.mouse, over_body, shift,
 				app_wheel ? wheel : 0)
 		}
 		// Suppress local selection while an application owns the gesture.
-		selecting := !tracking || (shift && !d.term.mouse_grab)
-		terminal_selection_update(&d.term, term_area, app.f, app.mouse, over_body,
-			igIsMouseDown_Nil(0) && selecting)
-		terminal_draw(&d.term, list, term_area, th, app.f, focused, app.now)
-		draw_terminal_scrollbar(app, list, &d.term, index, term_area, th, sb, has_sb)
+		selecting := !d.term.paste_prompt && (!tracking || (shift && !d.term.mouse_grab))
+		link_clicked := false
+		if !d.term.paste_prompt && over_body && !tracking && has_link && igIsMouseClicked_Bool(0, false) &&
+		   (mi_io_key_ctrl() != 0 || mi_io_key_super() != 0) {
+			link_clicked = terminal_open_link(d.term)
+		}
+		terminal_selection_update(d.term, term_area, app.f, app.mouse, over_body,
+			igIsMouseDown_Nil(0) && selecting && !link_clicked)
+		terminal_draw(d.term, list, term_area, th, app.f, focused, app.now)
+		draw_terminal_scrollbar(app, list, d.term, index, term_area, th, sb, has_sb)
 
 		if wheel != 0 && !app_wheel {
-			terminal_scroll(&d.term, -i32(wheel * 3.0))
+			terminal_wheel(d.term, -i32(wheel * 3.0))
 		}
-		if focused && !app.shortcut_fired && mi_io_want_text_input() == 0 {
-			terminal_handle_input(&d.term)
+
+		if d.term.paste_prompt {
+			if igIsKeyPressed_Bool(KEY_ESCAPE, false) do terminal_cancel_paste(d.term)
+			lines := 1
+			for b in d.term.pending_paste {
+				if b == '\n' do lines += 1
+			}
+			card_w := min(term_area.w - 24, 360)
+			card := rect(term_area.x + (term_area.w - card_w) * 0.5,
+				term_area.y + term_area.h - 76, card_w, 64)
+			panel(list, card, th.bg_raised, 8, th.border)
+			msg := fmt.tprintf("Paste %d lines into the terminal?", lines)
+			text_font(list, app.f.ui, 12.0, card.x + 12, card.y + 10, th.fg, msg)
+			paste_r := rect(card.x + card.w - 150, card.y + 34, 64, 22)
+			cancel_r := rect(card.x + card.w - 78, card.y + 34, 68, 22)
+			if button(list, cstr("##pasteconfirm"), paste_r, "Paste", app.f.ui, 11.5,
+				th.bg, th.accent, alpha(th.accent, 0.85), alpha(th.accent, 0.7), 6) {
+				terminal_confirm_paste(d.term)
+			}
+			if button(list, cstr("##pastecancel"), cancel_r, "Cancel", app.f.ui, 11.5,
+				th.fg_dim, th.bg_hover, th.bg_active, th.bg_active, 6) {
+				terminal_cancel_paste(d.term)
+			}
+		}
+
+		if focused && !app.shortcut_fired && !d.term.paste_prompt && mi_io_want_text_input() == 0 {
+			terminal_handle_input(d.term)
 		}
 	}
 

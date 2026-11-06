@@ -15,6 +15,12 @@ Submit one prompt immediately at launch (handy with a local mock endpoint):
 MIAGENT_PROMPT='summarize this project' ./build/miagent-desktop
 ```
 
+Open one shell drawer at launch (handy with `MIAGENT_SCREENSHOT`):
+
+```sh
+MIAGENT_DRAWER=1 ./build/miagent-desktop
+```
+
 Print frame timings (first frames plus every 60th frame) to stderr:
 
 ```sh
@@ -56,8 +62,11 @@ src/
   portal.c       XDG Desktop Portal FileChooser D-Bus/GIO shim
   conversation.odin  transcript view state + conversation/composer rendering
   markdown.odin   small Markdown renderer (paragraphs, headings, code, lists, tables)
-  terminal.odin   PTY <- libghostty-vt <- ImGui draw list; key/mouse encoding, selection, clipboard
-  ghostty.odin    libghostty-vt bindings (terminal, render state, key + mouse encoders)
+  terminal.odin   PTY <- libghostty-vt <- ImGui draw list; state, input, rendering cache
+  terminal_effects.odin  terminal effects (queries, bell, clipboard, focus, reset, compression)
+  terminal_selection.odin selection gestures, word/line/block selection, OSC 8 links
+  system.odin     bindings for host integration shims (open URI)
+  ghostty.odin    libghostty-vt bindings (terminal, render state, key + mouse encoders, effects)
   imgui.odin      cimgui bindings
   theme_config.odin  built-in terminal palette/font + theme.json overrides
   theme.odin      derived UI palette + ImGui style

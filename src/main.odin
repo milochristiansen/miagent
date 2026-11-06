@@ -200,16 +200,34 @@ main :: proc() {
 	merge_fallback(mono, FONT_SYMBOL[:], mono_px)
 	merge_emoji(mono, theme, mono_px)
 
-	mono_bold := load_font_path(theme_font_path(theme, true), mono_px)
+	mono_bold := load_font_path(theme_font_path_style(theme, .Bold), mono_px)
 	if mono_bold == nil do mono_bold = load_font(FONT_MONO_BOLD[:], mono_px)
 	if mono_bold == nil do mono_bold = mono
 	merge_fallback(mono_bold, FONT_NERD_BOLD[:], mono_px)
 	merge_fallback(mono_bold, FONT_SYMBOL[:], mono_px)
 	merge_emoji(mono_bold, theme, mono_px)
+
+	mono_italic := load_font_path(theme_font_path_style(theme, .Italic), mono_px)
+	if mono_italic == nil do mono_italic = mono
+	merge_fallback(mono_italic, FONT_SYMBOL[:], mono_px)
+	merge_emoji(mono_italic, theme, mono_px)
+
+	mono_bold_italic := load_font_path(theme_font_path_style(theme, .Bold_Italic), mono_px)
+	if mono_bold_italic == nil do mono_bold_italic = mono_bold
+	merge_fallback(mono_bold_italic, FONT_SYMBOL[:], mono_px)
+	merge_emoji(mono_bold_italic, theme, mono_px)
 	if ui != nil do mi_font_set_default(ui)
 
 	app := App{}
-	app_init(&app, Fonts{ui = ui, mono = mono, mono_bold = mono_bold, ui_size = ui_text_px(UI_PX), mono_size = mono_px}, th, &gui, gui_note)
+	app_init(&app, Fonts{
+		ui = ui,
+		mono = mono,
+		mono_bold = mono_bold,
+		mono_italic = mono_italic,
+		mono_bold_italic = mono_bold_italic,
+		ui_size = ui_text_px(UI_PX),
+		mono_size = mono_px,
+	}, th, &gui, gui_note)
 	defer app_destroy(&app)
 
 	shot := os.get_env("MIAGENT_SCREENSHOT", context.allocator)
@@ -219,6 +237,7 @@ main :: proc() {
 
 	for !glfw.WindowShouldClose(win) {
 		glfw.PollEvents()
+		app.window_focused = glfw.GetWindowAttrib(win, glfw.FOCUSED) != 0
 
 		ImGui_ImplOpenGL3_NewFrame()
 		ImGui_ImplGlfw_NewFrame()

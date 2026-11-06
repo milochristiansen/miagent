@@ -69,6 +69,49 @@ int mi_io_input_chars(unsigned int *out, int cap) {
   return n;
 }
 
+
+// --- ordered input events -------------------------------------------------
+//
+// ImGui keeps the events it consumed this frame in InputEventsTrail. The
+// terminal needs their order to associate text with the key that produced it
+// and to report key releases/repeats to the Kitty keyboard protocol.
+typedef struct MiInputEvent {
+  int type;
+  int key;
+  int down;
+  unsigned int ch;
+  float analog;
+} MiInputEvent;
+
+int mi_io_input_event_count(void) {
+  ImGuiContext *ctx = igGetCurrentContext();
+  return ctx ? ctx->InputEventsTrail.Size : 0;
+}
+
+bool mi_io_input_event_get(int index, MiInputEvent *out) {
+  ImGuiContext *ctx = igGetCurrentContext();
+  if (ctx == NULL || out == NULL || index < 0 || index >= ctx->InputEventsTrail.Size) return false;
+  const ImGuiInputEvent *e = &ctx->InputEventsTrail.Data[index];
+  memset(out, 0, sizeof(*out));
+  out->type = (int)e->Type;
+  switch (e->Type) {
+    case ImGuiInputEventType_Key:
+      out->key = (int)e->Key.Key;
+      out->down = e->Key.Down ? 1 : 0;
+      out->analog = e->Key.AnalogValue;
+      break;
+    case ImGuiInputEventType_Text:
+      out->ch = e->Text.Char;
+      break;
+    case ImGuiInputEventType_Focus:
+      out->down = e->AppFocused.Focused ? 1 : 0;
+      break;
+    default:
+      break;
+  }
+  return true;
+}
+
 // --- Fonts -----------------------------------------------------------------
 
 ImFont *mi_font_add(const char *path, float px) {

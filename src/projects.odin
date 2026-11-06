@@ -44,7 +44,10 @@ project_destroy :: proc(p: ^Project) {
 	}
 	delete(p.tabs)
 	for &d in p.drawers {
-		if d.spawned do terminal_destroy(&d.term)
+		if d.term != nil {
+			terminal_destroy(d.term)
+			free(d.term)
+		}
 		delete(d.name)
 	}
 	delete(p.drawers)

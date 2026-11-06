@@ -258,6 +258,7 @@ GHOSTTY_MOUSE_BUTTON_FIVE :: 5
 // Ghostty key codes we generate (values from ghostty/vt/key/event.h).
 GHOSTTY_KEY_UNIDENTIFIED :: 0
 GHOSTTY_KEY_DIGIT_0 :: 6
+GHOSTTY_KEY_DIGIT_9 :: 15
 GHOSTTY_KEY_BACKQUOTE :: 1
 GHOSTTY_KEY_BACKSLASH :: 2
 GHOSTTY_KEY_BRACKET_LEFT :: 3
@@ -382,3 +383,365 @@ foreign ghostty {
 	mi_pty_terminate :: proc(fd, pid: i32) ---
 	mi_pty_reap :: proc(pid: i32) -> i32 ---
 }
+
+// --- effects, selection gestures, diagnostics, and keyboard extras --------
+
+GhosttySelectionGesture :: distinct rawptr
+GhosttySelectionGestureEvent :: distinct rawptr
+
+GhosttySurfacePosition :: struct {
+	x, y: f64,
+}
+
+GhosttyClipboardContent :: struct {
+	mime: GhosttyString,
+	data: GhosttyString,
+}
+
+GhosttyClipboardWrite :: struct {
+	size:         uint,
+	location:     i32,
+	contents:     [^]GhosttyClipboardContent,
+	contents_len: uint,
+}
+
+GhosttySizeReportSize :: struct {
+	rows:        u16,
+	columns:     u16,
+	cell_width:  u32,
+	cell_height: u32,
+}
+
+GhosttyDeviceAttributesPrimary :: struct {
+	conformance_level: u16,
+	features:          [64]u16,
+	num_features:      uint,
+}
+
+GhosttyDeviceAttributesSecondary :: struct {
+	device_type:      u16,
+	firmware_version: u16,
+	rom_cartridge:    u16,
+}
+
+GhosttyDeviceAttributesTertiary :: struct {
+	unit_id: u32,
+}
+
+GhosttyDeviceAttributes :: struct {
+	primary:   GhosttyDeviceAttributesPrimary,
+	secondary: GhosttyDeviceAttributesSecondary,
+	tertiary:  GhosttyDeviceAttributesTertiary,
+}
+
+GhosttySelectionGestureBehaviors :: struct {
+	single_click: i32,
+	double_click: i32,
+	triple_click: i32,
+}
+
+GhosttySelectionGestureGeometry :: struct {
+	columns:       u32,
+	cell_width:    u32,
+	padding_left:  u32,
+	screen_height: u32,
+}
+
+GhosttyTerminalSelectWordOptions :: struct {
+	size:                  uint,
+	ref:                   GhosttyGridRef,
+	boundary_codepoints:   [^]u32,
+	boundary_codepoints_len: uint,
+}
+
+GhosttyTerminalSelectWordBetweenOptions :: struct {
+	size:                  uint,
+	start:                 GhosttyGridRef,
+	end:                   GhosttyGridRef,
+	boundary_codepoints:   [^]u32,
+	boundary_codepoints_len: uint,
+}
+
+GhosttyTerminalSelectLineOptions :: struct {
+	size:                      uint,
+	ref:                       GhosttyGridRef,
+	whitespace:                [^]u32,
+	whitespace_len:            uint,
+	semantic_prompt_boundary:  bool,
+	_pad:                      [7]u8,
+}
+
+// C callback types. Userdata is a stable ^Terminal.
+GhosttyTerminalWritePtyFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr, data: [^]u8, len: uint)
+GhosttyTerminalBellFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr)
+GhosttyTerminalEnquiryFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr) -> GhosttyString
+GhosttyTerminalXtversionFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr) -> GhosttyString
+GhosttyTerminalTitleChangedFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr)
+GhosttyTerminalPwdChangedFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr)
+GhosttyTerminalSizeFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr, out: ^GhosttySizeReportSize) -> bool
+GhosttyTerminalColorSchemeFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr, out: ^i32) -> bool
+GhosttyTerminalDeviceAttributesFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr, out: ^GhosttyDeviceAttributes) -> bool
+GhosttyTerminalClipboardWriteFn :: proc "c" (t: GhosttyTerminal, userdata: rawptr, write: ^GhosttyClipboardWrite) -> i32
+GhosttySysLogFn :: proc "c" (userdata: rawptr, level: i32, scope: [^]u8, scope_len: uint, message: [^]u8, message_len: uint)
+
+GHOSTTY_TERMINAL_OPT_USERDATA :: 0
+GHOSTTY_TERMINAL_OPT_WRITE_PTY :: 1
+GHOSTTY_TERMINAL_OPT_BELL :: 2
+GHOSTTY_TERMINAL_OPT_ENQUIRY :: 3
+GHOSTTY_TERMINAL_OPT_XTVERSION :: 4
+GHOSTTY_TERMINAL_OPT_TITLE_CHANGED :: 5
+GHOSTTY_TERMINAL_OPT_SIZE :: 6
+GHOSTTY_TERMINAL_OPT_COLOR_SCHEME :: 7
+GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES :: 8
+GHOSTTY_TERMINAL_OPT_TITLE :: 9
+GHOSTTY_TERMINAL_OPT_PWD :: 10
+GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE :: 22
+GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK :: 23
+GHOSTTY_TERMINAL_OPT_PWD_CHANGED :: 25
+GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE :: 26
+
+GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN :: 6
+GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS :: 8
+GHOSTTY_TERMINAL_DATA_CURSOR_STYLE :: 10
+GHOSTTY_TERMINAL_DATA_TOTAL_ROWS :: 14
+GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS :: 15
+GHOSTTY_TERMINAL_DATA_VT_PROCESSING_ERROR :: 33
+
+GHOSTTY_TERMINAL_SCREEN_PRIMARY :: 0
+GHOSTTY_TERMINAL_SCREEN_ALTERNATE :: 1
+
+GHOSTTY_MODE_DECCKM :: u16(1)
+GHOSTTY_MODE_FOCUS_EVENT :: u16(1004)
+GHOSTTY_MODE_ALT_SCROLL :: u16(1007)
+GHOSTTY_MODE_ALT_SCREEN :: u16(1047)
+GHOSTTY_MODE_COLOR_SCHEME_REPORT :: u16(2031)
+GHOSTTY_MODE_IN_BAND_RESIZE :: u16(2048)
+
+GHOSTTY_RENDER_STATE_DATA_DIRTY :: 3
+GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR_HAS_VALUE :: 8
+GHOSTTY_RENDER_STATE_DATA_COLOR_PALETTE :: 9
+GHOSTTY_RENDER_STATE_DATA_CURSOR_PASSWORD_INPUT :: 13
+GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL :: 17
+GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY :: 1
+GHOSTTY_RENDER_STATE_ROW_DATA_RAW :: 2
+GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY :: 0
+GHOSTTY_RENDER_STATE_OPTION_DIRTY :: 0
+
+GHOSTTY_RENDER_STATE_DIRTY_FALSE :: 0
+GHOSTTY_RENDER_STATE_DIRTY_PARTIAL :: 1
+GHOSTTY_RENDER_STATE_DIRTY_FULL :: 2
+
+GHOSTTY_FOCUS_GAINED :: 0
+GHOSTTY_FOCUS_LOST :: 1
+
+GHOSTTY_COLOR_SCHEME_LIGHT :: 0
+GHOSTTY_COLOR_SCHEME_DARK :: 1
+
+GHOSTTY_SIZE_REPORT_MODE_2048 :: 0
+GHOSTTY_SIZE_REPORT_CSI_14_T :: 1
+GHOSTTY_SIZE_REPORT_CSI_16_T :: 2
+GHOSTTY_SIZE_REPORT_CSI_18_T :: 3
+
+GHOSTTY_CLIPBOARD_LOCATION_STANDARD :: 0
+GHOSTTY_CLIPBOARD_LOCATION_SELECTION :: 1
+GHOSTTY_CLIPBOARD_LOCATION_PRIMARY :: 2
+
+GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS :: 0
+GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED :: 1
+GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED :: 2
+GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY :: 3
+GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA :: 4
+GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR :: 5
+
+GHOSTTY_SYS_OPT_USERDATA :: 0
+GHOSTTY_SYS_OPT_DECODE_PNG :: 1
+GHOSTTY_SYS_OPT_LOG :: 2
+
+GHOSTTY_SYS_LOG_LEVEL_ERROR :: 0
+GHOSTTY_SYS_LOG_LEVEL_WARNING :: 1
+GHOSTTY_SYS_LOG_LEVEL_INFO :: 2
+GHOSTTY_SYS_LOG_LEVEL_DEBUG :: 3
+
+GHOSTTY_BUILD_INFO_KITTY_GRAPHICS :: 2
+GHOSTTY_BUILD_INFO_OPTIMIZE :: 4
+GHOSTTY_BUILD_INFO_VERSION_STRING :: 5
+
+GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL :: 0
+GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL :: 1
+GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED :: 0
+GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING :: 1
+GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE :: 2
+
+GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL :: 0
+GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD :: 1
+GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE :: 2
+GHOSTTY_SELECTION_GESTURE_BEHAVIOR_OUTPUT :: 3
+
+GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS :: 0
+GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE :: 1
+GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG :: 2
+GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_AUTOSCROLL_TICK :: 3
+GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DEEP_PRESS :: 4
+
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF :: 0
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION :: 1
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE :: 2
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS :: 3
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS :: 4
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_WORD_BOUNDARY_CODEPOINTS :: 5
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS :: 6
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE :: 7
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY :: 8
+GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT :: 9
+
+GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT :: 0
+GHOSTTY_SELECTION_GESTURE_DATA_DRAGGED :: 1
+GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL :: 2
+GHOSTTY_SELECTION_GESTURE_DATA_BEHAVIOR :: 3
+GHOSTTY_SELECTION_GESTURE_DATA_ANCHOR :: 4
+
+GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE :: 0
+GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_UP :: 1
+GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_DOWN :: 2
+
+GHOSTTY_SELECTION_ADJUST_LEFT :: 0
+GHOSTTY_SELECTION_ADJUST_RIGHT :: 1
+GHOSTTY_SELECTION_ADJUST_UP :: 2
+GHOSTTY_SELECTION_ADJUST_DOWN :: 3
+GHOSTTY_SELECTION_ADJUST_HOME :: 4
+GHOSTTY_SELECTION_ADJUST_END :: 5
+GHOSTTY_SELECTION_ADJUST_PAGE_UP :: 6
+GHOSTTY_SELECTION_ADJUST_PAGE_DOWN :: 7
+GHOSTTY_SELECTION_ADJUST_BEGINNING_OF_LINE :: 8
+GHOSTTY_SELECTION_ADJUST_END_OF_LINE :: 9
+
+GHOSTTY_SELECTION_ORDER_FORWARD :: 0
+GHOSTTY_SELECTION_ORDER_REVERSE :: 1
+GHOSTTY_SELECTION_ORDER_MIRRORED_FORWARD :: 2
+GHOSTTY_SELECTION_ORDER_MIRRORED_REVERSE :: 3
+
+GHOSTTY_SGR_UNDERLINE_NONE :: 0
+GHOSTTY_SGR_UNDERLINE_SINGLE :: 1
+GHOSTTY_SGR_UNDERLINE_DOUBLE :: 2
+GHOSTTY_SGR_UNDERLINE_CURLY :: 3
+GHOSTTY_SGR_UNDERLINE_DOTTED :: 4
+GHOSTTY_SGR_UNDERLINE_DASHED :: 5
+
+GHOSTTY_KEY_ENCODER_OPT_CURSOR_KEY_APPLICATION :: 0
+GHOSTTY_KEY_ENCODER_OPT_KEYPAD_KEY_APPLICATION :: 1
+GHOSTTY_KEY_ENCODER_OPT_IGNORE_KEYPAD_WITH_NUMLOCK :: 2
+GHOSTTY_KEY_ENCODER_OPT_MODIFY_OTHER_KEYS_STATE_2 :: 4
+GHOSTTY_KEY_ENCODER_OPT_KITTY_FLAGS :: 5
+GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT :: 6
+GHOSTTY_KEY_ENCODER_OPT_BACKARROW_KEY_MODE :: 7
+
+GHOSTTY_KITTY_KEY_DISAMBIGUATE :: u8(1 << 0)
+GHOSTTY_KITTY_KEY_REPORT_EVENTS :: u8(1 << 1)
+GHOSTTY_KITTY_KEY_REPORT_ALTERNATES :: u8(1 << 2)
+GHOSTTY_KITTY_KEY_REPORT_ALL :: u8(1 << 3)
+GHOSTTY_KITTY_KEY_REPORT_ASSOCIATED :: u8(1 << 4)
+
+GHOSTTY_KEY_F13 :: 133
+GHOSTTY_KEY_F24 :: 144
+GHOSTTY_KEY_PRINT_SCREEN :: 149
+GHOSTTY_KEY_SCROLL_LOCK :: 150
+GHOSTTY_KEY_PAUSE :: 151
+
+#assert(size_of(GhosttySurfacePosition) == 16)
+#assert(size_of(GhosttyClipboardContent) == 32)
+#assert(size_of(GhosttyClipboardWrite) == 32)
+#assert(size_of(GhosttySizeReportSize) == 12)
+#assert(size_of(GhosttyDeviceAttributesPrimary) == 144)
+#assert(size_of(GhosttyDeviceAttributesSecondary) == 6)
+#assert(size_of(GhosttyDeviceAttributesTertiary) == 4)
+#assert(size_of(GhosttyDeviceAttributes) == 160)
+#assert(size_of(GhosttySelectionGestureBehaviors) == 12)
+#assert(size_of(GhosttySelectionGestureGeometry) == 16)
+#assert(size_of(GhosttyTerminalSelectWordOptions) == 48)
+#assert(size_of(GhosttyTerminalSelectWordBetweenOptions) == 72)
+#assert(size_of(GhosttyTerminalSelectLineOptions) == 56)
+
+@(default_calling_convention = "c")
+foreign ghostty {
+	ghostty_terminal_reset :: proc(t: GhosttyTerminal) ---
+	ghostty_terminal_compression_activity :: proc(t: GhosttyTerminal, out: ^u64) -> GhosttyResult ---
+	ghostty_terminal_compress :: proc(t: GhosttyTerminal, mode: i32, out: ^i32) -> GhosttyResult ---
+
+	ghostty_render_state_set :: proc(rs: GhosttyRenderState, option: i32, value: rawptr) -> GhosttyResult ---
+	ghostty_render_state_row_set :: proc(it: GhosttyRenderStateRowIterator, option: i32, value: rawptr) -> GhosttyResult ---
+	ghostty_render_state_row_cells_select :: proc(cells: GhosttyRenderStateRowCells, x: u16) -> GhosttyResult ---
+
+	ghostty_focus_encode :: proc(event: i32, buf: [^]u8, buf_len: uint, out_len: ^uint) -> GhosttyResult ---
+	ghostty_color_scheme_report_encode :: proc(scheme: i32, buf: [^]u8, buf_len: uint, out_len: ^uint) -> GhosttyResult ---
+	ghostty_size_report_encode :: proc(style: i32, size: GhosttySizeReportSize, buf: [^]u8, buf_len: uint, out_len: ^uint) -> GhosttyResult ---
+
+	ghostty_grid_ref_hyperlink_uri :: proc(ref: ^GhosttyGridRef, buf: [^]u8, buf_len: uint, out_len: ^uint) -> GhosttyResult ---
+
+	ghostty_key_event_set_consumed_mods :: proc(ev: GhosttyKeyEvent, mods: u16) ---
+	ghostty_key_event_set_unshifted_codepoint :: proc(ev: GhosttyKeyEvent, codepoint: u32) ---
+	ghostty_key_event_set_composing :: proc(ev: GhosttyKeyEvent, composing: bool) ---
+
+	ghostty_selection_gesture_new :: proc(allocator: rawptr, out: ^GhosttySelectionGesture) -> GhosttyResult ---
+	ghostty_selection_gesture_free :: proc(g: GhosttySelectionGesture, t: GhosttyTerminal) ---
+	ghostty_selection_gesture_reset :: proc(g: GhosttySelectionGesture, t: GhosttyTerminal) ---
+	ghostty_selection_gesture_event_new :: proc(allocator: rawptr, out: ^GhosttySelectionGestureEvent, event_type: i32) -> GhosttyResult ---
+	ghostty_selection_gesture_event_free :: proc(ev: GhosttySelectionGestureEvent) ---
+	ghostty_selection_gesture_event_set :: proc(ev: GhosttySelectionGestureEvent, option: i32, value: rawptr) -> GhosttyResult ---
+	ghostty_selection_gesture_event :: proc(g: GhosttySelectionGesture, t: GhosttyTerminal, ev: GhosttySelectionGestureEvent, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_selection_gesture_get :: proc(g: GhosttySelectionGesture, t: GhosttyTerminal, data: i32, value: rawptr) -> GhosttyResult ---
+	ghostty_terminal_select_word :: proc(t: GhosttyTerminal, options: ^GhosttyTerminalSelectWordOptions, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_terminal_select_word_between :: proc(t: GhosttyTerminal, options: ^GhosttyTerminalSelectWordBetweenOptions, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_terminal_select_line :: proc(t: GhosttyTerminal, options: ^GhosttyTerminalSelectLineOptions, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_terminal_select_all :: proc(t: GhosttyTerminal, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_terminal_select_output :: proc(t: GhosttyTerminal, ref: GhosttyGridRef, out: ^GhosttySelection) -> GhosttyResult ---
+	ghostty_terminal_selection_adjust :: proc(t: GhosttyTerminal, sel: ^GhosttySelection, adjustment: i32) -> GhosttyResult ---
+
+	ghostty_build_info :: proc(data: i32, out: rawptr) -> GhosttyResult ---
+	ghostty_sys_set :: proc(option: i32, value: rawptr) -> GhosttyResult ---
+	ghostty_color_luminance :: proc(color: ^GhosttyColorRgb) -> f64 ---
+}
+
+@(default_calling_convention = "c")
+foreign ghostty {
+	ghostty_paste_is_safe :: proc(data: [^]u8, len: uint) -> bool ---
+}
+
+// Additional key codes used by the full input map.
+GHOSTTY_KEY_INTL_BACKSLASH :: 17
+GHOSTTY_KEY_ALT_RIGHT :: 52
+GHOSTTY_KEY_CAPS_LOCK :: 54
+GHOSTTY_KEY_CONTEXT_MENU :: 55
+GHOSTTY_KEY_META_LEFT :: 59
+GHOSTTY_KEY_META_RIGHT :: 60
+GHOSTTY_KEY_SHIFT_RIGHT :: 62
+GHOSTTY_KEY_F2 :: 122
+GHOSTTY_KEY_F14 :: 134
+GHOSTTY_KEY_F15 :: 135
+GHOSTTY_KEY_F16 :: 136
+GHOSTTY_KEY_F17 :: 137
+GHOSTTY_KEY_F18 :: 138
+GHOSTTY_KEY_F19 :: 139
+GHOSTTY_KEY_F20 :: 140
+GHOSTTY_KEY_F21 :: 141
+GHOSTTY_KEY_F22 :: 142
+GHOSTTY_KEY_F23 :: 143
+GHOSTTY_KEY_NUM_LOCK :: 79
+GHOSTTY_KEY_NUMPAD_0 :: 80
+GHOSTTY_KEY_NUMPAD_1 :: 81
+GHOSTTY_KEY_NUMPAD_2 :: 82
+GHOSTTY_KEY_NUMPAD_3 :: 83
+GHOSTTY_KEY_NUMPAD_4 :: 84
+GHOSTTY_KEY_NUMPAD_5 :: 85
+GHOSTTY_KEY_NUMPAD_6 :: 86
+GHOSTTY_KEY_NUMPAD_7 :: 87
+GHOSTTY_KEY_NUMPAD_8 :: 88
+GHOSTTY_KEY_NUMPAD_9 :: 89
+GHOSTTY_KEY_NUMPAD_ADD :: 90
+GHOSTTY_KEY_NUMPAD_DECIMAL :: 95
+GHOSTTY_KEY_NUMPAD_DIVIDE :: 96
+GHOSTTY_KEY_NUMPAD_ENTER :: 97
+GHOSTTY_KEY_NUMPAD_EQUAL :: 98
+GHOSTTY_KEY_NUMPAD_SUBTRACT :: 111
+GHOSTTY_KEY_NUMPAD_MULTIPLY :: 112
+GHOSTTY_KEY_BROWSER_BACK :: 156
+GHOSTTY_KEY_BROWSER_FORWARD :: 158

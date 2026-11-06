@@ -35,9 +35,14 @@ Terminal_Theme :: struct {
 	font_size:    f32,
 	// Optional explicit font files. When empty, font_family is looked up in
 	// the usual Linux font directories.
-	font_regular: string,
-	font_bold:    string,
-	font_emoji:   string,
+	font_regular:     string,
+	font_bold:        string,
+	font_italic:      string,
+	font_bold_italic: string,
+	font_emoji:       string,
+
+	cursor_style: i32,
+	cursor_blink: bool,
 
 	source: string,
 }
@@ -72,6 +77,8 @@ terminal_theme_defaults :: proc(allocator := context.allocator) -> Terminal_Them
 		},
 		font_family = strings.clone("Fira Code", allocator),
 		font_size = 9.0,
+			cursor_style = GHOSTTY_CURSOR_BLOCK,
+		cursor_blink = false,
 		source = strings.clone(THEME_DEFAULT_SOURCE, allocator),
 	}
 }
@@ -80,6 +87,8 @@ terminal_theme_destroy :: proc(t: ^Terminal_Theme) {
 	delete(t.font_family)
 	delete(t.font_regular)
 	delete(t.font_bold)
+	delete(t.font_italic)
+	delete(t.font_bold_italic)
 	delete(t.font_emoji)
 	delete(t.source)
 	t^ = {}
@@ -143,7 +152,11 @@ Terminal_Theme_File :: struct {
 	font_size:            f32      `json:"font_size"`,
 	font_regular:         string   `json:"font_regular"`,
 	font_bold:            string   `json:"font_bold"`,
+	font_italic:          string   `json:"font_italic"`,
+	font_bold_italic:     string   `json:"font_bold_italic"`,
 	font_emoji:           string   `json:"font_emoji"`,
+	cursor_style:         string   `json:"cursor_style"`,
+	cursor_blink:         bool     `json:"cursor_blink"`,
 }
 
 theme_config_path :: proc() -> string {
@@ -180,7 +193,10 @@ terminal_theme_file_destroy :: proc(f: ^Terminal_Theme_File) {
 	delete(f.font_family)
 	delete(f.font_regular)
 	delete(f.font_bold)
+	delete(f.font_italic)
+	delete(f.font_bold_italic)
 	delete(f.font_emoji)
+	delete(f.cursor_style)
 	f^ = {}
 }
 
@@ -244,7 +260,20 @@ theme_config_apply_json :: proc(t: ^Terminal_Theme, data, path: string, allocato
 	}
 	theme_apply_string(&t.font_regular, f.font_regular, allocator)
 	theme_apply_string(&t.font_bold, f.font_bold, allocator)
+	theme_apply_string(&t.font_italic, f.font_italic, allocator)
+	theme_apply_string(&t.font_bold_italic, f.font_bold_italic, allocator)
 	theme_apply_string(&t.font_emoji, f.font_emoji, allocator)
+	if len(f.cursor_style) > 0 {
+		switch strings.to_lower(strings.trim_space(f.cursor_style), allocator) {
+		case "bar": t.cursor_style = GHOSTTY_CURSOR_BAR
+		case "block": t.cursor_style = GHOSTTY_CURSOR_BLOCK
+		case "underline": t.cursor_style = GHOSTTY_CURSOR_UNDERLINE
+		case "hollow", "block_hollow": t.cursor_style = GHOSTTY_CURSOR_BLOCK_HOLLOW
+		case:
+			theme_append_note(&note, fmt.tprintf("%s: cursor_style must be bar, block, underline, or hollow", path))
+		}
+	}
+	t.cursor_blink = f.cursor_blink
 	return note
 }
 
@@ -302,12 +331,25 @@ font_find_in_dir :: proc(dir: string, names: []string, depth: int, allocator: me
 	return ""
 }
 
-// theme_font_path resolves the terminal font. An explicit font_regular /
-// font_bold path wins; otherwise the family is looked up in the conventional
-// system and user font directories, falling back to the caller's built-in
-// Fira Code / DejaVu candidates.
-theme_font_path :: proc(t: Terminal_Theme, bold: bool, allocator := context.temp_allocator) -> string {
-	explicit := bold ? t.font_bold : t.font_regular
+// theme_font_path resolves the terminal font. An explicit per-style path
+// wins; otherwise the family is looked up in the conventional system and user
+// font directories.
+Font_Style :: enum {
+	Regular,
+	Bold,
+	Italic,
+	Bold_Italic,
+}
+
+theme_font_path_style :: proc(t: Terminal_Theme, style: Font_Style, allocator := context.temp_allocator) -> string {
+	explicit := ""
+	suffix := "Regular"
+	switch style {
+	case .Regular: explicit = t.font_regular
+	case .Bold: explicit = t.font_bold; suffix = "Bold"
+	case .Italic: explicit = t.font_italic; suffix = "Italic"
+	case .Bold_Italic: explicit = t.font_bold_italic; suffix = "BoldItalic"
+	}
 	if len(explicit) > 0 {
 		if os.exists(explicit) do return explicit
 	}
@@ -320,12 +362,17 @@ theme_font_path :: proc(t: Terminal_Theme, bold: bool, allocator := context.temp
 	}
 
 	stem := font_family_stem(family, allocator)
-	weight := bold ? "Bold" : "Regular"
 	names := []string{
-		fmt.tprintf("%s-%s.ttf", stem, weight),
-		fmt.tprintf("%s-%s.otf", stem, weight),
-		fmt.tprintf("%s.ttf", stem),
-		fmt.tprintf("%s.otf", stem),
+		fmt.tprintf("%s-%s.ttf", stem, suffix),
+		fmt.tprintf("%s-%s.otf", stem, suffix),
+	}
+	if style == .Regular {
+		names = []string{
+			fmt.tprintf("%s-Regular.ttf", stem),
+			fmt.tprintf("%s-Regular.otf", stem),
+			fmt.tprintf("%s.ttf", stem),
+			fmt.tprintf("%s.otf", stem),
+		}
 	}
 
 	lower := strings.to_lower(stem, allocator)
@@ -373,6 +420,11 @@ theme_font_path :: proc(t: Terminal_Theme, bold: bool, allocator := context.temp
 		if path := font_find_in_dir(root, names, 4, allocator); len(path) > 0 do return path
 	}
 	return ""
+}
+
+// Backwards-compatible wrapper used by older call sites.
+theme_font_path :: proc(t: Terminal_Theme, bold: bool, allocator := context.temp_allocator) -> string {
+	return theme_font_path_style(t, bold ? .Bold : .Regular, allocator)
 }
 
 // Scalable emoji fonts. Noto Color Emoji is deliberately absent: current

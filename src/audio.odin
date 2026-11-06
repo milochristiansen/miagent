@@ -20,6 +20,9 @@ import "core:time"
 AUDIO_RATE :: 44100
 AUDIO_LATENCY_US :: 100000
 AUDIO_MIN_INTERVAL :: 150 * time.Millisecond
+AUDIO_BELL_MIN_INTERVAL :: 120 * time.Millisecond
+AUDIO_BELL_MS :: 70
+AUDIO_BELL_HZ :: 920.0
 
 // A quick rising A-major arpeggio: A5, C#6, E6. The last note is held a
 // little longer so the alert resolves instead of stopping abruptly.
@@ -59,6 +62,7 @@ Audio :: struct {
 	symbols:   Alsa_Symbols,
 	mutex:     sync.Mutex,
 	last_play: time.Tick,
+	last_bell: time.Tick,
 }
 
 g_audio: Audio
@@ -104,6 +108,76 @@ audio_alert_play :: proc() {
 		// back rather than dropping the alert silently.
 		audio_bell()
 	}
+}
+
+// audio_bell_play is the terminal BEL sound. It is deliberately distinct from
+// the turn-end arpeggio and is rate-limited so `printf '\a\a\a'` cannot turn
+// into a stream of PCM opens.
+audio_bell_play :: proc() {
+	if !g_audio.ready {
+		audio_bell()
+		return
+	}
+
+	sync.mutex_lock(&g_audio.mutex)
+	now := time.tick_now()
+	if g_audio.last_bell._nsec != 0 && time.tick_since(g_audio.last_bell) < AUDIO_BELL_MIN_INTERVAL {
+		sync.mutex_unlock(&g_audio.mutex)
+		return
+	}
+	g_audio.last_bell = now
+	sync.mutex_unlock(&g_audio.mutex)
+
+	if thread.create_and_start(audio_bell_worker, priority = .Low, self_cleanup = true, name = "miagent-bell") == nil {
+		audio_bell()
+	}
+}
+
+audio_bell_worker :: proc() {
+	if !audio_play_bell_tone() do audio_bell()
+}
+
+audio_play_bell_tone :: proc() -> bool {
+	s := g_audio.symbols
+	pcm: ^Alsa_Pcm
+	if s.pcm_open(&pcm, cstring("default"), SND_PCM_STREAM_PLAYBACK, 0) < 0 do return false
+	defer _ = s.pcm_close(pcm)
+
+	if s.pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
+	                    1, AUDIO_RATE, 1, AUDIO_LATENCY_US) < 0 {
+		return false
+	}
+
+	samples := audio_bell_samples()
+	defer delete(samples)
+	total := uint(len(samples))
+	written: uint = 0
+	for written < total {
+		frames := s.pcm_writei(pcm, rawptr(&samples[written]), total - written)
+		if frames < 0 {
+			if s.pcm_recover(pcm, i32(frames), 1) < 0 do return false
+			continue
+		}
+		if frames == 0 do return false
+		written += uint(frames)
+	}
+	_ = s.pcm_drain(pcm)
+	return true
+}
+
+audio_bell_samples :: proc() -> []i16 {
+	n := AUDIO_RATE * AUDIO_BELL_MS / 1000
+	buf := make([]i16, n)
+	attack := max(AUDIO_RATE * 2 / 1000, 1)
+	for i in 0 ..< n {
+		t := f32(i) / f32(AUDIO_RATE)
+		life := f32(i) / f32(n)
+		env := min(f32(1.0), f32(i) / f32(attack)) * (1.0 - life) * (1.0 - life)
+		wave := math.sin(2.0 * math.PI * AUDIO_BELL_HZ * t) +
+		        0.12 * math.sin(4.0 * math.PI * AUDIO_BELL_HZ * t)
+		buf[i] = i16(wave * env * AUDIO_GAIN * 32767.0)
+	}
+	return buf
 }
 
 audio_alert_worker :: proc() {

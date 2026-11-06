@@ -29,6 +29,14 @@ ImGuiChildFlags :: distinct u32
 ImGuiMouseCursor :: distinct i32
 ImGuiInputTextFlags :: distinct u32
 
+Mi_Input_Event :: struct {
+	type:   i32,
+	key:    i32,
+	down:   i32,
+	ch:     u32,
+	analog: f32,
+}
+
 foreign import cimgui "../build/libmiagent.a"
 
 @(default_calling_convention = "c")
@@ -99,6 +107,8 @@ foreign cimgui {
 	mi_io_wheel :: proc() -> f32 ---
 	mi_io_set_mouse_cursor :: proc(cursor: i32) ---
 	mi_io_input_chars :: proc(out: [^]u32, cap: i32) -> i32 ---
+	mi_io_input_event_count :: proc() -> i32 ---
+	mi_io_input_event_get :: proc(index: i32, out: ^Mi_Input_Event) -> bool ---
 
 	mi_font_add :: proc(path: cstring, px: f32) -> ^ImFont ---
 	mi_font_merge :: proc(dst: ^ImFont, path: cstring, px: f32) -> ^ImFont ---

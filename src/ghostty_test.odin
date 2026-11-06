@@ -317,3 +317,13 @@ test_ghostty_mouse_encode :: proc(t: ^testing.T) {
 		"",
 	)
 }
+
+@(test)
+test_ghostty_focus_encode_binding :: proc(t: ^testing.T) {
+	buf: [8]u8
+	n: uint
+	res := ghostty_focus_encode(GHOSTTY_FOCUS_GAINED, &buf[0], len(buf), &n)
+	testing.expect_value(t, res, GHOSTTY_SUCCESS)
+	testing.expect_value(t, n, uint(3))
+	testing.expect_value(t, string(buf[:n]), "\x1b[I")
+}

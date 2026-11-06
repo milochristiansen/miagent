@@ -361,7 +361,7 @@ emit_schema() {
 	jq '
 		{
 			name: "activate_skill",
-			description: ("Load a skill'\''s full instructions. Call this before starting a task whose description matches one of the available skills. The skill'\''s instructions and a listing of its bundled resources are injected into the conversation as a protected nugget. Read any listed resource with the bash tool using the absolute skill directory shown in the activation result. Do not activate the same skill twice in one conversation.\n\nAvailable skills:\n" + (map("- " + .name + ": " + .description) | join("\n"))),
+			description: ("Load a skill'\''s full instructions. Call this before starting a task whose description matches one of the available skills. The skill'\''s instructions and a listing of its bundled resources are injected into the conversation as a protected nugget. Read any listed resource using the absolute skill directory shown in the activation result. Do not activate the same skill twice in one conversation.\n\nAvailable skills:\n" + (map("- " + .name + ": " + .description) | join("\n"))),
 			parameters: {
 				type: "object",
 				properties: {

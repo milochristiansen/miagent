@@ -252,3 +252,15 @@ text_elided :: proc(list: ^ImDrawList, font: ^ImFont, size, x, y, max_w: f32, co
 	text_font(list, font, size, x, y, col, fmt.tprintf("%s%s", s[:i], ell))
 	return max_w
 }
+
+
+// glyph_lock draws a tiny padlock for password-input cursors.
+glyph_lock :: proc(list: ^ImDrawList, cx, cy, s: f32, col: Color) {
+	w := s * 0.85
+	h := s * 0.7
+	body := rect(cx - w * 0.5, cy - h * 0.1, w, h)
+	mi_draw_rect_stroke(list, body.x, body.y, body.x + body.w, body.y + body.h, color_u32(col), 1.5, 1.1)
+	mi_draw_line(list, cx - w * 0.3, cy - h * 0.1, cx - w * 0.3, cy - h * 0.5, color_u32(col), 1.1)
+	mi_draw_line(list, cx + w * 0.3, cy - h * 0.1, cx + w * 0.3, cy - h * 0.5, color_u32(col), 1.1)
+	mi_draw_line(list, cx - w * 0.3, cy - h * 0.5, cx + w * 0.3, cy - h * 0.5, color_u32(col), 1.1)
+}
