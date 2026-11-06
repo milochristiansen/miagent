@@ -1,0 +1,13 @@
+# Build output
+/build/
+
+# Fetched sources + toolchain (recreated by `make deps`)
+/.deps/
+
+# Built native dependencies (recreated by `make deps`)
+/third_party/
+
+# Editor / OS noise
+*.swp
+.DS_Store
+.miagent

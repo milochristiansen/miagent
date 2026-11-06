@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "background": "#1d1f21",
+  "foreground": "#c5c8c6",
+  "cursor": "#c5c8c6",
+  "cursor_text": "#000000",
+  "selection_background": "#c5c8c6",
+  "selection_foreground": "#1d1f21",
+  "palette": [
+    "#1d1f21", "#cc6666", "#b5bd68", "#f0c674",
+    "#81a2be", "#b294bb", "#8abeb7", "#c5c8c6",
+    "#666666", "#d54e53", "#b9ca4a", "#e7c547",
+    "#7aa6da", "#c397d8", "#70c0b1", "#eaeaea"
+  ],
+  "font_family": "Fira Code",
+  "font_size": 9.0,
+  "font_regular": "",
+  "font_bold": "",
+  "font_emoji": ""
+}

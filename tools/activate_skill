@@ -1,0 +1,505 @@
+#!/bin/sh
+# TGI tool: discover Agent Skills and activate one as a protected nugget.
+#
+# SCHEMA  -> print one "activate_skill" schema whose description contains the
+#            discovered skill catalog and whose name parameter is an enum.
+# INVOKE  -> read {"name":"..."} on stdin, load that skill's SKILL.md body, and
+#            write a nugget containing the body, skill directory, and resource
+#            listing to $TGI_ATTACHMENT_DIR/nuggets/skills/<name>.md.
+#
+# Skills are discovered from:
+#   $HOME/.agents/skills
+#   $MIAGENT_CONFIG_DIR/skills
+#   <project>/.agents/skills          (unless MIAGENT_SKILLS_PROJECT=0)
+#   <project>/.miagent/skills         (unless MIAGENT_SKILLS_PROJECT=0)
+#   every directory in MIAGENT_SKILLS_DIRS, in order
+#
+# Later scopes override earlier scopes with the same skill name. Discovery is
+# deterministic: roots, skills, and resources are sorted.
+
+set -eu
+export LC_ALL=C
+
+TOOL_NAME=activate_skill
+WARN=1
+WORK=
+NUGGET_TMP=
+
+cleanup() {
+	if [ -n "${NUGGET_TMP:-}" ]; then
+		rm -f "$NUGGET_TMP"
+	fi
+	if [ -n "${WORK:-}" ]; then
+		rm -rf "$WORK"
+	fi
+}
+trap cleanup 0 INT TERM HUP
+
+usage_error() {
+	echo "$TOOL_NAME: $*" >&2
+	exit 2
+}
+
+warn() {
+	if [ "$WARN" -eq 1 ]; then
+		echo "$TOOL_NAME: warning: $*" >&2
+	fi
+}
+
+need_jq() {
+	if ! command -v jq >/dev/null 2>&1; then
+		echo "$TOOL_NAME: jq not found in PATH" >&2
+		exit 127
+	fi
+}
+
+normalize_ws() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ *//' -e 's/ *$//'
+}
+
+xml_escape() {
+	printf '%s' "$1" | sed \
+		-e 's/&/\&amp;/g' \
+		-e 's/</\&lt;/g' \
+		-e 's/>/\&gt;/g' \
+		-e 's/"/\&quot;/g'
+}
+
+# parse_frontmatter prints name, description, and compatibility on three lines.
+# It returns non-zero for a missing/unterminated frontmatter block.
+parse_frontmatter() {
+	awk '
+	function trim(s) {
+		sub(/^[ \t]+/, "", s)
+		sub(/[ \t]+$/, "", s)
+		return s
+	}
+	function unquote(s, first, last) {
+		first = substr(s, 1, 1)
+		last = substr(s, length(s), 1)
+		if (length(s) >= 2 && first == "\"" && last == "\"") {
+			s = substr(s, 2, length(s) - 2)
+			gsub(/\\"/, "\"", s)
+			gsub(/\\\\/, "\\", s)
+		} else if (length(s) >= 2 && first == "'"'"'" && last == "'"'"'") {
+			s = substr(s, 2, length(s) - 2)
+			gsub(/'"'"''"'"'/, "'"'"'", s)
+		}
+		return s
+	}
+	function assign(k, v) {
+		if (k == "name") name = v
+		else if (k == "description") description = v
+		else if (k == "compatibility") compatibility = v
+	}
+	function append_value(k, v) {
+		if (v == "") return
+		if (k == "name") name = (name == "" ? v : name " " v)
+		else if (k == "description") description = (description == "" ? v : description " " v)
+		else if (k == "compatibility") compatibility = (compatibility == "" ? v : compatibility " " v)
+	}
+	function normalize(s) {
+		gsub(/[ \t\r\n]+/, " ", s)
+		sub(/^ /, "", s)
+		sub(/ $/, "", s)
+		return s
+	}
+	BEGIN { in_fm = 0; done = 0; key = ""; block = 0; name = ""; description = ""; compatibility = "" }
+	{
+		line = $0
+		gsub(/\r/, "", line)
+		if (NR == 1 && substr(line, 1, 3) == "\357\273\277") line = substr(line, 4)
+		if (NR == 1) {
+			if (line !~ /^---[ \t]*$/) exit 3
+			in_fm = 1
+			next
+		}
+		if (!in_fm) next
+		if (line ~ /^---[ \t]*$/) {
+			in_fm = 0
+			done = 1
+			next
+		}
+		if (block) {
+			if (line ~ /^[ \t]*$/) next
+			if (line ~ /^[ \t]/) {
+				append_value(key, trim(line))
+				next
+			}
+			block = 0
+		}
+		if (line ~ /^[ \t]*$/) next
+		if (line ~ /^[ \t]/ && (key == "name" || key == "description" || key == "compatibility")) {
+			append_value(key, trim(line))
+			next
+		}
+		colon = index(line, ":")
+		if (colon > 0) {
+			k = trim(substr(line, 1, colon - 1))
+			v = trim(substr(line, colon + 1))
+			if (k == "name" || k == "description" || k == "compatibility") {
+				key = k
+				if (v ~ /^[|>][-+]?[ \t]*$/) {
+					block = 1
+					next
+				}
+				assign(k, unquote(v))
+			} else {
+				key = ""
+			}
+			next
+		}
+	}
+	END {
+		if (!done) exit 4
+		print normalize(name)
+		print normalize(description)
+		print normalize(compatibility)
+	}
+	' "$1"
+}
+
+# extract_body prints everything after the closing frontmatter delimiter.
+extract_body() {
+	awk '
+	{
+		line = $0
+		gsub(/\r/, "", line)
+		if (NR == 1 && substr(line, 1, 3) == "\357\273\277") line = substr(line, 4)
+	}
+	NR == 1 {
+		if (line !~ /^---[ \t]*$/) exit 3
+		in_fm = 1
+		next
+	}
+	in_fm {
+		if (line ~ /^---[ \t]*$/) {
+			in_fm = 0
+			done = 1
+		}
+		next
+	}
+	done { print line }
+	END { if (!done) exit 4 }
+	' "$1"
+}
+
+# list_resources writes <file> entries to $2 and sets RESOURCE_TOTAL.
+list_resources() {
+	dir=$1
+	out=$2
+	total=0
+	skipped_control=0
+	: > "$out"
+	if ! (cd "$dir" && find . \( -type f -o -type l \) -print) > "$WORK/all-files" 2>/dev/null; then
+		RESOURCE_TOTAL=0
+		return 1
+	fi
+	sed -e 's|^\./||' "$WORK/all-files" | LC_ALL=C sort > "$WORK/all-files.sorted"
+	while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		case "$path" in
+			SKILL.md) continue ;;
+			.*|*/.*) continue ;;
+			node_modules/*|*/node_modules/*) continue ;;
+			.git/*|*/.git/*) continue ;;
+		esac
+		case "$path" in
+			*[[:cntrl:]]*)
+				skipped_control=$((skipped_control + 1))
+				continue
+				;;
+		esac
+		# A symlink is listed only when it resolves to a regular file.
+		[ -f "$dir/$path" ] || continue
+		total=$((total + 1))
+		if [ "$total" -le 200 ]; then
+			printf '<file>%s</file>\n' "$(xml_escape "$path")" >> "$out"
+		fi
+	done < "$WORK/all-files.sorted"
+	if [ "$total" -gt 200 ]; then
+		printf '<note>listing truncated after 200 files; %d more not listed</note>\n' "$((total - 200))" >> "$out"
+	fi
+	if [ "$skipped_control" -gt 0 ]; then
+		printf '<note>skipped %d files with control characters in their names</note>\n' "$skipped_control" >> "$out"
+	fi
+	RESOURCE_TOTAL=$total
+	return 0
+}
+
+add_root() {
+	[ -n "$1" ] || return 0
+	printf '%s\n' "$1" >> "$WORK/roots"
+}
+
+build_roots() {
+	: > "$WORK/roots"
+	if [ -n "$HOME_DIR" ]; then
+		add_root "$HOME_DIR/.agents/skills"
+	fi
+	add_root "$CONFIG_DIR/skills"
+	if [ "$SKILLS_PROJECT" -ne 0 ]; then
+		add_root "$PROJECT_DIR/.agents/skills"
+		add_root "$PROJECT_DIR/.miagent/skills"
+	fi
+	if [ -n "${MIAGENT_SKILLS_DIRS:-}" ]; then
+		old_ifs=$IFS
+		IFS=:
+		for d in $MIAGENT_SKILLS_DIRS; do
+			[ -n "$d" ] || continue
+			case "$d" in
+				"~")
+					[ -n "$HOME_DIR" ] || continue
+					d=$HOME_DIR
+					;;
+				"~/"*)
+					[ -n "$HOME_DIR" ] || continue
+					d=$HOME_DIR/${d#"~/"}
+					;;
+			esac
+			case "$d" in
+				/*) ;;
+				*) d=$PROJECT_DIR/$d ;;
+			esac
+			add_root "$d"
+		done
+		IFS=$old_ifs
+	fi
+}
+
+discover_skills() {
+	: > "$WORK/records.jsonl"
+	build_roots
+	while IFS= read -r root; do
+		[ -d "$root" ] || continue
+		for skill_md in "$root"/*/SKILL.md; do
+			[ -f "$skill_md" ] || continue
+			dir=${skill_md%/SKILL.md}
+			base=${dir##*/}
+			case "$base" in
+				.*|node_modules) continue ;;
+			esac
+			if ! parse_frontmatter "$skill_md" > "$WORK/frontmatter"; then
+				warn "$skill_md: cannot parse frontmatter"
+				continue
+			fi
+			name=
+			description=
+			compatibility=
+			{
+				IFS= read -r name || true
+				IFS= read -r description || true
+				IFS= read -r compatibility || true
+			} < "$WORK/frontmatter"
+
+			if [ -z "$name" ]; then
+				name=$(normalize_ws "$base")
+				warn "$skill_md: missing 'name'; using directory name '$name'"
+			fi
+			if [ -z "$description" ]; then
+				warn "$skill_md: missing or empty 'description'; skipping"
+				continue
+			fi
+			if [ "$name" != "$base" ]; then
+				warn "$skill_md: name '$name' does not match directory '$base'"
+			fi
+			if [ "${#name}" -gt 64 ]; then
+				warn "$skill_md: name '$name' is longer than 64 characters"
+			fi
+			if ! printf '%s' "$name" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+				warn "$skill_md: name '$name' does not match the Agent Skills name rules"
+			fi
+			if [ "${#description}" -gt 1024 ]; then
+				description_length=$(printf '%s' "$description" | jq -R -s 'length')
+				if [ "$description_length" -gt 1024 ]; then
+					warn "$skill_md: description is longer than 1024 characters; truncating in the catalog"
+					description=$(printf '%s' "$description" | jq -R -s '.[0:1024]' -r)
+				fi
+			fi
+			dir_abs=$(cd "$dir" && pwd -P) || {
+				warn "$skill_md: cannot resolve skill directory"
+				continue
+			}
+			jq -nc \
+				--arg name "$name" \
+				--arg description "$description" \
+				--arg directory "$dir_abs" \
+				--arg compatibility "$compatibility" \
+				'{name: $name, description: $description, directory: $directory, compatibility: $compatibility}' \
+				>> "$WORK/records.jsonl"
+		done
+	done < "$WORK/roots"
+
+	if [ -s "$WORK/records.jsonl" ] && [ "$WARN" -eq 1 ]; then
+		jq -r -s '
+			group_by(.name)[] | select(length > 1) |
+			"'"$TOOL_NAME"': warning: skill \(.[0].name) is shadowed; using \(.[-1].directory) (ignored \(.[0:-1] | map(.directory) | join(", ")))"
+		' "$WORK/records.jsonl" >&2 || true
+	fi
+
+	jq -s 'reduce .[] as $s ({}; .[$s.name] = $s) | [.[]] | sort_by(.name)' \
+		"$WORK/records.jsonl" > "$WORK/skills.json"
+
+	count=$(jq 'length' "$WORK/skills.json")
+	if [ "$count" -gt 200 ]; then
+		warn "more than 200 skills discovered; advertising the first 200"
+		jq '.[0:200]' "$WORK/skills.json" > "$WORK/skills.limited.json"
+		mv "$WORK/skills.limited.json" "$WORK/skills.json"
+	fi
+	if [ "$WARN" -eq 1 ]; then
+		catalog_size=$(jq -r 'map("- " + .name + ": " + .description) | join("\n") | length' "$WORK/skills.json")
+		if [ "$catalog_size" -gt 32768 ]; then
+			warn "skill catalog is larger than 32 KiB"
+		fi
+	fi
+}
+
+emit_schema() {
+	if [ "$(jq 'length' "$WORK/skills.json")" -eq 0 ]; then
+		return 0
+	fi
+	jq '
+		{
+			name: "activate_skill",
+			description: ("Load a skill'\''s full instructions. Call this before starting a task whose description matches one of the available skills. The skill'\''s instructions and a listing of its bundled resources are injected into the conversation as a protected nugget. Read any listed resource with the bash tool using the absolute skill directory shown in the activation result. Do not activate the same skill twice in one conversation.\n\nAvailable skills:\n" + (map("- " + .name + ": " + .description) | join("\n"))),
+			parameters: {
+				type: "object",
+				properties: {
+					name: {
+						type: "string",
+						enum: map(.name),
+						description: "The name of the skill to activate."
+					}
+				},
+				required: ["name"]
+			}
+		}
+	' "$WORK/skills.json"
+}
+
+invoke_skill() {
+	args=$(cat)
+	if [ -z "$args" ]; then
+		usage_error "expected a JSON object on stdin"
+	fi
+	if ! printf '%s' "$args" | jq -e 'type == "object" and (.name | type) == "string" and (.name | length) > 0' >/dev/null 2>&1; then
+		usage_error "'name' is required and must be a non-empty string"
+	fi
+	requested_name=$(printf '%s' "$args" | jq -r '.name')
+
+	WARN=0
+	discover_skills
+	record=$(jq -c --arg name "$requested_name" '.[] | select(.name == $name)' "$WORK/skills.json")
+	if [ -z "$record" ]; then
+		usage_error "unknown skill '$requested_name'"
+	fi
+	dir=$(printf '%s' "$record" | jq -r '.directory')
+	compatibility=$(printf '%s' "$record" | jq -r '.compatibility')
+	skill_md=$dir/SKILL.md
+	if [ ! -f "$skill_md" ]; then
+		echo "$TOOL_NAME: cannot read $skill_md" >&2
+		exit 1
+	fi
+	if ! body=$(extract_body "$skill_md"); then
+		echo "$TOOL_NAME: cannot parse frontmatter in $skill_md" >&2
+		exit 1
+	fi
+	body=$(printf '%s\n' "$body" | sed -e '/./,$!d')
+	if [ -z "$body" ]; then
+		body="This skill has no body instructions."
+	fi
+
+	if [ -z "${TGI_ATTACHMENT_DIR:-}" ]; then
+		echo "$TOOL_NAME: TGI_ATTACHMENT_DIR is not set" >&2
+		exit 1
+	fi
+	nugget_dir=$TGI_ATTACHMENT_DIR/nuggets/skills
+	if ! mkdir -p "$nugget_dir"; then
+		echo "$TOOL_NAME: cannot create $nugget_dir" >&2
+		exit 1
+	fi
+
+	slug=$(printf '%s' "$requested_name" | sed -e 's/[^A-Za-z0-9._-]/-/g' -e 's/^\.*//')
+	[ -n "$slug" ] || slug=skill
+
+	if ! list_resources "$dir" "$WORK/resources"; then
+		RESOURCE_TOTAL=0
+	fi
+
+	NUGGET_TMP=$nugget_dir/.tmp.$$
+	{
+		printf '<skill_content name="%s">\n' "$(xml_escape "$requested_name")"
+		printf '%s\n' "$body"
+		if [ -n "$compatibility" ]; then
+			printf '\nCompatibility: %s\n' "$(xml_escape "$compatibility")"
+		fi
+		printf '\nSkill directory: %s\n' "$(xml_escape "$dir")"
+		printf 'Relative paths in this skill are relative to the skill directory. Read them with the bash tool when the instructions reference them.\n\n'
+		printf '<skill_resources>\n'
+		cat "$WORK/resources"
+		printf '</skill_resources>\n'
+		printf '</skill_content>\n'
+	} > "$NUGGET_TMP"
+
+	if ! mv "$NUGGET_TMP" "$nugget_dir/$slug.md"; then
+		echo "$TOOL_NAME: cannot write nugget for '$requested_name'" >&2
+		exit 1
+	fi
+	NUGGET_TMP=
+
+	printf 'activated skill "%s" (%d resources found); instructions were injected as a protected nugget\n' \
+		"$requested_name" "$RESOURCE_TOTAL"
+}
+
+main() {
+	case "${TGI_METHOD:-}" in
+		SCHEMA|INVOKE) ;;
+		*) usage_error "usage: TGI_METHOD=SCHEMA|INVOKE" ;;
+	esac
+
+	PROJECT_DIR=$(pwd -P)
+	HOME_DIR=${HOME:-}
+	CONFIG_DIR=${MIAGENT_CONFIG_DIR:-}
+	if [ -z "$CONFIG_DIR" ]; then
+		if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+			CONFIG_DIR=$XDG_CONFIG_HOME/miagent
+		elif [ -n "$HOME_DIR" ]; then
+			CONFIG_DIR=$HOME_DIR/.config/miagent
+		else
+			CONFIG_DIR=./.config/miagent
+		fi
+	fi
+	case "$CONFIG_DIR" in
+		/*) ;;
+		*) CONFIG_DIR=$PROJECT_DIR/$CONFIG_DIR ;;
+	esac
+
+	SKILLS_PROJECT=1
+	case "${MIAGENT_SKILLS_PROJECT:-1}" in
+		0|off|false|no|OFF|FALSE|NO) SKILLS_PROJECT=0 ;;
+	esac
+
+	case "${MIAGENT_SKILLS:-1}" in
+		0|off|false|no|OFF|FALSE|NO)
+			if [ "${TGI_METHOD:-}" = INVOKE ]; then
+				usage_error "skills are disabled by MIAGENT_SKILLS"
+			fi
+			exit 0
+			;;
+	esac
+
+	need_jq
+	WORK=$(mktemp -d "${TMPDIR:-/tmp}/miagent-skills.XXXXXX")
+	case "${TGI_METHOD:-}" in
+		SCHEMA)
+			WARN=1
+			discover_skills
+			emit_schema
+			;;
+		INVOKE)
+			invoke_skill
+			;;
+	esac
+}
+
+main "$@"
