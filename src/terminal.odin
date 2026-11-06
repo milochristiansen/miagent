@@ -565,6 +565,69 @@ terminal_cancel_paste :: proc(t: ^Terminal) {
 	t.paste_prompt = false
 }
 
+// terminal_key_is_modifier reports whether a keyboard key only changes
+// modifier state. Modifiers never repeat into the shell.
+terminal_key_is_modifier :: proc(gkey: i32) -> bool {
+	switch gkey {
+	case GHOSTTY_KEY_CONTROL_LEFT, GHOSTTY_KEY_CONTROL_RIGHT,
+	     GHOSTTY_KEY_SHIFT_LEFT, GHOSTTY_KEY_SHIFT_RIGHT,
+	     GHOSTTY_KEY_ALT_LEFT, GHOSTTY_KEY_ALT_RIGHT,
+	     GHOSTTY_KEY_META_LEFT, GHOSTTY_KEY_META_RIGHT,
+	     GHOSTTY_KEY_CAPS_LOCK, GHOSTTY_KEY_SCROLL_LOCK, GHOSTTY_KEY_NUM_LOCK:
+		return true
+	}
+	return false
+}
+
+// terminal_encode_key_repeat decides whether a held key's repeat must be
+// encoded through libghostty. Printable repeats already arrive as ImGui text
+// events and are written directly, so encoding them again would duplicate the
+// character. Special keys (arrows, backspace, ...) and modified keys produce
+// no text and need an explicit GHOSTTY_KEY_ACTION_REPEAT event.
+terminal_encode_key_repeat :: proc(gkey: i32, is_text_key: bool,
+                                   ctrl, shift, alt, super: bool) -> bool {
+	if super do return false
+	if gkey == GHOSTTY_KEY_UNIDENTIFIED do return false
+	if terminal_key_is_modifier(gkey) do return false
+
+	// Ctrl+Shift+C/V/A/O are local clipboard/selection shortcuts. The initial
+	// press is consumed before the encoder, so their repeats must not leak
+	// through to the shell.
+	if ctrl && shift {
+		cp := terminal_unshifted_codepoint(gkey)
+		if cp == 'c' || cp == 'v' || cp == 'a' || cp == 'o' do return false
+	}
+
+	// Numpad keys produce text (digits) in numerical keypad mode; let ImGui's
+	// text queue carry those repeats too.
+	if gkey >= GHOSTTY_KEY_NUMPAD_0 && gkey <= GHOSTTY_KEY_NUMPAD_EQUAL do return false
+
+	if (is_text_key || gkey == GHOSTTY_KEY_SPACE) && !ctrl && !alt do return false
+	return true
+}
+
+// terminal_emit_key_repeats drives held-key repeats. ImGui's GLFW backend
+// discards GLFW_REPEAT events, but ImGui still tracks each key's held
+// duration and exposes the same typematic repeat predicate its own widgets
+// use. Walk the keys the terminal believes are down and turn each repeat
+// frame into one encoder event.
+terminal_emit_key_repeats :: proc(t: ^Terminal, mods: u16, ctrl, shift, alt, super: bool) {
+	for raw in 0 ..< len(t.key_down) {
+		if !t.key_down[raw] do continue
+		key := ImGuiKey(raw)
+
+		// The initial press is already encoded from the input trail.
+		if igIsKeyPressed_Bool(key, false) do continue
+		if !igIsKeyPressed_Bool(key, true) do continue
+
+		gkey, is_text_key := imgui_key_to_ghostty(key)
+		if !terminal_encode_key_repeat(gkey, is_text_key, ctrl, shift, alt, super) do continue
+
+		unshifted := terminal_unshifted_codepoint(gkey)
+		terminal_emit_key(t, GHOSTTY_KEY_ACTION_REPEAT, gkey, mods, "", unshifted, 0)
+	}
+}
+
 // Feed one frame of keyboard input to the shell. Text arrives through ImGui's
 // character queue; key events are only encoded for keys that don't produce
 // text (plus Ctrl combinations), which keeps libghostty's encoder authoritative
@@ -596,14 +659,14 @@ terminal_handle_input :: proc(t: ^Terminal) {
 			if t.hover_cell_valid do terminal_select_output(t, t.hover_cell)
 			return
 		}
-		if igIsKeyPressed_Bool(KEY_LEFT, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_LEFT); return }
-		if igIsKeyPressed_Bool(KEY_RIGHT, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_RIGHT); return }
-		if igIsKeyPressed_Bool(KEY_UP, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_UP); return }
-		if igIsKeyPressed_Bool(KEY_DOWN, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_DOWN); return }
-		if igIsKeyPressed_Bool(KEY_HOME, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_BEGINNING_OF_LINE); return }
-		if igIsKeyPressed_Bool(KEY_END, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_END_OF_LINE); return }
-		if igIsKeyPressed_Bool(KEY_PAGE_UP, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_PAGE_UP); return }
-		if igIsKeyPressed_Bool(KEY_PAGE_DOWN, false) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_PAGE_DOWN); return }
+		if igIsKeyPressed_Bool(KEY_LEFT, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_LEFT); return }
+		if igIsKeyPressed_Bool(KEY_RIGHT, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_RIGHT); return }
+		if igIsKeyPressed_Bool(KEY_UP, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_UP); return }
+		if igIsKeyPressed_Bool(KEY_DOWN, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_DOWN); return }
+		if igIsKeyPressed_Bool(KEY_HOME, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_BEGINNING_OF_LINE); return }
+		if igIsKeyPressed_Bool(KEY_END, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_END_OF_LINE); return }
+		if igIsKeyPressed_Bool(KEY_PAGE_UP, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_PAGE_UP); return }
+		if igIsKeyPressed_Bool(KEY_PAGE_DOWN, true) { terminal_selection_adjust(t, GHOSTTY_SELECTION_ADJUST_PAGE_DOWN); return }
 	}
 
 	mods: u16
@@ -613,8 +676,6 @@ terminal_handle_input :: proc(t: ^Terminal) {
 	if super do mods |= GHOSTTY_MODS_SUPER
 
 	count := mi_io_input_event_count()
-	if count <= 0 do return
-
 	i: i32 = 0
 	for i < count {
 		e: Mi_Input_Event
@@ -669,6 +730,8 @@ terminal_handle_input :: proc(t: ^Terminal) {
 
 		i += 1
 	}
+
+	terminal_emit_key_repeats(t, mods, ctrl, shift, alt, super)
 }
 
 

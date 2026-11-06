@@ -92,13 +92,7 @@ You can add an `AGENT.md` file in the global config directory that will be injec
 
 After the first time you run the GUI, it creates a `gui.json` file with some GUI specific settings in the global config
 directory. Most of these are, IMHO, not very interesting. There is also a fully optional theme file, `theme.json` you
-can edit to change fonts and colors. There is a somewhat minimal example file in the project root. Set `font_emoji` to
-an explicit font path if you want a different emoji fallback.
-
-A bundled monochrome Noto Emoji font supplies emoji glyphs when the regular text fonts do not have them. Noto Color
-Emoji itself is a bitmap font with a single fixed 109px strike, which ImGui's rasterizer cannot scale down to UI sizes,
-so its colorful glyphs are not used here. A scalable color emoji font would require switching the rasterizer to
-FreeType.
+can edit to change fonts and colors. There is a somewhat minimal example file in the project root.
 
 
 ## Tools and Prompts

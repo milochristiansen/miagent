@@ -62,6 +62,98 @@ terminal_geometry :: proc(area: Rect, f: Fonts, cols: u16) -> GhosttySelectionGe
 	}
 }
 
+// terminal_selection_press starts a gesture at a cell. The gesture returns a
+// selection only for repeat clicks (word/line); a single click starts a drag
+// without selecting anything yet. Any previous selection is cleared, and the
+// return value reports whether the press was applied to the gesture state.
+terminal_selection_press :: proc(t: ^Terminal, cell: Terminal_Cell, pos: GhosttySurfacePosition, time_ns: u64) -> bool {
+	ref, ok := terminal_ref_at_cell(t, cell)
+	if !ok do return false
+
+	t.sel_anchor_col = cell.col
+	t.sel_anchor_row = cell.row
+	t.sel_moved = false
+	terminal_clear_selection(t)
+
+	repeat_ns := SELECTION_REPEAT_INTERVAL_NS
+	repeat_dist := SELECTION_REPEAT_DISTANCE
+	press_pos := pos
+	press_time := time_ns
+	behaviors := GhosttySelectionGestureBehaviors {
+		single_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL,
+		double_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD,
+		triple_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE,
+	}
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref)
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &press_pos)
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS, &press_time)
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS, &repeat_ns)
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE, &repeat_dist)
+	ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS, &behaviors)
+
+	sel: GhosttySelection
+	res := ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_press, &sel)
+	if res == GHOSTTY_SUCCESS {
+		_ = terminal_install_selection(t, &sel)
+		return true
+	}
+	return res == GHOSTTY_NO_VALUE
+}
+
+// terminal_selection_drag_to updates the active drag. The surface position is
+// required: libghostty uses it for the within-cell selection threshold and to
+// decide the autoscroll direction. Leaving it unset reads as (0, 0) -- the
+// top-left edge -- which makes every drag look like it is above the surface
+// (autoscrolling up forever) and can turn a same-cell click into a selection.
+terminal_selection_drag_to :: proc(t: ^Terminal, cell: Terminal_Cell,
+                                   pos: GhosttySurfacePosition,
+                                   geometry: GhosttySelectionGestureGeometry,
+                                   rectangle: bool) -> bool {
+	ref, ok := terminal_ref_at_cell(t, cell)
+	if !ok do return false
+	drag_pos := pos
+	drag_geometry := geometry
+	drag_rectangle := rectangle
+	ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref)
+	ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &drag_pos)
+	ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &drag_geometry)
+	ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE, &drag_rectangle)
+
+	sel: GhosttySelection
+	res := ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_drag, &sel)
+	if res == GHOSTTY_SUCCESS do return terminal_install_selection(t, &sel)
+	// This drag position does not select a cell. Clear so dragging back to the
+	// anchor does not leave a stale selection behind.
+	if res == GHOSTTY_NO_VALUE do terminal_clear_selection(t)
+	return false
+}
+
+// terminal_selection_autoscroll_to advances an edge-scroll drag. Position is
+// passed again because libghostty re-evaluates autoscroll while continuing the
+// drag; without it the tick would immediately think the pointer was at the top
+// edge and keep scrolling up.
+terminal_selection_autoscroll_to :: proc(t: ^Terminal, cell: Terminal_Cell,
+                                         pos: GhosttySurfacePosition,
+                                         geometry: GhosttySelectionGestureGeometry,
+                                         rectangle: bool) -> bool {
+	vp := GhosttyPointCoordinate{x = cell.col, y = cell.row}
+	tick_pos := pos
+	tick_geometry := geometry
+	tick_rectangle := rectangle
+	ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT, &vp)
+	ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &tick_pos)
+	ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &tick_geometry)
+	ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE, &tick_rectangle)
+
+	sel: GhosttySelection
+	res := ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_autoscroll, &sel)
+	if res == GHOSTTY_SUCCESS {
+		return terminal_install_selection(t, &sel)
+	}
+	if res == GHOSTTY_NO_VALUE do terminal_clear_selection(t)
+	return false
+}
+
 terminal_selection_update :: proc(t: ^Terminal, area: Rect, f: Fonts, mouse: ImVec2, over_body, down: bool) {
 	if !t.alive || t.gesture == nil || f.cell_w <= 0 || f.cell_h <= 0 do return
 	cols, rows := terminal_grid_size(area, f)
@@ -79,49 +171,18 @@ terminal_selection_update :: proc(t: ^Terminal, area: Rect, f: Fonts, mouse: ImV
 	t.sel_was_down = down
 
 	if pressed {
-		ref, ok := terminal_ref_at_cell(t, cell)
-		if !ok do return
-		t.sel_dragging = true
-		t.sel_moved = false
-		t.sel_anchor_col = cell.col
-		t.sel_anchor_row = cell.row
-		t.sel_last_tick = mi_io_time()
-		terminal_clear_selection(t)
-
 		time_ns := u64(max(mi_io_time(), 0) * 1_000_000_000.0)
-		repeat_ns := SELECTION_REPEAT_INTERVAL_NS
-		repeat_dist := SELECTION_REPEAT_DISTANCE
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref)
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &pos)
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS, &time_ns)
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS, &repeat_ns)
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE, &repeat_dist)
-		behaviors := GhosttySelectionGestureBehaviors {
-			single_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL,
-			double_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD,
-			triple_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE,
-		}
-		ghostty_selection_gesture_event_set(t.gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS, &behaviors)
-		sel: GhosttySelection
-		if ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_press, &sel) == GHOSTTY_SUCCESS {
-			_ = terminal_install_selection(t, &sel)
+		if terminal_selection_press(t, cell, pos, time_ns) {
+			t.sel_dragging = true
+			t.sel_last_tick = mi_io_time()
 		}
 		return
 	}
 
 	if t.sel_dragging && down {
 		if cell.col != t.sel_anchor_col || cell.row != t.sel_anchor_row do t.sel_moved = true
-		ref, ok := terminal_ref_at_cell(t, cell)
-		if ok {
-			rect_select := mi_io_key_alt() != 0
-			ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref)
-			ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &geometry)
-			ghostty_selection_gesture_event_set(t.gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE, &rect_select)
-			sel: GhosttySelection
-			if ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_drag, &sel) == GHOSTTY_SUCCESS {
-				_ = terminal_install_selection(t, &sel)
-			}
-		}
+		rect_select := mi_io_key_alt() != 0
+		_ = terminal_selection_drag_to(t, cell, pos, geometry, rect_select)
 
 		// Edge autoscroll: ask the gesture for its preferred direction, scroll
 		// one row, and feed it a tick with the clamped viewport coordinate.
@@ -131,13 +192,7 @@ terminal_selection_update :: proc(t: ^Terminal, area: Rect, f: Fonts, mouse: ImV
 			_ = ghostty_selection_gesture_get(t.gesture, t.gt, GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL, &autoscroll)
 			if autoscroll != GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE {
 				terminal_scroll(t, autoscroll == GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_UP ? -1 : 1)
-				vp := GhosttyPointCoordinate{x = cell.col, y = cell.row}
-				ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT, &vp)
-				ghostty_selection_gesture_event_set(t.gesture_autoscroll, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &geometry)
-				sel: GhosttySelection
-				if ghostty_selection_gesture_event(t.gesture, t.gt, t.gesture_autoscroll, &sel) == GHOSTTY_SUCCESS {
-					_ = terminal_install_selection(t, &sel)
-				}
+				_ = terminal_selection_autoscroll_to(t, cell, pos, geometry, rect_select)
 				t.sel_last_tick = now
 			}
 		}

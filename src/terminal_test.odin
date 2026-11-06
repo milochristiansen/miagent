@@ -294,3 +294,159 @@ test_terminal_micro_alt_screen :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, false, "micro screen should contain its filename")
 }
+
+// --- selection gestures -----------------------------------------------------
+
+terminal_test_selection_text :: proc(t: ^Terminal) -> (text: string, ok: bool) {
+	sel: GhosttySelection
+	if ghostty_terminal_get(t.gt, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS {
+		return "", false
+	}
+	opts := GhosttyTerminalSelectionFormatOptions {
+		size      = size_of(GhosttyTerminalSelectionFormatOptions),
+		emit      = GHOSTTY_FORMATTER_FORMAT_PLAIN,
+		unwrap    = true,
+		trim      = true,
+		selection = &sel,
+	}
+	needed: uint
+	if ghostty_terminal_selection_format_buf(t.gt, opts, nil, 0, &needed) != GHOSTTY_OUT_OF_SPACE ||
+	   needed == 0 {
+		return "", false
+	}
+	out := make([]u8, int(needed), context.temp_allocator)
+	if ghostty_terminal_selection_format_buf(t.gt, opts, raw_data(out), needed, &needed) != GHOSTTY_SUCCESS {
+		return "", false
+	}
+	return string(out[:needed]), true
+}
+
+terminal_test_autoscroll :: proc(t: ^Terminal) -> i32 {
+	v: i32 = -1
+	_ = ghostty_selection_gesture_get(t.gesture, t.gt, GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL, &v)
+	return v
+}
+
+terminal_test_selection_geometry :: proc() -> GhosttySelectionGestureGeometry {
+	return {
+		columns       = 20,
+		cell_width    = 10,
+		padding_left  = u32(TERM_PAD_X),
+		screen_height = 100,
+	}
+}
+
+// Surface position of a cell, with `frac` pixels into the cell (0..cell_width).
+terminal_test_selection_pos :: proc(cell: Terminal_Cell, frac: f32) -> GhosttySurfacePosition {
+	return {
+		x = f64(TERM_PAD_X + f32(cell.col) * 10 + frac),
+		y = f64(TERM_PAD_Y + f32(cell.row) * 20 + 10),
+	}
+}
+
+@(test)
+test_terminal_selection_click_does_not_select :: proc(t: ^testing.T) {
+	tt, ok := test_terminal_new(t)
+	if !ok do return
+	defer test_terminal_destroy(tt)
+	test_terminal_write(tt, "hello world")
+
+	geometry := terminal_test_selection_geometry()
+	cell := Terminal_Cell{col = 2, row = 0}
+	// Right-hand side of the cell: with the drag position left unset the
+	// gesture reads (0, 0) and treated this as a real drag, selecting the cell.
+	pos := terminal_test_selection_pos(cell, 8)
+
+	if !testing.expect(t, terminal_selection_press(tt.term, cell, pos, 1_000_000)) do return
+	_ = terminal_selection_drag_to(tt.term, cell, pos, geometry, false)
+
+	sel: GhosttySelection
+	res := ghostty_terminal_get(tt.term.gt, GHOSTTY_TERMINAL_DATA_SELECTION, &sel)
+	testing.expect_value(t, res, GHOSTTY_NO_VALUE)
+}
+
+@(test)
+test_terminal_selection_drag_selects_cells :: proc(t: ^testing.T) {
+	tt, ok := test_terminal_new(t)
+	if !ok do return
+	defer test_terminal_destroy(tt)
+	test_terminal_write(tt, "hello world")
+
+	geometry := terminal_test_selection_geometry()
+	start := Terminal_Cell{col = 2, row = 0}
+	end := Terminal_Cell{col = 7, row = 0}
+
+	if !testing.expect(t, terminal_selection_press(tt.term, start,
+		terminal_test_selection_pos(start, 5), 1_000_000)) {
+		return
+	}
+	if !testing.expect(t, terminal_selection_drag_to(tt.term, end,
+		terminal_test_selection_pos(end, 8), geometry, false)) {
+		return
+	}
+
+	text, has := terminal_test_selection_text(tt.term)
+	if !testing.expect(t, has, "drag should install a selection") do return
+	testing.expect_value(t, text, "llo wo")
+}
+
+@(test)
+test_terminal_selection_autoscroll_follows_pointer :: proc(t: ^testing.T) {
+	tt, ok := test_terminal_new(t)
+	if !ok do return
+	defer test_terminal_destroy(tt)
+	test_terminal_write(tt, "hello world")
+
+	geometry := terminal_test_selection_geometry()
+	cell := Terminal_Cell{col = 2, row = 0}
+	inside := terminal_test_selection_pos(cell, 5)
+
+	if !testing.expect(t, terminal_selection_press(tt.term, cell, inside, 1_000_000)) do return
+
+	// A drag inside the body must not autoscroll. This regressed to UP when the
+	// drag event omitted its position because (0, 0) is above the top edge.
+	_ = terminal_selection_drag_to(tt.term, cell, inside, geometry, false)
+	testing.expect_value(t, terminal_test_autoscroll(tt.term), i32(GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE))
+
+	above := GhosttySurfacePosition{x = inside.x, y = -4}
+	_ = terminal_selection_drag_to(tt.term, cell, above, geometry, false)
+	testing.expect_value(t, terminal_test_autoscroll(tt.term), i32(GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_UP))
+
+	below := GhosttySurfacePosition{x = inside.x, y = f64(geometry.screen_height) + 4}
+	_ = terminal_selection_drag_to(tt.term, cell, below, geometry, false)
+	testing.expect_value(t, terminal_test_autoscroll(tt.term), i32(GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_DOWN))
+
+	_ = terminal_selection_drag_to(tt.term, cell, inside, geometry, false)
+	testing.expect_value(t, terminal_test_autoscroll(tt.term), i32(GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE))
+}
+
+@(test)
+test_terminal_key_repeat_encoding :: proc(t: ^testing.T) {
+	// Plain printable repeats arrive through ImGui's text queue, so encoding
+	// them again would duplicate the character.
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A, true, false, false, false, false))
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A, true, false, true, false, false), "shift+letter")
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_SPACE, false, false, false, false, false))
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_NUMPAD_1, false, false, false, false, false))
+
+	// Keys with no text and modified keys need an explicit repeat event.
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_A, true, true, false, false, false), "ctrl+letter")
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_A, true, false, false, true, false), "alt+letter")
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_ARROW_LEFT, false, false, true, false, false), "shift+arrow")
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_ARROW_LEFT, false, false, false, false, false))
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_BACKSPACE, false, false, false, false, false))
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_ENTER, false, false, false, false, false))
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_TAB, false, false, false, false, false))
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_F1, false, false, false, false, false))
+
+	// Modifiers, super shortcuts, and the local Ctrl+Shift actions must not
+	// repeat into the shell.
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_SHIFT_LEFT, false, false, true, false, false))
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_ARROW_UP, false, false, false, false, true))
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A, true, true, true, false, false), "ctrl+shift+a")
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A + 2, true, true, true, false, false), "ctrl+shift+c")
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A + 21, true, true, true, false, false), "ctrl+shift+v")
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_A + 14, true, true, true, false, false), "ctrl+shift+o")
+	testing.expect(t, terminal_encode_key_repeat(GHOSTTY_KEY_A + 15, true, true, true, false, false), "ctrl+shift+p")
+	testing.expect(t, !terminal_encode_key_repeat(GHOSTTY_KEY_UNIDENTIFIED, false, false, false, false, false))
+}
