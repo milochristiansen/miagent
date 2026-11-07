@@ -261,6 +261,7 @@ terminal_destroy :: proc(t: ^Terminal) {
 terminal_pump :: proc(t: ^Terminal) {
 	if !t.alive do return
 	buf: [65536]u8
+	read_error := false
 	for {
 		n := mi_pty_read(t.fd, &buf[0], i32(len(buf)))
 		if n > 0 {
@@ -271,15 +272,21 @@ terminal_pump :: proc(t: ^Terminal) {
 			break
 		} else {
 			t.alive = false
+			read_error = true
 			break
 		}
 	}
-	if t.alive {
+	if t.pid > 0 {
 		code := mi_pty_reap(t.pid)
 		if code > 0 {
 			t.alive = false
 			t.exit_code = code - 1
 			t.pid = -1
+		} else if read_error {
+			// The PTY is gone but the child has not been reaped yet. Do not
+			// leave the misleading zero default on screen; terminal_destroy
+			// will reap it and overwrite this if it gets a real status.
+			t.exit_code = -1
 		}
 	}
 	if !t.alive && t.fd >= 0 {
@@ -1342,7 +1349,7 @@ terminal_draw :: proc(t: ^Terminal, list: ^ImDrawList, area: Rect, th: Theme, f:
 	}
 
 	if !t.alive {
-		msg := fmt.tprintf("process exited (%d)", t.exit_code)
+		msg := t.exit_code >= 0 ? fmt.tprintf("process exited (%d)", t.exit_code) : "process exited (status unknown)"
 		mi_draw_text_font_n(list, f.mono, f.mono_size, inner.x, inner.y, color_u32(th.fg_faint), cstr(msg), uint(len(msg)))
 	}
 }

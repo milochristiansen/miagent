@@ -114,8 +114,8 @@ folder_picker_worker :: proc(fp: ^Folder_Picker) {
 		}
 	}
 
-	if out_thread != nil do thread.join(out_thread)
-	if err_thread != nil do thread.join(err_thread)
+	if out_thread != nil do thread.destroy(out_thread)
+	if err_thread != nil do thread.destroy(err_thread)
 	if fp.stdout != nil do os.close(fp.stdout)
 	if fp.stderr != nil do os.close(fp.stderr)
 
@@ -164,7 +164,13 @@ folder_picker_start :: proc(app: ^App, title: string) -> bool {
 
 	exe, exe_err := os.get_executable_path(context.temp_allocator)
 	if exe_err != nil || len(exe) == 0 {
-		if len(os.args) == 0 do return false
+		if len(os.args) == 0 {
+			os.close(stdout_r)
+			os.close(stdout_w)
+			os.close(stderr_r)
+			os.close(stderr_w)
+			return false
+		}
 		exe = os.args[0]
 	}
 	command := []string{exe, FOLDER_PICKER_FLAG, title}
@@ -220,7 +226,7 @@ folder_picker_poll :: proc(app: ^App) {
 
 	fp.running = false
 	if fp.thread != nil {
-		thread.join(fp.thread)
+		thread.destroy(fp.thread)
 		fp.thread = nil
 	}
 
@@ -245,7 +251,7 @@ folder_picker_poll :: proc(app: ^App) {
 folder_picker_destroy :: proc(fp: ^Folder_Picker) {
 	if fp.running {
 		_ = os.process_kill(fp.process)
-		if fp.thread != nil do thread.join(fp.thread)
+		if fp.thread != nil do thread.destroy(fp.thread)
 		fp.thread = nil
 		fp.running = false
 	}
@@ -343,8 +349,8 @@ attachment_picker_worker :: proc(fp: ^Attachment_Picker) {
 		}
 	}
 
-	if out_thread != nil do thread.join(out_thread)
-	if err_thread != nil do thread.join(err_thread)
+	if out_thread != nil do thread.destroy(out_thread)
+	if err_thread != nil do thread.destroy(err_thread)
 	if fp.stdout != nil do os.close(fp.stdout)
 	if fp.stderr != nil do os.close(fp.stderr)
 
@@ -423,7 +429,13 @@ attachment_picker_start :: proc(app: ^App, title: string) -> bool {
 
 	exe, exe_err := os.get_executable_path(context.temp_allocator)
 	if exe_err != nil || len(exe) == 0 {
-		if len(os.args) == 0 do return false
+		if len(os.args) == 0 {
+			os.close(stdout_r)
+			os.close(stdout_w)
+			os.close(stderr_r)
+			os.close(stderr_w)
+			return false
+		}
 		exe = os.args[0]
 	}
 	command := []string{exe, FILES_PICKER_FLAG, title}
@@ -490,7 +502,7 @@ attachment_picker_poll :: proc(app: ^App) {
 
 	fp.running = false
 	if fp.thread != nil {
-		thread.join(fp.thread)
+		thread.destroy(fp.thread)
 		fp.thread = nil
 	}
 
@@ -519,7 +531,7 @@ attachment_picker_poll :: proc(app: ^App) {
 attachment_picker_destroy :: proc(fp: ^Attachment_Picker) {
 	if fp.running {
 		_ = os.process_kill(fp.process)
-		if fp.thread != nil do thread.join(fp.thread)
+		if fp.thread != nil do thread.destroy(fp.thread)
 		fp.thread = nil
 		fp.running = false
 	}

@@ -283,6 +283,47 @@ view_append_to :: proc(v: ^Conversation_View, idx: int, text: string, field: int
 	v.scroll_pending = 2
 }
 
+view_set_assistant_text :: proc(v: ^Conversation_View, text: string) {
+	idx := v.assistant_index
+	if idx >= 0 && idx < len(v.messages) && v.messages[idx].kind == .Assistant {
+		m := &v.messages[idx]
+		if m.text_buf.buf != nil {
+			delete(m.text_buf.buf)
+			m.text_buf = {}
+		}
+		delete(m.text)
+		if len(text) == 0 {
+			view_message_destroy(m)
+			ordered_remove(&v.messages, idx)
+			v.assistant_index = -1
+			if v.reasoning_index > idx do v.reasoning_index -= 1
+			v.message_count = len(v.messages)
+			v.scroll_pending = 2
+			return
+		}
+		m.text = strings.clone(text)
+		m.height_valid = false
+		v.message_count = len(v.messages)
+		v.scroll_pending = 2
+		return
+	}
+	if len(text) == 0 do return
+	view_append(v, View_Message{kind = .Assistant, name = "MiAgent", text = text})
+	v.assistant_index = len(v.messages) - 1
+}
+
+view_discard_reasoning :: proc(v: ^Conversation_View) {
+	idx := v.reasoning_index
+	if idx >= 0 && idx < len(v.messages) && v.messages[idx].kind == .Reasoning {
+		view_message_destroy(&v.messages[idx])
+		ordered_remove(&v.messages, idx)
+		if v.assistant_index > idx do v.assistant_index -= 1
+		v.message_count = len(v.messages)
+		v.scroll_pending = 2
+	}
+	v.reasoning_index = -1
+}
+
 view_find_tool :: proc(v: ^Conversation_View, call_id: string) -> int {
 	for i := len(v.messages) - 1; i >= 0; i -= 1 {
 		if v.messages[i].kind == .Tool && v.messages[i].call_id == call_id do return i
@@ -392,6 +433,8 @@ view_apply_event :: proc(v: ^Conversation_View, ev: ^harness.Event) {
 			v.assistant_index = len(v.messages) - 1
 		}
 		view_append_to(v, v.assistant_index, ev.text, 0)
+	case .Assistant_Replace:
+		view_set_assistant_text(v, ev.text)
 	case .Assistant_End:
 		if v.assistant_index >= 0 && v.assistant_index < len(v.messages) {
 			delete(v.messages[v.assistant_index].meta)
@@ -407,6 +450,8 @@ view_apply_event :: proc(v: ^Conversation_View, ev: ^harness.Event) {
 			v.reasoning_index = len(v.messages) - 1
 		}
 		view_append_to(v, v.reasoning_index, ev.text, 0)
+	case .Reasoning_Discard:
+		view_discard_reasoning(v)
 	case .Reasoning_End:
 		// Leave live reasoning expanded: it is part of the turn the user just
 		// watched. Historical reasoning from a session starts collapsed.
@@ -977,7 +1022,7 @@ draw_conversation :: proc(app: ^App) {
 		}
 		view.layout_ready = true
 		sel_draw_highlights(child_list, &view.sel, th)
-		if live && active_harness != nil && harness.harness_is_running(active_harness) {
+		if live && active_harness != nil && harness.harness_is_busy(active_harness) {
 			phase := app.now * 3.0
 			for i in 0 ..< 3 {
 				a := 0.25 + 0.75 * (0.5 + 0.5 * math.sin(phase + f32(i) * 1.1))
@@ -1176,7 +1221,7 @@ draw_conversation :: proc(app: ^App) {
 
 	entered := igIsKeyPressed_Bool(KEY_ENTER, false) && mi_io_key_shift() == 0
 	if active && entered do submit(app)
-	if !app.image_viewer.open && igIsKeyPressed_Bool(KEY_ESCAPE, false) && active_harness != nil && harness.harness_is_running(active_harness) {
+	if !app.image_viewer.open && igIsKeyPressed_Bool(KEY_ESCAPE, false) && active_harness != nil && harness.harness_is_busy(active_harness) {
 		harness.harness_cancel(active_harness)
 	}
 
@@ -1185,7 +1230,7 @@ draw_conversation :: proc(app: ^App) {
 	send_w: f32 = 58
 	send_r := rect(composer.x + composer.w - 14 - send_w, row_y - 4, send_w, btn_h)
 	has_text := tab.composer[0] != 0
-	running := active_harness != nil && harness.harness_is_running(active_harness)
+	running := active_harness != nil && harness.harness_is_busy(active_harness)
 	send_bg := has_text ? th.accent : th.bg_raised
 	send_fg := has_text ? th.bg_deep : th.fg_faint
 	if button(list, cstr("##send"), send_r, "Send", app.f.ui, 12.0, send_fg, send_bg,

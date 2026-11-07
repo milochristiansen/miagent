@@ -93,7 +93,7 @@ project_any_tab_ready :: proc(p: ^Project) -> bool {
 
 project_any_tab_running :: proc(p: ^Project) -> bool {
 	for t in p.tabs {
-		if t.harness_ready && harness.harness_is_running(&t.harness) do return true
+		if t.harness_ready && harness.harness_is_busy(&t.harness) do return true
 	}
 	return false
 }
@@ -341,6 +341,17 @@ tab_ensure_runtime :: proc(p: ^Project, t: ^Conversation_Tab) {
 	} else {
 		init_err = harness.harness_init_project_session(&t.harness, p.path, t.session_path)
 	}
+	if len(init_err) > 0 {
+		// harness_ready must mean there is a live worker. A partial harness is
+		// destroyed so a later project/tab selection can retry cleanly.
+		harness.harness_destroy(&t.harness)
+		t.harness_ready = false
+		if len(t.session_path) > 0 do t.view.session_path = strings.clone(t.session_path)
+		view_add_error(&t.view, init_err)
+		delete(init_err)
+		t.view.scroll_pending = 6
+		return
+	}
 	t.harness_ready = true
 
 	sp := harness.harness_session_path(&t.harness)
@@ -357,10 +368,6 @@ tab_ensure_runtime :: proc(p: ^Project, t: ^Conversation_Tab) {
 	history := harness.harness_history(&t.harness)
 	view_load_history(&t.view, history, t.view.session_path)
 	harness.harness_free_items(history)
-	if len(init_err) > 0 {
-		view_add_error(&t.view, init_err)
-		delete(init_err)
-	}
 	notes := harness.harness_startup_notes(&t.harness)
 	if len(notes) > 0 do view_add_note(&t.view, notes)
 	delete(notes)
@@ -611,7 +618,7 @@ draw_session_tabs :: proc(app: ^App, p: ^Project, r: Rect) {
 			panel(list, tr, th.bg_hover, 7)
 		}
 		name_x := tr.x + 10
-		if t.harness_ready && harness.harness_is_running(&t.harness) {
+		if t.harness_ready && harness.harness_is_busy(&t.harness) {
 			dot(list, tr.x + 8, tr.y + tr.h * 0.5, 2.4, th.yellow)
 			name_x = tr.x + 16
 		}

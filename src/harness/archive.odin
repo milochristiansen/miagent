@@ -433,6 +433,31 @@ archive_session :: proc(session_path: string) -> (string, string) {
 	return target, ""
 }
 
+// retire_files renames originals out of their live names before deleting
+// them. If any rename fails, the already-renamed files are moved back. This
+// keeps /new from leaving a half-removed session when one path is not
+// removable.
+retire_files :: proc(paths: []string) -> ([]string, string) {
+	if len(paths) == 0 do return nil, ""
+	suffix := fmt.aprintf(".archived-%d-%d", os.get_pid(), time.to_unix_nanoseconds(time.now()))
+	defer delete(suffix)
+	retired := make([dynamic]string, 0, len(paths))
+	for path, i in paths {
+		target := fmt.aprintf("%s%s-%d", path, suffix, i)
+		if rerr := os.rename(path, target); rerr != nil {
+			for j := len(retired) - 1; j >= 0; j -= 1 {
+				_ = os.rename(retired[j], paths[j])
+			}
+			for p in retired do delete(p)
+			delete(retired)
+			delete(target)
+			return nil, fmt.aprintf("renaming %s: %v", path, rerr)
+		}
+		append(&retired, target)
+	}
+	return retired[:], ""
+}
+
 remove_files :: proc(paths: []string) -> string {
 	failures := make([dynamic]string, 0, 2)
 	defer delete(failures)

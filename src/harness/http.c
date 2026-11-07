@@ -243,3 +243,73 @@ int mi_http_get_buffered(const char *url, const char *api_key,
     }
     return 0;
 }
+
+/* Kill a process and all of its descendants. Tool and schema discovery
+ * processes are shell scripts that may spawn children (for example a test
+ * fixture that runs `sleep`); killing only the direct child leaves the
+ * grandchildren holding the stdout/stderr pipes, which makes the reader
+ * threads block forever on timeout/cancel. */
+#include <dirent.h>
+#include <signal.h>
+
+static int mi_proc_ppid(const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path), "/proc/%s/stat", name);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    /* The comm field can contain spaces and ')' characters; the last ')' is
+     * the delimiter before state and ppid. */
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+    p++;
+    char state = 0;
+    int ppid = -1;
+    if (sscanf(p, " %c %d", &state, &ppid) != 2) return -1;
+    return ppid;
+}
+
+int mi_kill_process_tree(int pid) {
+    if (pid <= 1) return -1;
+    int pids[4096];
+    int n = 0;
+    pids[n++] = pid;
+    for (int round = 0; round < 64 && n < 4096; round++) {
+        int found = 0;
+        DIR *d = opendir("/proc");
+        if (!d) break;
+        struct dirent *entry;
+        while ((entry = readdir(d)) != NULL) {
+            if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+            int child = atoi(entry->d_name);
+            if (child <= 1 || child == pid) continue;
+            int ppid = mi_proc_ppid(entry->d_name);
+            if (ppid < 0) continue;
+            for (int i = 0; i < n; i++) {
+                if (ppid == pids[i]) {
+                    int already = 0;
+                    for (int j = 0; j < n; j++) {
+                        if (pids[j] == child) { already = 1; break; }
+                    }
+                    if (!already) {
+                        pids[n++] = child;
+                        found = 1;
+                    }
+                    break;
+                }
+            }
+            if (n >= 4096) break;
+        }
+        closedir(d);
+        if (!found) break;
+    }
+    /* Children first, then the root. SIGKILL is deliberate: discovery and
+     * tool cancellation must not wait on a process that ignores SIGTERM. */
+    for (int i = n - 1; i >= 0; i--) kill(pids[i], SIGKILL);
+    return n;
+}

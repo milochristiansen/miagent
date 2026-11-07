@@ -7,6 +7,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:thread"
 import "core:time"
 import "core:unicode/utf8"
@@ -256,7 +257,7 @@ split_json_stream :: proc(input: string) -> []string {
 	return values[:]
 }
 
-discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
+discover_tools :: proc(config: ^Config, cancel: ^i32 = nil) -> (tools: []Tool, warnings: string) {
 	dirs := [2]string{
 		join_path(config.config_dir, TOOLS_DIR),
 		join_path(config.state_dir, TOOLS_DIR),
@@ -264,12 +265,17 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 	index := make(map[string]int)
 	scanned := make([dynamic]string, 0, 4)
 	out := make([dynamic]Tool, 0, 8)
+	interrupted := false
 	defer {
 		for p in scanned do delete(p)
 		delete(scanned)
 	}
 
 	for dir in dirs {
+		if cancel != nil && sync.atomic_load(cancel) != 0 {
+			interrupted = true
+			break
+		}
 		entries, err := os.read_all_directory_by_path(dir, context.temp_allocator)
 		if err != nil {
 			if !os.exists(dir) do continue
@@ -286,6 +292,10 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 			}
 		}
 		for entry in entries {
+			if cancel != nil && sync.atomic_load(cancel) != 0 {
+				interrupted = true
+				break
+			}
 			if entry.type == .Directory do continue
 			exec_path := strings.clone(entry.fullpath)
 			if !(.Execute_User in entry.mode) && !(.Execute_Group in entry.mode) && !(.Execute_Other in entry.mode) {
@@ -293,14 +303,19 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 				continue
 			}
 			append(&scanned, strings.clone(exec_path))
-			defs, schema_warnings, derr := fetch_tool_metas(config, exec_path)
+			defs, schema_warnings, derr := fetch_tool_metas(config, exec_path, cancel)
 			if len(schema_warnings) > 0 {
 				warnings = join_notes(warnings, schema_warnings)
 				delete(schema_warnings)
 			}
 			if derr != "" {
-				warnings = join_notes(warnings, fmt.aprintf("tool %q: %s", entry.name, derr))
+				note := fmt.aprintf("tool %q: %s", entry.name, derr)
+				warnings = join_notes(warnings, note)
+				delete(note)
+				if derr == "interrupted" do interrupted = true
+				delete(derr)
 				delete(exec_path)
+				if interrupted do break
 				continue
 			}
 			for &def in defs {
@@ -316,11 +331,12 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 			delete(defs)
 			delete(exec_path)
 		}
+		if interrupted do break
 	}
 	// If MCP servers are configured, fold the bridge in as one more TGI tool
 	// executable. It declares every MCP tool under a namespaced name, so the
 	// model sees MCP and ordinary TGI tools in the same tools array.
-	if mcp_bridge_configured(config) {
+	if !interrupted && mcp_bridge_configured(config) {
 		bridge := mcp_bridge_path(config)
 		if len(bridge) == 0 {
 			warnings = join_notes(warnings, "MCP servers are configured but the miagent-mcp bridge was not found (build it with make, set MIAGENT_MCP_BRIDGE, or run make install-mcp)")
@@ -328,13 +344,17 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 			already_scanned := false
 			for p in scanned do if p == bridge do already_scanned = true
 			if !already_scanned {
-				defs, schema_warnings, derr := fetch_tool_metas(config, bridge)
+				defs, schema_warnings, derr := fetch_tool_metas(config, bridge, cancel)
 				if len(schema_warnings) > 0 {
 					warnings = join_notes(warnings, schema_warnings)
 					delete(schema_warnings)
 				}
 				if derr != "" {
-					warnings = join_notes(warnings, fmt.aprintf("MCP bridge: %s", derr))
+					note := fmt.aprintf("MCP bridge: %s", derr)
+					warnings = join_notes(warnings, note)
+					delete(note)
+					if derr == "interrupted" do interrupted = true
+					delete(derr)
 				} else {
 					for &def in defs {
 						def.exec_path = strings.clone(bridge)
@@ -353,29 +373,159 @@ discover_tools :: proc(config: ^Config) -> (tools: []Tool, warnings: string) {
 		delete(bridge)
 	}
 
+	if interrupted {
+		warnings = join_notes(warnings, "tool discovery interrupted")
+	}
 	for key in index do delete(key)
 	delete(index)
 	return out[:], warnings
 }
 
-fetch_tool_metas :: proc(config: ^Config, exec_path: string) -> (
+TOOL_SCHEMA_TIMEOUT :: 10 * time.Second
+
+Schema_Exec_Reader :: struct {
+	file: ^os.File,
+	buf:  ^strings.Builder,
+}
+
+schema_exec_reader :: proc(r: ^Schema_Exec_Reader) {
+	tmp: [8192]u8
+	for {
+		n, err := os.read(r.file, tmp[:])
+		if n > 0 do strings.write_bytes(r.buf, tmp[:n])
+		if err != nil || n == 0 do break
+	}
+}
+
+// exec_capture runs a short-lived process with a hard timeout and a
+// cancellation flag. It is used for tool SCHEMA discovery, which previously
+// used os.process_exec and could block forever on a hung tool.
+exec_capture :: proc(
+	command: []string,
+	env: []string,
+	cwd: string,
+	timeout: time.Duration,
+	cancel: ^i32,
+) -> (stdout: string, stderr: string, exit_code: int, err: string) {
+	stdout_r, stdout_w, stdout_err := os.pipe()
+	if stdout_err != nil do return "", "", -1, fmt.aprintf("creating stdout pipe: %v", stdout_err)
+	stderr_r, stderr_w, stderr_err := os.pipe()
+	if stderr_err != nil {
+		os.close(stdout_r); os.close(stdout_w)
+		return "", "", -1, fmt.aprintf("creating stderr pipe: %v", stderr_err)
+	}
+
+	process, perr := os.process_start({
+		command = command,
+		env = env,
+		working_dir = cwd,
+		stdout = stdout_w,
+		stderr = stderr_w,
+	})
+	os.close(stdout_w)
+	os.close(stderr_w)
+	if perr != nil {
+		os.close(stdout_r)
+		os.close(stderr_r)
+		return "", "", -1, fmt.aprintf("starting schema process: %v", perr)
+	}
+
+	out_buf := strings.builder_make()
+	err_buf := strings.builder_make()
+	out_ctx := Schema_Exec_Reader{file = stdout_r, buf = &out_buf}
+	err_ctx := Schema_Exec_Reader{file = stderr_r, buf = &err_buf}
+	out_thread := thread.create_and_start_with_poly_data(&out_ctx, schema_exec_reader)
+	err_thread := thread.create_and_start_with_poly_data(&err_ctx, schema_exec_reader)
+	if out_thread == nil || err_thread == nil {
+		_ = mi_kill_process_tree(i32(process.pid))
+		if out_thread != nil do thread.destroy(out_thread)
+		if err_thread != nil do thread.destroy(err_thread)
+		os.close(stdout_r)
+		os.close(stderr_r)
+		delete(out_buf.buf)
+		delete(err_buf.buf)
+		return "", "", -1, "could not start schema reader threads"
+	}
+
+	start := time.tick_now()
+	state: os.Process_State
+	wait_error: os.Error
+	stop_requested := false
+	stop_time := start
+	was_timeout := false
+	was_cancelled := false
+	for {
+		st, werr := os.process_wait(process, 100 * time.Millisecond)
+		if werr == nil && st.exited {
+			state = st
+			break
+		}
+		if werr != nil {
+			if general, ok := werr.(os.General_Error); ok && general == .Timeout {
+				// Still running.
+			} else {
+				wait_error = werr
+				_ = mi_kill_process_tree(i32(process.pid))
+				break
+			}
+		}
+		now := time.tick_now()
+		cancelled := cancel != nil && sync.atomic_load(cancel) != 0
+		timed_out := timeout > 0 && time.tick_since(start) > timeout
+		if cancelled || timed_out {
+			if cancelled do was_cancelled = true
+			if timed_out do was_timeout = true
+			if !stop_requested {
+				_ = mi_kill_process_tree(i32(process.pid))
+				stop_requested = true
+				stop_time = now
+			} else if time.tick_since(stop_time) > 2 * time.Second {
+				_ = os.process_kill(process)
+			}
+		}
+	}
+
+	thread.destroy(out_thread)
+	thread.destroy(err_thread)
+	os.close(stdout_r)
+	os.close(stderr_r)
+	stdout = strings.to_string(out_buf)
+	stderr = strings.to_string(err_buf)
+
+	if wait_error != nil {
+		return stdout, stderr, -1, fmt.aprintf("waiting for schema process: %v", wait_error)
+	}
+	if was_cancelled do return stdout, stderr, -1, "interrupted"
+	if was_timeout do return stdout, stderr, -1, fmt.aprintf("tool schema timed out after %s", timeout)
+	return stdout, stderr, state.exit_code, ""
+}
+
+fetch_tool_metas :: proc(config: ^Config, exec_path: string, cancel: ^i32 = nil) -> (
 	tools:    []Tool,
 	warnings: string,
 	err:      string,
 ) {
 	env := tool_env(config, "SCHEMA", base_name(exec_path), "")
 	defer free_env(env)
-	state, stdout, stderr, exec_err := os.process_exec(
-		{command = []string{exec_path}, env = env, working_dir = config.project_dir},
-		context.allocator,
+	stdout, stderr, exit_code, exec_err := exec_capture(
+		[]string{exec_path},
+		env,
+		config.project_dir,
+		TOOL_SCHEMA_TIMEOUT,
+		cancel,
 	)
 	defer delete(stdout)
 	defer delete(stderr)
-	if exec_err != nil do return nil, "", fmt.aprintf("running schema: %v", exec_err)
-	if state.exit_code != 0 {
-		detail := strings.trim_space(string(stderr))
-		if len(detail) == 0 do return nil, "", fmt.aprintf("tool exited %d", state.exit_code)
-		return nil, "", fmt.aprintf("tool exited %d: %s", state.exit_code, detail)
+	if exec_err != "" {
+		// `exec_capture` returns the literal "interrupted"; the caller owns
+		// and frees schema errors, so return an allocated copy.
+		if exec_err == "interrupted" do return nil, "", strings.clone("interrupted")
+		return nil, "", fmt.aprintf("running schema: %s", exec_err)
+	}
+	if exit_code != 0 {
+		detail := strings.trim_space(stderr)
+		if len(detail) == 0 do return nil, "", fmt.aprintf("tool exited %d", exit_code)
+		return nil, "", fmt.aprintf("tool exited %d: %s", exit_code, detail)
 	}
 	// Schema stderr is a warning channel: a tool can report a shadowed entry or
 	// a skipped definition while still declaring the tools that are valid.
@@ -464,11 +614,17 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 	}
 	stdout_r, stdout_w, stdout_err := os.pipe()
 	if stdout_err != nil {
+		os.close(stdin_r)
+		os.close(stdin_w)
 		res.err = "creating stdout pipe"
 		return res
 	}
 	stderr_r, stderr_w, stderr_err := os.pipe()
 	if stderr_err != nil {
+		os.close(stdin_r)
+		os.close(stdin_w)
+		os.close(stdout_r)
+		os.close(stdout_w)
 		res.err = "creating stderr pipe"
 		return res
 	}
@@ -518,7 +674,7 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 		now := time.tick_now()
 		if h_cancelled(h) || time.tick_since(start) > TOOL_CALL_TIMEOUT {
 			if !stop_requested {
-				_ = os.process_terminate(process)
+				_ = mi_kill_process_tree(i32(process.pid))
 				stop_requested = true
 				stop_time = now
 			} else if time.tick_since(stop_time) > 5 * time.Second {
@@ -527,8 +683,8 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 		}
 	}
 
-	thread.join(out_thread)
-	thread.join(err_thread)
+	if out_thread != nil do thread.destroy(out_thread)
+	if err_thread != nil do thread.destroy(err_thread)
 	os.close(stdout_r)
 	os.close(stderr_r)
 

@@ -4,6 +4,8 @@
 #include <string.h>
 #include <zlib.h>
 
+#define MI_GZIP_MAX_OUTPUT (256ull << 20)
+
 int mi_gzip_compress(const void *data, size_t len, unsigned char **out, size_t *outlen) {
     if (out == NULL || outlen == NULL) return -1;
     *out = NULL;
@@ -55,6 +57,10 @@ int mi_gzip_decompress(const void *data, size_t len, unsigned char **out, size_t
     if (inflateInit2(&strm, 15 + 16) != Z_OK) return -1;
 
     size_t cap = len * 4 + 1024;
+    if (cap > MI_GZIP_MAX_OUTPUT) {
+        inflateEnd(&strm);
+        return -1;
+    }
     unsigned char *buf = (unsigned char *)malloc(cap);
     if (buf == NULL) {
         inflateEnd(&strm);
@@ -77,7 +83,13 @@ int mi_gzip_decompress(const void *data, size_t len, unsigned char **out, size_t
         }
         if (strm.avail_out == 0) {
             size_t used = cap;
+            if (cap >= MI_GZIP_MAX_OUTPUT) {
+                free(buf);
+                inflateEnd(&strm);
+                return -1;
+            }
             cap *= 2;
+            if (cap > MI_GZIP_MAX_OUTPUT) cap = MI_GZIP_MAX_OUTPUT;
             unsigned char *grown = (unsigned char *)realloc(buf, cap);
             if (grown == NULL) {
                 free(buf);

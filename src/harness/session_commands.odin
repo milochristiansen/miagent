@@ -50,6 +50,13 @@ load_prompt_file :: proc(config_dir, name: string) -> (string, string) {
 
 cmd_new :: proc(h: ^Harness) -> string {
 	if len(h.session.path) == 0 do return "no session file configured"
+	// Persist any in-memory items first. /new archives files, so an
+	// uncommitted turn would otherwise disappear with the old in-memory
+	// session after the reset below.
+	sync.mutex_lock(&h.state_mutex)
+	commit_err := session_commit(&h.session)
+	sync.mutex_unlock(&h.state_mutex)
+	if commit_err != "" do return fmt.aprintf("saving session before archive: %s", commit_err)
 	files, ferr := session_pack_files(h.session.path)
 	if ferr != "" do return ferr
 	defer session_files_destroy(&files)
@@ -114,9 +121,16 @@ cmd_new :: proc(h: ^Harness) -> string {
 		os.remove(target)
 		return err
 	}
-	if rerr := remove_files(all); rerr != "" {
-		return fmt.aprintf("archived as %s, but removing the originals failed: %s", target, rerr)
+	retired, rerr := retire_files(all)
+	if rerr != "" {
+		os.remove(target)
+		return fmt.aprintf("archiving as %s, but retiring the originals failed: %s", target, rerr)
 	}
+	defer {
+		for path in retired do delete(path)
+		delete(retired)
+	}
+	cleanup_err := remove_files(retired)
 	sync.mutex_lock(&h.state_mutex)
 	session_reset(&h.session)
 	sync.mutex_unlock(&h.state_mutex)
@@ -131,6 +145,10 @@ cmd_new :: proc(h: ^Harness) -> string {
 	desc := session_files_describe(files)
 	h_emit_note(h, fmt.aprintf("removed %s; the next prompt starts a new session", desc))
 	delete(desc)
+	if cleanup_err != "" {
+		h_emit_note(h, fmt.aprintf("archived as %s, but deleting the retired originals failed: %s", target, cleanup_err))
+		delete(cleanup_err)
+	}
 	h_emit_context(h)
 	return ""
 }
@@ -249,17 +267,71 @@ cmd_load_target :: proc(h: ^Harness, target: string) -> string {
 		return fmt.aprintf("reading %s (%s): %s", target, session_file_name, perr)
 	}
 
+	// Reject final paths that cannot be replaced by a rename before any
+	// destructive work starts.
+	for e in extra {
+		final := join_path(dir, e.name)
+		blocked := false
+		if st, serr := os.stat(final, context.temp_allocator); serr == nil && st.type == .Directory do blocked = true
+		delete(final)
+		if blocked do return fmt.aprintf("restoring %s: target is a directory", e.name)
+	}
+	if st, serr := os.stat(h.session.path, context.temp_allocator); serr == nil && st.type == .Directory {
+		return fmt.aprintf("writing %s: target is a directory", h.session.path)
+	}
+
+	// Stage every write before retiring the current session. Staging uses
+	// unique names in the same directory, so a pre-existing compaction file
+	// or a failed write cannot destroy the live session first.
+	stage_id := fmt.aprintf("%d-%d", os.get_pid(), time.to_unix_nanoseconds(time.now()))
+	defer delete(stage_id)
+	staged_extra := make([]string, len(extra))
+	defer {
+		for path in staged_extra {
+			if len(path) > 0 {
+				os.remove(path)
+				delete(path)
+			}
+		}
+		delete(staged_extra)
+	}
+	for e, i in extra {
+		staged := fmt.aprintf("%s/.miagent-restore-%s-%d", dir, stage_id, i)
+		if werr := write_restored_file(staged, e.content); werr != "" {
+			delete(staged)
+			return fmt.aprintf("restoring %s: %s", e.name, werr)
+		}
+		staged_extra[i] = staged
+	}
+	staged_session := fmt.aprintf("%s/.miagent-restore-session-%s", dir, stage_id)
+	defer {
+		if len(staged_session) > 0 {
+			os.remove(staged_session)
+			delete(staged_session)
+		}
+	}
+	if werr := write_restored_file(staged_session, session_content); werr != "" {
+		return fmt.aprintf("writing %s: %s", h.session.path, werr)
+	}
+
 	// Retire the session being replaced first, exactly as /new would.
 	if nerr := cmd_new(h); nerr != "" do return nerr
 
-	for e in extra {
-		if werr := write_restored_file(join_path(dir, e.name), e.content); werr != "" {
-			return fmt.aprintf("restoring %s: %s", e.name, werr)
+	for e, i in extra {
+		final := join_path(dir, e.name)
+		if rerr := os.rename(staged_extra[i], final); rerr != nil {
+			delete(final)
+			return fmt.aprintf("restoring %s: %v", e.name, rerr)
 		}
+		delete(final)
+		delete(staged_extra[i])
+		staged_extra[i] = ""
 	}
-	if werr := write_session_file(h.session.path, transmute([]byte)session_content); werr != "" {
-		return fmt.aprintf("writing %s: %s", h.session.path, werr)
+	if rerr := os.rename(staged_session, h.session.path); rerr != nil {
+		return fmt.aprintf("writing %s: %v", h.session.path, rerr)
 	}
+	delete(staged_session)
+	staged_session = ""
 	sync.mutex_lock(&h.state_mutex)
 	lerr := session_reload(&h.session)
 	sync.mutex_unlock(&h.state_mutex)

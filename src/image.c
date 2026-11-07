@@ -67,9 +67,16 @@ static size_t mi_image_write_cb(char *ptr, size_t size, size_t nmemb, void *ud) 
 static pthread_once_t mi_image_curl_once = PTHREAD_ONCE_INIT;
 static void mi_image_curl_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
+static int mi_image_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                                curl_off_t ultotal, curl_off_t ulnow) {
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    volatile int *cancel = (volatile int *)ud;
+    return (cancel != NULL && *cancel) ? 1 : 0;
+}
+
 // Download a URL into a malloc'd buffer. Returns NULL on failure; the caller
 // frees successful buffers with mi_image_buf_free.
-unsigned char *mi_image_http_get(const char *url, size_t max, size_t *out_len) {
+unsigned char *mi_image_http_get(const char *url, size_t max, size_t *out_len, volatile int *cancel) {
     if (url == NULL || url[0] == 0 || max == 0 || out_len == NULL) return NULL;
     *out_len = 0;
     pthread_once(&mi_image_curl_once, mi_image_curl_init);
@@ -91,6 +98,9 @@ unsigned char *mi_image_http_get(const char *url, size_t max, size_t *out_len) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "MiAgent/1.0");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, mi_image_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, mi_image_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
 
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);

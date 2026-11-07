@@ -65,3 +65,56 @@ test_harness_archive_load_accepts_path_with_spaces :: proc(t: ^testing.T) {
 	defer delete(data)
 	testing.expect_value(t, string(data), content)
 }
+
+// Loading the same foreign archive twice used to retire the live session and
+// then fail while restoring an existing compaction file. Staging must make the
+// second load replace the file without losing the active session.
+@(test)
+test_foreign_archive_load_twice_is_transactional :: proc(t: ^testing.T) {
+	dir := fmt.aprintf("/tmp/miagent-load-twice-%d", time.to_unix_nanoseconds(time.now()))
+	defer delete(dir)
+	if !testing.expectf(t, os.make_directory_all(dir) == nil, "creating %s", dir) do return
+	defer os.remove_all(dir)
+
+	session_path := join_path(dir, "session.jsonl")
+	defer delete(session_path)
+	target := join_path(dir, "foreign.tar.gz")
+	defer delete(target)
+
+	session_content := `{"role":"assistant","content":"foreign answer"}` + "\n"
+	entries := make([]Archive_Entry, 2)
+	entries[0] = Archive_Entry{name = strings.clone("other.jsonl"), content = strings.clone(session_content)}
+	entries[1] = Archive_Entry{
+		name = strings.clone("prepak-20240101T000000Z-other.jsonl.tar.gz"),
+		content = strings.clone("not a real nested archive"),
+	}
+	defer archive_entries_destroy(entries)
+	if err := archive_pack(target, nil, entries); err != "" do testing.fail_now(t, err)
+
+	h := Harness{}
+	h.session = session_init(session_path)
+	defer session_destroy(&h.session)
+	defer {
+		for &ev in h.events do event_destroy(&ev)
+		delete(h.events)
+	}
+	defer {
+		for &w in h.work {
+			delete(w.prompt)
+			delete(w.archive)
+		}
+		delete(h.work)
+	}
+
+	if err := cmd_load_target(&h, target); err != "" do testing.fail_now(t, err)
+	if !testing.expect_value(t, len(h.session.items), 1) do return
+	extra_path := join_path(dir, entries[1].name)
+	defer delete(extra_path)
+	if !testing.expect(t, os.exists(extra_path), "first load must restore the compaction archive") do return
+
+	if err := cmd_load_target(&h, target); err != "" do testing.fail_now(t, err)
+	if !testing.expect_value(t, len(h.session.items), 1) do return
+	testing.expect_value(t, h.session.items[0].content, "foreign answer")
+	testing.expect(t, os.exists(session_path), "second load must leave an active session file")
+	testing.expect(t, os.exists(extra_path), "second load must leave the restored compaction archive")
+}

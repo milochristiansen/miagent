@@ -39,6 +39,7 @@ foreign harness_http {
 		errbuf: [^]u8,
 		errcap: uint,
 	) -> i32 ---
+	mi_kill_process_tree :: proc(pid: i32) -> i32 ---
 }
 
 DEFAULT_BASE_URL :: "https://api.openai.com/v1"
@@ -531,11 +532,12 @@ parse_usage :: proc(response: json.Value) -> (Usage, bool) {
 }
 
 SSE_State :: struct {
-	h:       ^Harness,
-	turn:    ^Turn_Accum,
-	pending: strings.Builder,
-	data:    strings.Builder,
-	aborted: bool,
+	h:         ^Harness,
+	turn:      ^Turn_Accum,
+	pending:   strings.Builder,
+	data:      strings.Builder,
+	aborted:   bool,
+	emit_live: bool,
 }
 
 sse_write_cb :: proc "c" (userdata: rawptr, data: cstring, size: uint) -> uint {
@@ -608,20 +610,20 @@ handle_stream_event :: proc(state: ^SSE_State, payload: string) {
 		if len(ev.delta) > 0 {
 			a.progress = true
 			add_reasoning_delta(a, ev.item_id, false, ev.content_index, ev.delta)
-			h_emit_reasoning_delta(h, ev.delta)
+			if state.emit_live do h_emit_reasoning_delta(h, ev.delta)
 		}
 	case "response.reasoning_summary_text.delta":
 		if len(ev.delta) > 0 {
 			a.progress = true
 			add_reasoning_delta(a, ev.item_id, true, ev.summary_index, ev.delta)
-			h_emit_reasoning_delta(h, ev.delta)
+			if state.emit_live do h_emit_reasoning_delta(h, ev.delta)
 		}
 	case "response.output_text.delta":
 		if len(ev.delta) > 0 {
 			a.progress = true
 			a.got_assistant_delta = true
 			strings.write_string(&a.assistant, ev.delta)
-			h_emit_assistant_delta(h, ev.delta)
+			if state.emit_live do h_emit_assistant_delta(h, ev.delta)
 		}
 	case "response.function_call_arguments.delta":
 		if len(ev.item_id) > 0 {
@@ -672,7 +674,7 @@ handle_stream_event :: proc(state: ^SSE_State, payload: string) {
 		if !a.got_assistant_delta {
 			if text := assistant_text_of(a.final_items); len(text) > 0 {
 				strings.write_string(&a.assistant, text)
-				h_emit_assistant_delta(h, text)
+				if state.emit_live do h_emit_assistant_delta(h, text)
 				a.progress = true
 			}
 		}
@@ -731,7 +733,7 @@ marshal_request :: proc(request: Request) -> ([]byte, json.Marshal_Error) {
 // stream_model_turn performs one streaming request. On success it returns the
 // response items and usage. On failure it returns the partial items plus
 // whether any model output arrived.
-stream_model_turn :: proc(h: ^Harness, input: []json.Value, tools: []json.Value) -> (Turn_Accum, string) {
+stream_model_turn :: proc(h: ^Harness, input: []json.Value, tools: []json.Value, emit_live := true) -> (Turn_Accum, string) {
 	a := turn_accum_init()
 	request := Request{
 		model = h.config.model,
@@ -757,7 +759,7 @@ stream_model_turn :: proc(h: ^Harness, input: []json.Value, tools: []json.Value)
 	defer delete(endpoint)
 	turn_info_request(h, request.model, endpoint, len(input), len(tools), len(body), len(h.config.instructions))
 
-	state := SSE_State{h = h, turn = &a}
+	state := SSE_State{h = h, turn = &a, emit_live = emit_live}
 	state.pending = strings.builder_make()
 	state.data = strings.builder_make()
 	defer {

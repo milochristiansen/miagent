@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "harness"
 import "mcp"
 
@@ -29,6 +31,15 @@ Drawer :: struct {
 	anim:    f32,
 	spawned: bool,
 	failed:  bool,
+}
+
+Mcp_Status_Poller :: struct {
+	running: bool,
+	done:    bool,
+	project: string,
+	status:  mcp.Host_Status,
+	mutex:   sync.Mutex,
+	thread:  ^thread.Thread,
 }
 
 App :: struct {
@@ -75,6 +86,7 @@ App :: struct {
 	mcp_status_project:  string,
 	mcp_status_at:       f32,
 	mcp_status_refreshed: bool,
+	mcp_poller:           Mcp_Status_Poller,
 
 	shell: string,
 	home:  string,
@@ -159,6 +171,7 @@ app_destroy :: proc(app: ^App) {
 	delete(app.preview_subtitle)
 	folder_picker_destroy(&app.folder_picker)
 	attachment_picker_destroy(&app.attachment_picker)
+	mcp_status_poller_destroy(app)
 	app_clear_mcp_status(app)
 	delete(app.project_input_error)
 	delete(app.shell)
@@ -218,7 +231,7 @@ app_running_count :: proc(app: ^App) -> int {
 	count := 0
 	for p in app.projects {
 		for t in p.tabs {
-			if t.harness_ready && harness.harness_is_running(&t.harness) do count += 1
+			if t.harness_ready && harness.harness_is_busy(&t.harness) do count += 1
 		}
 	}
 	return count
@@ -307,6 +320,77 @@ app_update_splitter :: proc(app: ^App) {
 
 // --- MCP status card -------------------------------------------------------
 
+mcp_status_poller_worker :: proc(p: ^Mcp_Status_Poller) {
+	sync.mutex_lock(&p.mutex)
+	project := strings.clone(p.project)
+	sync.mutex_unlock(&p.mutex)
+	status := mcp.host_status(project)
+	delete(project)
+	sync.mutex_lock(&p.mutex)
+	mcp.host_status_destroy(&p.status)
+	p.status = status
+	p.done = true
+	sync.mutex_unlock(&p.mutex)
+}
+
+mcp_status_poller_start :: proc(app: ^App, project: string) -> bool {
+	p := &app.mcp_poller
+	if p.running do return false
+	mcp.host_status_destroy(&p.status)
+	delete(p.project)
+	p.project = strings.clone(project)
+	p.done = false
+	p.running = true
+	p.thread = thread.create_and_start_with_poly_data(p, mcp_status_poller_worker, name = "miagent-mcp-status")
+	if p.thread == nil {
+		p.running = false
+		return false
+	}
+	return true
+}
+
+mcp_status_poller_poll :: proc(app: ^App) {
+	p := &app.mcp_poller
+	if !p.running do return
+	sync.mutex_lock(&p.mutex)
+	done := p.done
+	sync.mutex_unlock(&p.mutex)
+	if !done do return
+
+	p.running = false
+	if p.thread != nil {
+		thread.destroy(p.thread)
+		p.thread = nil
+	}
+	sync.mutex_lock(&p.mutex)
+	status := p.status
+	p.status = {}
+	project := p.project
+	p.project = ""
+	p.done = false
+	sync.mutex_unlock(&p.mutex)
+
+	if project == app.mcp_status_project {
+		mcp.host_status_destroy(&app.mcp_status)
+		app.mcp_status = status
+	} else {
+		mcp.host_status_destroy(&status)
+	}
+	delete(project)
+}
+
+mcp_status_poller_destroy :: proc(app: ^App) {
+	p := &app.mcp_poller
+	if p.running {
+		if p.thread != nil do thread.destroy(p.thread)
+		p.thread = nil
+		p.running = false
+	}
+	mcp.host_status_destroy(&p.status)
+	delete(p.project)
+	p.project = ""
+}
+
 app_clear_mcp_status :: proc(app: ^App) {
 	mcp.host_status_destroy(&app.mcp_status)
 	delete(app.mcp_status_project)
@@ -321,6 +405,9 @@ app_refresh_mcp_status :: proc(app: ^App, force: bool = false) {
 		app_clear_mcp_status(app)
 		return
 	}
+	// Never queue multiple host-status requests. Polling happens on a worker
+	// thread; this function only schedules and applies results.
+	if app.mcp_poller.running do return
 	if !force && app.mcp_status_refreshed && app.mcp_status_project == p.path {
 		if app.now - app.mcp_status_at < MCP_STATUS_INTERVAL do return
 	}
@@ -337,6 +424,7 @@ app_refresh_mcp_status :: proc(app: ^App, force: bool = false) {
 	if app.mcp_status_project != p.path {
 		delete(app.mcp_status_project)
 		app.mcp_status_project = strings.clone(p.path)
+		mcp.host_status_destroy(&app.mcp_status)
 	}
 	app.mcp_configured = configured
 	app.mcp_status_at = app.now
@@ -346,9 +434,12 @@ app_refresh_mcp_status :: proc(app: ^App, force: bool = false) {
 		return
 	}
 
-	mcp.host_status_destroy(&app.mcp_status)
-	app.mcp_status = mcp.host_status(p.path)
+	if !mcp_status_poller_start(app, p.path) {
+		mcp.host_status_destroy(&app.mcp_status)
+		app.mcp_status.error = strings.clone("could not start MCP status worker")
+	}
 }
+
 
 // --- frame update ----------------------------------------------------------
 
@@ -453,6 +544,7 @@ app_update :: proc(app: ^App) {
 	}
 
 	app_update_splitter(app)
+	mcp_status_poller_poll(app)
 	app_refresh_mcp_status(app)
 }
 

@@ -15,9 +15,16 @@ Event_Kind :: enum {
 	User,
 	Assistant_Start,
 	Assistant_Delta,
+	// Assistant_Replace sets the current assistant message to exactly `text`.
+	// It is used after a continuation when the provider did not repeat the
+	// carried prefix and the live transcript cannot be corrected by appending.
+	Assistant_Replace,
 	Assistant_End,
 	Reasoning_Start,
 	Reasoning_Delta,
+	// Reasoning_Discard removes the live reasoning block for a model attempt
+	// that is being discarded before a continuation/retry.
+	Reasoning_Discard,
 	Reasoning_End,
 	Tool_Start,
 	Tool_Output,
@@ -160,6 +167,13 @@ h_emit_reasoning_end :: proc(h: ^Harness) {
 	}
 }
 
+h_emit_reasoning_discard :: proc(h: ^Harness) {
+	if h.reasoning_open {
+		h.reasoning_open = false
+		h_emit(h, Event{kind = .Reasoning_Discard})
+	}
+}
+
 h_emit_assistant_delta :: proc(h: ^Harness, delta: string) {
 	if !h.assistant_open {
 		h.assistant_open = true
@@ -173,6 +187,13 @@ h_emit_assistant_end :: proc(h: ^Harness) {
 		h.assistant_open = false
 		h_emit(h, Event{kind = .Assistant_End, meta = clock_string()})
 	}
+}
+
+h_emit_assistant_clear :: proc(h: ^Harness, text: string) {
+	// Used when a continuation cannot proceed: the live partial answer must
+	// not remain when there is no persisted answer to match it.
+	h.assistant_open = false
+	h_emit(h, Event{kind = .Assistant_Replace, text = text})
 }
 
 h_emit_tool_output :: proc(h: ^Harness, call_id: string, stream: Tool_Stream, text: string) {
@@ -239,9 +260,9 @@ harness_init_project_session :: proc(h: ^Harness, project_dir, session_path: str
 		notes = join_notes(notes, "OPENAI_API_KEY is not set")
 	}
 
-	tools, warnings := discover_tools(&h.config)
-	h.tools = tools
-	if len(warnings) > 0 do notes = join_notes(notes, warnings)
+	// Tool discovery is intentionally deferred to the worker's first turn.
+	// It runs subprocesses and, for MCP, IPC; doing it here would block the
+	// GUI thread while a project/tab opens.
 	h.startup_notes = strings.clone(notes)
 	refresh_context(h)
 
@@ -276,7 +297,7 @@ h_reload_runtime :: proc(h: ^Harness, reload_tools: bool) {
 	notes := ""
 	notes_changed := false
 	if reload_tools {
-		tools, warnings := discover_tools(&new_config)
+		tools, warnings := discover_tools(&new_config, &h.cancel)
 		new_tools = tools
 		notes = strings.clone(new_config.setup_error)
 		if len(new_config.model) == 0 {
@@ -334,7 +355,10 @@ harness_destroy :: proc(h: ^Harness) {
 	sync.atomic_store(&h.cancel, 1)
 	sync.cond_signal(&h.work_cond)
 	sync.mutex_unlock(&h.work_mutex)
-	if h.worker != nil do thread.join(h.worker)
+	if h.worker != nil {
+		thread.destroy(h.worker)
+		h.worker = nil
+	}
 
 	for &w in h.work do work_item_destroy(&w)
 	delete(h.work)
@@ -395,13 +419,35 @@ harness_load_archive :: proc(h: ^Harness, archive_path: string) -> bool {
 }
 
 harness_cancel :: proc(h: ^Harness) {
+	// Stop is an explicit cancellation of the current turn *and* anything
+	// queued behind it. The worker clears `cancel` when it dequeues the next
+	// item, so removing queued items here is what makes the user's action
+	// stick.
+	sync.mutex_lock(&h.work_mutex)
 	sync.atomic_store(&h.cancel, 1)
+	for &w in h.work do work_item_destroy(&w)
+	clear(&h.work)
+	sync.mutex_unlock(&h.work_mutex)
 }
 
 harness_is_running :: proc(h: ^Harness) -> bool {
 	sync.mutex_lock(&h.work_mutex)
 	defer sync.mutex_unlock(&h.work_mutex)
 	return h.running
+}
+
+// harness_is_busy reports work that is either running or waiting. The UI must
+// use this (not harness_is_running) to decide whether Stop is meaningful.
+harness_is_busy :: proc(h: ^Harness) -> bool {
+	sync.mutex_lock(&h.work_mutex)
+	defer sync.mutex_unlock(&h.work_mutex)
+	return h.running || len(h.work) > 0
+}
+
+harness_queued_count :: proc(h: ^Harness) -> int {
+	sync.mutex_lock(&h.work_mutex)
+	defer sync.mutex_unlock(&h.work_mutex)
+	return len(h.work)
 }
 
 harness_has_queued :: proc(h: ^Harness) -> bool {
@@ -626,6 +672,13 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 	command := strings.has_prefix(prompt, "/")
 	if len(h.config.project_dir) > 0 do h_reload_runtime(h, !command)
 	harness_reset_live(h)
+	if h_cancelled(h) {
+		// Cancellation during config/tool discovery must not append a user
+		// item or start a model request.
+		h_emit_error(h, "interrupted")
+		h_emit(h, Event{kind = .Action_End})
+		return
+	}
 	if command {
 		if len(files) > 0 do h_emit_note(h, "attachments are ignored for slash commands")
 		h_run_command(h, prompt)
@@ -956,6 +1009,23 @@ combined_answer :: proc(carry, attempt_answer, attempt_text: string) -> string {
 	return fmt.aprintf("%s%s", carry, answer)
 }
 
+// emit_continuation_display aligns the live transcript with the answer that
+// will be persisted. Live deltas for a continuation attempt are suppressed,
+// so either append the non-carried suffix or replace the block when the
+// provider did not repeat the carried prefix.
+emit_continuation_display :: proc(h: ^Harness, carry: string, answer: string) {
+	if len(answer) == 0 do return
+	if len(carry) == 0 {
+		h_emit_assistant_delta(h, answer)
+		return
+	}
+	if strings.has_prefix(answer, carry) {
+		if len(answer) > len(carry) do h_emit_assistant_delta(h, answer[len(carry):])
+		return
+	}
+	h_emit(h, Event{kind = .Assistant_Replace, text = answer})
+}
+
 // run_model_turn runs one model turn with the CLI's retry/continuation policy.
 run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []json.Value) -> (
 	items: []StoredItem,
@@ -989,6 +1059,8 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 			if len(continue_prompt) == 0 {
 				p, perr := load_optional_prompt(h.config.config_dir, "CONTINUE.md", true)
 				if perr != "" {
+					if h.assistant_open do h_emit_assistant_clear(h, "")
+					h_emit_reasoning_discard(h)
 					err = perr
 					items = []StoredItem{}
 					return
@@ -1001,7 +1073,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 			input = extra[:]
 		}
 
-		accum, aerr_raw := stream_model_turn(h, input, tools)
+		accum, aerr_raw := stream_model_turn(h, input, tools, !continuing)
 		aerr := strings.clone(aerr_raw)
 		attempt_text := strings.clone(strings.to_string(accum.assistant))
 		attempt_items := take_turn_items(&accum)
@@ -1017,12 +1089,18 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 		}
 
 		if aerr == "" {
-			answer := combined_answer(strings.to_string(carry), assistant_text_of(attempt_items), attempt_text)
+			carry_text := strings.to_string(carry)
+			answer := combined_answer(carry_text, assistant_text_of(attempt_items), attempt_text)
 			attempt_items = with_assistant_text(attempt_items, answer)
-			// Echo any remainder the display did not see.
-			streamed := fmt.aprintf("%s%s", strings.to_string(carry), attempt_text)
-			if len(answer) > len(streamed) && strings.has_prefix(answer, streamed) {
-				h_emit_assistant_delta(h, answer[len(streamed):])
+			if continuing {
+				emit_continuation_display(h, carry_text, answer)
+			} else {
+				// Echo any remainder the display did not see.
+				streamed := fmt.aprintf("%s%s", carry_text, attempt_text)
+				if len(answer) > len(streamed) && strings.has_prefix(answer, streamed) {
+					h_emit_assistant_delta(h, answer[len(streamed):])
+				}
+				delete(streamed)
 			}
 			delete(attempt_text)
 			h_emit_assistant_end(h)
@@ -1035,6 +1113,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 		attempt_items = with_assistant_text(attempt_items, answer)
 
 		if h_cancelled(h) {
+			if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
 			delete(attempt_text)
 			h_emit_assistant_end(h)
 			h_emit_reasoning_end(h)
@@ -1043,12 +1122,17 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 
 		if attempt_progress {
 			if continuations >= MAX_MODEL_CONTINUATIONS {
+				if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
 				delete(attempt_text)
 				h_emit_assistant_end(h)
 				h_emit_reasoning_end(h)
 				return attempt_items, attempt_usage, attempt_got_usage, false,
 					fmt.aprintf("model turn did not complete after %d continuation attempts: %s", continuations, aerr)
 			}
+			// The attempt is being discarded. Its reasoning is not part of the
+			// persisted session, so remove the live block rather than
+			// appending the next attempt's thinking to it.
+			h_emit_reasoning_discard(h)
 			continuations += 1
 			strings.write_string(&carry, attempt_text)
 			delete(attempt_text)
@@ -1060,6 +1144,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 		}
 
 		if retries >= MAX_MODEL_RETRIES {
+			if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
 			delete(attempt_text)
 			h_emit_assistant_end(h)
 			h_emit_reasoning_end(h)

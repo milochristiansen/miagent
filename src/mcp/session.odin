@@ -57,6 +57,8 @@ Mcp_Session :: struct {
 	error:     string,
 	logs:      string,
 	tools:     []Advertised_Tool,
+	failed_at: time.Tick,
+	stopping:  bool,
 
 	// Capabilities from initialize. They are set before the session becomes
 	// Ready and are read under status_mu.
@@ -68,6 +70,10 @@ Mcp_Session :: struct {
 	init_cond:    sync.Cond,
 	initializing: bool,
 	initialized:  bool,
+	// Serializes transport start and teardown. It is deliberately separate
+	// from init_mu: waiters must be able to observe initialization without
+	// blocking a shutdown that needs to clean up the transport.
+	lifecycle_mu: sync.Mutex,
 
 	rpc_mu:   sync.Mutex,
 	rpc_cond: sync.Cond,
@@ -85,6 +91,7 @@ Mcp_Session :: struct {
 	stderr_reader:   ^thread.Thread,
 	waiter:          ^thread.Thread,
 
+	http_mu:              sync.Mutex,
 	http_session_id:      string,
 	http_protocol_version: string,
 
@@ -114,7 +121,7 @@ session_new :: proc(project: string, cfg: ^Server_Config, base_env: map[string]s
 	s.project = strings.clone(project)
 	s.config = server_clone(cfg)
 	s.base_env = clone_string_map(base_env)
-	s.fingerprint = strings.concatenate({server_fingerprint(cfg), env_fingerprint(base_env)})
+	s.fingerprint = server_fingerprint(cfg)
 	s.state = .New
 	s.rpc_mu = {}
 	s.rpc_cond = {}
@@ -123,57 +130,87 @@ session_new :: proc(project: string, cfg: ^Server_Config, base_env: map[string]s
 	return s
 }
 
-session_set_state :: proc(s: ^Mcp_Session, state: Session_State, err: string) {
+session_set_state :: proc(s: ^Mcp_Session, state: Session_State, err: string) -> bool {
 	sync.mutex_lock(&s.status_mu)
+	current := s.state
+	// Closed is terminal. Failed may only go to Closed (or stay Failed), so a
+	// late pipe write cannot resurrect a failed/closed session as Starting or
+	// Ready.
+	if current == .Closed && state != .Closed {
+		sync.mutex_unlock(&s.status_mu)
+		return false
+	}
+	if current == .Failed && state != .Closed && state != .Failed {
+		sync.mutex_unlock(&s.status_mu)
+		return false
+	}
+	if state == .Starting && current != .New {
+		sync.mutex_unlock(&s.status_mu)
+		return false
+	}
 	s.state = state
 	delete(s.error)
 	s.error = strings.clone(err)
+	if state == .Failed || state == .Closed do s.failed_at = time.tick_now()
 	sync.mutex_unlock(&s.status_mu)
+	return true
 }
+
+LOG_CAP :: 8192
+TOOLS_LIST_BUDGET :: 45 * time.Second
+RESOURCE_LIST_BUDGET :: 45 * time.Second
+SESSION_INIT_TIMEOUT_MS :: 30_000
 
 session_append_log :: proc(s: ^Mcp_Session, text: string) {
 	if len(text) == 0 do return
 	sync.mutex_lock(&s.status_mu)
 	combined := strings.concatenate({s.logs, text})
-	if len(combined) > 8192 do combined = combined[len(combined) - 8192:]
 	delete(s.logs)
-	s.logs = strings.clone(combined)
-	delete(combined)
+	if len(combined) > LOG_CAP {
+		// Keep the tail, but never free an interior pointer. `combined` owns
+		// the whole allocation, so clone the tail before releasing it.
+		s.logs = strings.clone(combined[len(combined) - LOG_CAP:])
+		delete(combined)
+	} else {
+		s.logs = combined
+	}
 	sync.mutex_unlock(&s.status_mu)
+}
+
+session_stopping :: proc(s: ^Mcp_Session) -> bool {
+	sync.mutex_lock(&s.status_mu)
+	defer sync.mutex_unlock(&s.status_mu)
+	return s.stopping
+}
+
+session_wake_pending :: proc(s: ^Mcp_Session, message: string) {
+	sync.mutex_lock(&s.rpc_mu)
+	for _, p in s.pending {
+		if !p.done {
+			p.done = true
+			p.err = strings.clone(message)
+		}
+	}
+	sync.cond_broadcast(&s.rpc_cond)
+	sync.mutex_unlock(&s.rpc_mu)
 }
 
 session_fail :: proc(s: ^Mcp_Session, message: string) {
-	session_set_state(s, .Failed, message)
-	sync.mutex_lock(&s.rpc_mu)
-	for _, p in s.pending {
-		if !p.done {
-			p.done = true
-			p.err = strings.clone(message)
-		}
-	}
-	sync.cond_broadcast(&s.rpc_cond)
-	sync.mutex_unlock(&s.rpc_mu)
+	if !session_set_state(s, .Failed, message) do return
+	session_wake_pending(s, message)
 }
 
 session_closed :: proc(s: ^Mcp_Session, message: string) {
-	sync.mutex_lock(&s.status_mu)
-	if s.state == .Closed || s.state == .Failed {
-		sync.mutex_unlock(&s.status_mu)
-		return
-	}
-	s.state = .Closed
-	delete(s.error)
-	s.error = strings.clone(message)
-	sync.mutex_unlock(&s.status_mu)
-	sync.mutex_lock(&s.rpc_mu)
-	for _, p in s.pending {
-		if !p.done {
-			p.done = true
-			p.err = strings.clone(message)
-		}
-	}
-	sync.cond_broadcast(&s.rpc_cond)
-	sync.mutex_unlock(&s.rpc_mu)
+	if !session_set_state(s, .Closed, message) do return
+	session_wake_pending(s, message)
+}
+
+session_ready_error :: proc(s: ^Mcp_Session, timed_out: bool) -> string {
+	if err := session_error(s); err != "" do return err
+	state := session_state(s)
+	if state == .Ready do return ""
+	if timed_out do return "timed out waiting for MCP session initialization"
+	return fmt.aprintf("MCP session is not ready (%s)", state_string(state))
 }
 
 session_ensure_ready :: proc(s: ^Mcp_Session) -> string {
@@ -183,15 +220,23 @@ session_ensure_ready :: proc(s: ^Mcp_Session) -> string {
 		return session_error(s)
 	}
 	if s.initializing {
-		deadline := s.config.timeout_ms + 15_000
+		deadline := min(s.config.timeout_ms, SESSION_INIT_TIMEOUT_MS) + 15_000
+		timed_out := false
 		for !s.initialized {
+			state := session_state(s)
+			if state == .Failed || state == .Closed do break
 			if !sync.cond_wait_with_timeout(&s.init_cond, &s.init_mu, 100 * time.Millisecond) {
 				deadline -= 100
-				if deadline <= 0 do break
+				if deadline <= 0 {
+					timed_out = true
+					break
+				}
 			}
 		}
+		initialized := s.initialized
 		sync.mutex_unlock(&s.init_mu)
-		return session_error(s)
+		if !initialized && timed_out do return "timed out waiting for MCP session initialization"
+		return session_ready_error(s, false)
 	}
 	s.initializing = true
 	sync.mutex_unlock(&s.init_mu)
@@ -205,8 +250,9 @@ session_ensure_ready :: proc(s: ^Mcp_Session) -> string {
 	sync.cond_broadcast(&s.init_cond)
 	sync.mutex_unlock(&s.init_mu)
 	if serr != "" do return serr
-	return session_error(s)
+	return session_ready_error(s, false)
 }
+
 
 session_error :: proc(s: ^Mcp_Session) -> string {
 	sync.mutex_lock(&s.status_mu)
@@ -351,8 +397,57 @@ free_env_strings :: proc(env: []string) {
 	delete(env)
 }
 
+// session_close_transport_locked tears down the transport. The caller must
+// hold lifecycle_mu. It is used by both normal shutdown and every failed start
+// path so a failed session cannot leak pipes, threads, or a child process.
+session_close_transport_locked :: proc(s: ^Mcp_Session) {
+	switch s.config.transport {
+	case .Stdio:
+		if s.stdin != nil {
+			os.close(s.stdin)
+			s.stdin = nil
+		}
+		if s.process_started {
+			_ = os.process_terminate(s.process)
+			time.sleep(200 * time.Millisecond)
+			_ = os.process_kill(s.process)
+			s.process_started = false
+		}
+		// Close the descriptors but keep the fields valid until the reader
+		// threads have observed the close. Nilling them first races a reader
+		// that is between `os.read` calls and dereferences a nil file.
+		if s.stdout_r != nil do os.close(s.stdout_r)
+		if s.stderr_r != nil do os.close(s.stderr_r)
+		if s.reader != nil { thread.destroy(s.reader); s.reader = nil }
+		if s.stderr_reader != nil { thread.destroy(s.stderr_reader); s.stderr_reader = nil }
+		if s.waiter != nil { thread.destroy(s.waiter); s.waiter = nil }
+		s.stdout_r = nil
+		s.stderr_r = nil
+	case .Streamable_HTTP:
+		sync.mutex_lock(&s.http_mu)
+		has_id := len(s.http_session_id) > 0
+		sync.mutex_unlock(&s.http_mu)
+		if has_id {
+			headers := http_headers(s)
+			defer delete(headers)
+			res, _, _ := http_request("DELETE", s.config.url, headers, "", 2_000)
+			http_result_free(&res)
+			sync.mutex_lock(&s.http_mu)
+			delete(s.http_session_id)
+			s.http_session_id = ""
+			sync.mutex_unlock(&s.http_mu)
+		}
+	case .SSE:
+	}
+}
+
 session_start :: proc(s: ^Mcp_Session) -> string {
-	session_set_state(s, .Starting, "")
+	sync.mutex_lock(&s.lifecycle_mu)
+	defer sync.mutex_unlock(&s.lifecycle_mu)
+	if session_stopping(s) do return "session is stopping"
+	if !session_set_state(s, .Starting, "") {
+		return fmt.aprintf("cannot start MCP session from %s", state_string(session_state(s)))
+	}
 	switch s.config.transport {
 	case .Stdio:
 		return session_start_stdio(s)
@@ -366,6 +461,7 @@ session_start :: proc(s: ^Mcp_Session) -> string {
 
 session_start_stdio :: proc(s: ^Mcp_Session) -> string {
 	if len(s.config.command) == 0 do return "server command is empty"
+	if session_stopping(s) do return "session is stopping"
 
 	env := session_env(s)
 	defer free_env_strings(env)
@@ -430,25 +526,50 @@ session_start_stdio :: proc(s: ^Mcp_Session) -> string {
 	s.reader = thread.create_and_start_with_poly_data(s, session_stdout_reader)
 	s.stderr_reader = thread.create_and_start_with_poly_data(s, session_stderr_reader)
 	s.waiter = thread.create_and_start_with_poly_data(s, session_waiter)
+	if s.reader == nil || s.stderr_reader == nil || s.waiter == nil {
+		session_close_transport_locked(s)
+		return "could not start MCP transport threads"
+	}
+	if session_stopping(s) {
+		session_close_transport_locked(s)
+		return "session is stopping"
+	}
 
-	res, err := session_rpc(s, "initialize", initialize_params(), s.config.timeout_ms)
+	res, err := session_rpc(s, "initialize", initialize_params(), min(s.config.timeout_ms, SESSION_INIT_TIMEOUT_MS))
 	if err != "" {
-		_ = os.process_terminate(process)
+		session_close_transport_locked(s)
 		return err
 	}
 	ro, ok := jobj(res)
 	if ok {
 		session_capture_capabilities(s, res)
 		if v := jstr(jget(ro, "protocolVersion")); len(v) > 0 {
+			sync.mutex_lock(&s.http_mu)
+			delete(s.http_protocol_version)
 			s.http_protocol_version = strings.clone(v)
+			sync.mutex_unlock(&s.http_mu)
 		}
 	}
 	json.destroy_value(res)
 
+	if session_stopping(s) {
+		session_close_transport_locked(s)
+		return "session is stopping"
+	}
 	notify := jsonrpc_notification("notifications/initialized", nil)
-	if nerr := session_send_line(s, notify); nerr != "" do return nerr
+	defer delete(notify)
+	if nerr := session_send_line(s, notify); nerr != "" {
+		session_close_transport_locked(s)
+		return nerr
+	}
 
-	return session_load_tools(s)
+	lerr := session_load_tools(s)
+	if lerr != "" || session_stopping(s) {
+		session_close_transport_locked(s)
+		if lerr != "" do return lerr
+		return "session is stopping"
+	}
+	return ""
 }
 
 session_stdout_reader :: proc(s: ^Mcp_Session) {
@@ -506,7 +627,9 @@ session_consume_lines :: proc(s: ^Mcp_Session, b: ^strings.Builder) {
 session_handle_line :: proc(s: ^Mcp_Session, line: string) {
 	msg: Rpc_Incoming
 	if err := json.unmarshal_string(line, &msg); err != nil {
-		session_append_log(s, fmt.aprintf("invalid JSON from MCP server: %v\n", err))
+		note := fmt.aprintf("invalid JSON from MCP server: %v\n", err)
+		session_append_log(s, note)
+		delete(note)
 		return
 	}
 	defer {
@@ -531,7 +654,9 @@ session_handle_line :: proc(s: ^Mcp_Session, line: string) {
 				response = jsonrpc_result_response(msg.id, o)
 				json.destroy_value(o)
 			case:
-				response = jsonrpc_error_response(msg.id, -32601, fmt.aprintf("unsupported method: %s", msg.method))
+				detail := fmt.aprintf("unsupported method: %s", msg.method)
+				response = jsonrpc_error_response(msg.id, -32601, detail)
+				delete(detail)
 			}
 			if len(response) > 0 do _ = session_send_line(s, response)
 		}
@@ -610,9 +735,14 @@ session_rpc :: proc(s: ^Mcp_Session, method: string, params: json.Value, timeout
 	sync.mutex_unlock(&s.rpc_mu)
 	free(p)
 
-	if len(err) > 0 do return nil, err
+	if len(err) > 0 {
+		delete(raw)
+		return nil, err
+	}
 	if len(raw) == 0 do return nil, "MCP server returned no response"
-	return parse_rpc_result(raw)
+	result, perr := parse_rpc_result(raw)
+	delete(raw)
+	return result, perr
 }
 
 // session_request dispatches an RPC over whichever transport the session uses.
@@ -626,6 +756,7 @@ parse_rpc_result :: proc(raw: string) -> (json.Value, string) {
 	if err := json.unmarshal_string(raw, &resp); err != nil do return nil, fmt.aprintf("decoding MCP response: %v", err)
 	if len(resp.error.message) > 0 {
 		msg := fmt.aprintf("MCP error %d: %s", resp.error.code, resp.error.message)
+		delete(resp.error.message)
 		json.destroy_value(resp.error.data)
 		json.destroy_value(resp.result)
 		return nil, msg
@@ -634,7 +765,10 @@ parse_rpc_result :: proc(raw: string) -> (json.Value, string) {
 		json.destroy_value(resp.error.data)
 		return make(json.Object), ""
 	}
-	return json.clone_value(resp.result), ""
+	result := json.clone_value(resp.result)
+	json.destroy_value(resp.result)
+	json.destroy_value(resp.error.data)
+	return result, ""
 }
 
 initialize_params :: proc() -> json.Value {
@@ -651,22 +785,37 @@ initialize_params :: proc() -> json.Value {
 
 session_load_tools :: proc(s: ^Mcp_Session) -> string {
 	tools := make([dynamic]Advertised_Tool, 0, 16)
+	tool_index := make(map[string]int, 16)
+	defer {
+		for k in tool_index do delete(k)
+		delete(tool_index)
+	}
+	start := time.tick_now()
 	cursor := ""
 	pages := 0
+	abort_reason := ""
 	for {
+		if session_stopping(s) {
+			abort_reason = "session is stopping"
+			break
+		}
+		if time.tick_since(start) > TOOLS_LIST_BUDGET {
+			abort_reason = "tools/list exceeded the initialization budget"
+			break
+		}
 		params := make(json.Object)
 		if len(cursor) > 0 do obj_set(&params, "cursor", str_value(cursor))
-		res, err := session_request(s, "tools/list", params, s.config.timeout_ms)
+		res, err := session_request(s, "tools/list", params, min(s.config.timeout_ms, SESSION_INIT_TIMEOUT_MS))
 		json.destroy_value(params)
 		if err != "" {
 			// A server without tools is still useful for resources/prompts;
 			// tolerate method-not-found and report zero tools.
 			if strings.contains(err, "-32601") || strings.contains(strings.to_lower(err), "method not found") {
-				delete(cursor)
 				break
 			}
 			session_fail(s, err)
-			return err
+			abort_reason = err
+			break
 		}
 		ro, ok := jobj(res)
 		if !ok {
@@ -683,26 +832,53 @@ session_load_tools :: proc(s: ^Mcp_Session) -> string {
 				if params_val == nil do params_val = json.Null(nil)
 				description := jstr(jget(to, "description"))
 				if len(description) == 0 do description = jstr(jget(to, "title"))
-				append(&tools, Advertised_Tool{
+				tool := Advertised_Tool{
 					server = strings.clone(s.config.name),
 					name = strings.clone(name),
 					function_name = function_name(s.config.name, name),
 					title = strings.clone(jstr(jget(to, "title"))),
 					description = strings.clone(description),
 					parameters = json.clone_value(params_val),
-				})
+				}
+				// A paginated server can repeat a tool (and a buggy server can
+				// list the same name twice). Keep one entry per server tool;
+				// the last definition wins.
+				if idx, exists := tool_index[name]; exists {
+					advertised_tool_destroy(&tools[idx])
+					tools[idx] = tool
+				} else {
+					tool_index[strings.clone(name)] = len(tools)
+					append(&tools, tool)
+				}
 			}
 		}
-		next := jstr(jget(ro, "nextCursor"))
+		// `nextCursor` is a view into `res`; clone it before destroying the
+		// JSON value. This was a use-after-free that produced garbage cursors.
+		next := strings.clone(jstr(jget(ro, "nextCursor")))
 		json.destroy_value(res)
 		pages += 1
-		if len(next) == 0 || pages >= 100 do break
+		if len(next) == 0 || pages >= 100 {
+			delete(next)
+			break
+		}
 		delete(cursor)
-		cursor = strings.clone(next)
+		cursor = next
 	}
 	delete(cursor)
 
+	if abort_reason != "" {
+		for &t in tools do advertised_tool_destroy(&t)
+		delete(tools)
+		return abort_reason
+	}
+
 	sync.mutex_lock(&s.status_mu)
+	if s.stopping || s.state == .Closed || s.state == .Failed {
+		sync.mutex_unlock(&s.status_mu)
+		for &t in tools do advertised_tool_destroy(&t)
+		delete(tools)
+		return "session is stopping"
+	}
 	for &t in s.tools do advertised_tool_destroy(&t)
 	delete(s.tools)
 	s.tools = tools[:]
@@ -717,9 +893,11 @@ session_load_tools :: proc(s: ^Mcp_Session) -> string {
 
 session_collect_list :: proc(s: ^Mcp_Session, method, key: string, limit, timeout_ms: int) -> (json.Array, string) {
 	out := make(json.Array, 0, 16)
+	start := time.tick_now()
 	cursor := ""
 	pages := 0
 	for {
+		if session_stopping(s) || time.tick_since(start) > RESOURCE_LIST_BUDGET do break
 		params := make(json.Object)
 		if len(cursor) > 0 do obj_set(&params, "cursor", str_value(cursor))
 		res, err := session_request(s, method, params, timeout_ms)
@@ -747,12 +925,15 @@ session_collect_list :: proc(s: ^Mcp_Session, method, key: string, limit, timeou
 				append(&out, json.clone_value(raw))
 			}
 		}
-		next := jstr(jget(ro, "nextCursor"))
+		next := strings.clone(jstr(jget(ro, "nextCursor")))
 		json.destroy_value(res)
 		pages += 1
-		if len(next) == 0 || pages >= 50 || len(out) >= limit do break
+		if len(next) == 0 || pages >= 50 || len(out) >= limit {
+			delete(next)
+			break
+		}
 		delete(cursor)
-		cursor = strings.clone(next)
+		cursor = next
 	}
 	delete(cursor)
 	return out, ""
@@ -790,26 +971,47 @@ session_read_resource :: proc(s: ^Mcp_Session, uri: string) -> (json.Value, stri
 
 session_start_http :: proc(s: ^Mcp_Session) -> string {
 	if len(s.config.url) == 0 do return "server url is empty"
-	res, err := session_http_rpc(s, "initialize", initialize_params(), s.config.timeout_ms)
-	if err != "" do return err
+	if session_stopping(s) do return "session is stopping"
+	res, err := session_http_rpc(s, "initialize", initialize_params(), min(s.config.timeout_ms, SESSION_INIT_TIMEOUT_MS))
+	if err != "" {
+		session_close_transport_locked(s)
+		return err
+	}
 	ro, ok := jobj(res)
 	if ok {
 		session_capture_capabilities(s, res)
 		if v := jstr(jget(ro, "protocolVersion")); len(v) > 0 {
+			sync.mutex_lock(&s.http_mu)
 			delete(s.http_protocol_version)
 			s.http_protocol_version = strings.clone(v)
+			sync.mutex_unlock(&s.http_mu)
 		}
 	}
 	json.destroy_value(res)
+	if session_stopping(s) {
+		session_close_transport_locked(s)
+		return "session is stopping"
+	}
 
 	payload := jsonrpc_notification("notifications/initialized", nil)
 	defer delete(payload)
-	if nerr := session_http_send(s, payload, s.config.timeout_ms); nerr != "" do return nerr
-	return session_load_tools(s)
+	if nerr := session_http_send(s, payload, s.config.timeout_ms); nerr != "" {
+		session_close_transport_locked(s)
+		return nerr
+	}
+	lerr := session_load_tools(s)
+	if lerr != "" || session_stopping(s) {
+		session_close_transport_locked(s)
+		if lerr != "" do return lerr
+		return "session is stopping"
+	}
+	return ""
 }
 
 http_headers :: proc(s: ^Mcp_Session) -> string {
 	b := strings.builder_make()
+	sync.mutex_lock(&s.http_mu)
+	defer sync.mutex_unlock(&s.http_mu)
 	for k, v in s.config.headers {
 		strings.write_string(&b, k)
 		strings.write_string(&b, ": ")
@@ -858,11 +1060,14 @@ session_http_rpc :: proc(s: ^Mcp_Session, method: string, params: json.Value, ti
 		return nil, fmt.aprintf("MCP HTTP server returned %d: %s", res.status, detail)
 	}
 	if len(res.session_id) > 0 && res.session_id[0] != 0 {
+		sync.mutex_lock(&s.http_mu)
 		delete(s.http_session_id)
 		s.http_session_id = strings.clone(cstring_string(res.session_id[:]))
+		sync.mutex_unlock(&s.http_mu)
 	}
 
 	ctype := strings.to_lower(cstring_string(res.content_type[:]))
+	defer delete(ctype)
 	if strings.contains(ctype, "text/event-stream") {
 		events := sse_data_events(body)
 		defer {
@@ -875,6 +1080,7 @@ session_http_rpc :: proc(s: ^Mcp_Session, method: string, params: json.Value, ti
 				if rid, ok := id_int(resp.id); ok && rid == id {
 					if len(resp.error.message) > 0 {
 						msg := fmt.aprintf("MCP error %d: %s", resp.error.code, resp.error.message)
+						delete(resp.error.message)
 						json.destroy_value(resp.error.data)
 						json.destroy_value(resp.result)
 						return nil, msg
@@ -895,6 +1101,7 @@ session_http_rpc :: proc(s: ^Mcp_Session, method: string, params: json.Value, ti
 	if uerr := json.unmarshal_string(body, &resp); uerr != nil do return nil, fmt.aprintf("decoding MCP HTTP response: %v", uerr)
 	if len(resp.error.message) > 0 {
 		msg := fmt.aprintf("MCP error %d: %s", resp.error.code, resp.error.message)
+		delete(resp.error.message)
 		json.destroy_value(resp.error.data)
 		json.destroy_value(resp.result)
 		return nil, msg
@@ -974,27 +1181,23 @@ session_refresh_tools :: proc(s: ^Mcp_Session) -> string {
 
 // --- shutdown ---------------------------------------------------------------
 
+session_retry_allowed :: proc(s: ^Mcp_Session, cooldown: time.Duration) -> bool {
+	sync.mutex_lock(&s.status_mu)
+	defer sync.mutex_unlock(&s.status_mu)
+	if s.state != .Failed && s.state != .Closed do return false
+	if s.failed_at._nsec == 0 do return true
+	return time.tick_since(s.failed_at) >= cooldown
+}
+
 session_shutdown :: proc(s: ^Mcp_Session) {
-	if s.config.transport == .Stdio {
-		if s.stdin != nil {
-			os.close(s.stdin)
-			s.stdin = nil
-		}
-		if s.process_started {
-			_ = os.process_terminate(s.process)
-			time.sleep(200 * time.Millisecond)
-			_ = os.process_kill(s.process)
-		}
-		if s.stdout_r != nil { os.close(s.stdout_r); s.stdout_r = nil }
-		if s.stderr_r != nil { os.close(s.stderr_r); s.stderr_r = nil }
-		if s.reader != nil { thread.join(s.reader); s.reader = nil }
-		if s.stderr_reader != nil { thread.join(s.stderr_reader); s.stderr_reader = nil }
-		if s.waiter != nil { thread.join(s.waiter); s.waiter = nil }
-	} else if s.config.transport == .Streamable_HTTP && len(s.http_session_id) > 0 {
-		headers := http_headers(s)
-		defer delete(headers)
-		res, _, _ := http_request("DELETE", s.config.url, headers, "", 2_000)
-		http_result_free(&res)
+	sync.mutex_lock(&s.status_mu)
+	s.stopping = true
+	sync.mutex_unlock(&s.status_mu)
+	if session_set_state(s, .Closed, "host shut down") {
+		session_wake_pending(s, "host shut down")
 	}
-	session_set_state(s, .Closed, "host shut down")
+
+	sync.mutex_lock(&s.lifecycle_mu)
+	defer sync.mutex_unlock(&s.lifecycle_mu)
+	session_close_transport_locked(s)
 }

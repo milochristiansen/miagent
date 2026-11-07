@@ -15,6 +15,8 @@ import "core:time"
 
 HOST_IDLE_ENV :: "MIAGENT_MCP_HOST_IDLE_SECONDS"
 DEFAULT_IDLE_SECONDS :: 24 * 60 * 60
+SESSION_RESTART_COOLDOWN :: 2 * time.Second
+HOST_SESSION_BUDGET :: 60 * time.Second
 
 RESOURCE_LIST_TOOL_NAME :: "resources_list"
 RESOURCE_READ_TOOL_NAME :: "resources_read"
@@ -180,6 +182,9 @@ Host :: struct {
 	sessions: map[string]^Mcp_Session,
 	all:      [dynamic]^Mcp_Session,
 	mu:       sync.Mutex,
+	// Serializes session creation/replacement so two callers cannot race on
+	// the same server key.
+	session_mu: sync.Mutex,
 
 	clients:    int,
 	clients_mu: sync.Mutex,
@@ -191,34 +196,102 @@ Host :: struct {
 	listener: net.TCP_Socket,
 	stop:     bool,
 	stop_mu:  sync.Mutex,
+	token:    string,
 }
 
 session_key :: proc(project, name: string) -> string {
 	return fmt.aprintf("%d:%s%s", len(project), project, name)
 }
 
-host_get_session :: proc(h: ^Host, project: string, cfg: ^Server_Config, base_env: map[string]string) -> ^Mcp_Session {
-	key := session_key(project, cfg.name)
-	fp := strings.concatenate({server_fingerprint(cfg), env_fingerprint(base_env)})
+// host_remove_endpoint removes only the endpoint file owned by this host.
+// A stale host that exits later must not delete a newer host's endpoint.
+host_remove_endpoint :: proc(h: ^Host) {
+	ep, ok, _ := read_endpoint()
+	if !ok do return
+	defer endpoint_destroy(&ep)
+	if ep.pid != os.get_pid() do return
+	if len(h.token) > 0 && ep.token != h.token do return
+	remove_endpoint()
+}
+
+host_is_stopping :: proc(h: ^Host) -> bool {
 	sync.mutex_lock(&h.mu)
 	defer sync.mutex_unlock(&h.mu)
-	if existing, ok := h.sessions[key]; ok {
-		if existing.fingerprint == fp {
+	return h.stop
+}
+
+host_all_remove_locked :: proc(h: ^Host, session: ^Mcp_Session) {
+	for existing, i in h.all {
+		if existing == session {
+			ordered_remove(&h.all, i)
+			return
+		}
+	}
+}
+
+host_get_session :: proc(h: ^Host, project: string, cfg: ^Server_Config, base_env: map[string]string) -> ^Mcp_Session {
+	sync.mutex_lock(&h.session_mu)
+	defer sync.mutex_unlock(&h.session_mu)
+
+	key := session_key(project, cfg.name)
+	fp := server_fingerprint(cfg)
+
+	sync.mutex_lock(&h.mu)
+	if h.stop {
+		sync.mutex_unlock(&h.mu)
+		delete(fp)
+		delete(key)
+		return nil
+	}
+	existing := h.sessions[key]
+	sync.mutex_unlock(&h.mu)
+
+	if existing != nil && existing.fingerprint == fp {
+		state := session_state(existing)
+		if state != .Failed && state != .Closed {
+			delete(fp)
+			delete(key)
+			return existing
+		}
+		// A failed/closed server may be restarted, but not in a tight loop.
+		if !session_retry_allowed(existing, SESSION_RESTART_COOLDOWN) {
 			delete(fp)
 			delete(key)
 			return existing
 		}
 	}
+
+	if existing != nil {
+		// Never leave a replaced process running invisibly in h.all.
+		session_shutdown(existing)
+		sync.mutex_lock(&h.mu)
+		host_all_remove_locked(h, existing)
+		sync.mutex_unlock(&h.mu)
+	}
+
 	s := session_new(project, cfg, base_env)
+	sync.mutex_lock(&h.mu)
+	if h.stop {
+		sync.mutex_unlock(&h.mu)
+		delete(fp)
+		delete(key)
+		session_shutdown(s)
+		return nil
+	}
 	// The map owns the key string; do not free it here.
 	h.sessions[key] = s
 	append(&h.all, s)
+	sync.mutex_unlock(&h.mu)
 	delete(fp)
 	return s
 }
 
 host_shutdown_all :: proc(h: ^Host) {
 	sync.mutex_lock(&h.mu)
+	// Set stopping and snapshot in the same critical section that
+	// host_get_session uses to append. A session created after this point sees
+	// stop and refuses to start, so host exit cannot orphan a child.
+	h.stop = true
 	sessions := make([]^Mcp_Session, len(h.all))
 	copy(sessions, h.all[:])
 	sync.mutex_unlock(&h.mu)
@@ -374,6 +447,29 @@ project_tools :: proc(h: ^Host, project: string, servers: []Server_Config) -> (T
 		if session_supports_resources(session) do append_resource_tools(&all, session)
 	}
 
+	// Collapse duplicate (server, tool) entries before assigning function
+	// names. A paginated or buggy server can repeat a tool; that is the same
+	// tool, not a name collision. Keep the last definition.
+	deduped := make([dynamic]Advertised_Tool, 0, len(all))
+	tool_index := make(map[string]int, len(all))
+	defer {
+		for k in tool_index do delete(k)
+		delete(tool_index)
+	}
+	for &t in all {
+		key := fmt.aprintf("%s\x00%s", t.server, t.name)
+		if idx, exists := tool_index[key]; exists {
+			advertised_tool_destroy(&deduped[idx])
+			deduped[idx] = t
+			delete(key)
+		} else {
+			tool_index[key] = len(deduped)
+			append(&deduped, t)
+		}
+	}
+	delete(all)
+	all = deduped
+
 	// Stable sort by server then tool before assigning collision suffixes.
 	for i in 1 ..< len(all) {
 		j := i
@@ -415,10 +511,33 @@ project_tools :: proc(h: ^Host, project: string, servers: []Server_Config) -> (T
 	return Tool_Projection{tools = all[:], by_name = by_name}, statuses[:], ""
 }
 
-ensure_sessions :: proc(h: ^Host, project: string, servers: []Server_Config, base_env: map[string]string) -> ([]^Mcp_Session, string) {
+ensure_sessions :: proc(
+	h: ^Host,
+	project: string,
+	servers: []Server_Config,
+	base_env: map[string]string,
+	budget: time.Duration = 0,
+) -> ([]^Mcp_Session, string) {
 	out := make([]^Mcp_Session, len(servers))
+	start := time.tick_now()
 	for &cfg, i in servers {
+		if host_is_stopping(h) {
+			delete(out)
+			return nil, "host is shutting down"
+		}
+		// Bound discovery even when several servers are slow to initialize.
+		// A single ensure_ready call is already capped by
+		// SESSION_INIT_TIMEOUT_MS; this prevents N slow servers from
+		// multiplying that budget.
+		if budget > 0 && time.tick_since(start) > budget {
+			delete(out)
+			return nil, "MCP discovery deadline exceeded"
+		}
 		out[i] = host_get_session(h, project, &cfg, base_env)
+		if out[i] == nil {
+			delete(out)
+			return nil, "host is shutting down"
+		}
 		if err := session_ensure_ready(out[i]); err != "" {
 			// A single failed server must not hide the healthy ones.
 			continue
@@ -448,7 +567,9 @@ host_handle_discover :: proc(h: ^Host, params: json.Value) -> (json.Value, strin
 		for &cfg in servers do server_destroy(&cfg)
 		delete(servers)
 	}
-	_, _ = ensure_sessions(h, p.project, servers[:], p.env)
+	sessions, serr := ensure_sessions(h, p.project, servers[:], p.env, HOST_SESSION_BUDGET)
+	defer delete(sessions)
+	if serr != "" do return nil, serr
 	proj, statuses, _ := project_tools(h, p.project, servers[:])
 	defer projection_destroy(&proj)
 	defer {
@@ -688,8 +809,9 @@ host_handle_call :: proc(h: ^Host, params: json.Value) -> (json.Value, string) {
 		for &cfg in servers do server_destroy(&cfg)
 		delete(servers)
 	}
-	sessions, _ := ensure_sessions(h, p.project, servers[:], p.env)
+	sessions, serr := ensure_sessions(h, p.project, servers[:], p.env, HOST_SESSION_BUDGET)
 	defer delete(sessions)
+	if serr != "" do return nil, serr
 
 	proj, statuses, _ := project_tools(h, p.project, servers[:])
 	for st in statuses do json.destroy_value(st)
@@ -856,7 +978,7 @@ host_client :: proc(h: ^Host, sock: net.TCP_Socket) {
 		// daemon.  Exiting here also wakes the blocked accept loop.
 		time.sleep(100 * time.Millisecond)
 		host_shutdown_all(h)
-		remove_endpoint()
+		host_remove_endpoint(h)
 		os.exit(0)
 	}
 }
@@ -903,6 +1025,7 @@ host_run :: proc() -> int {
 		net.close(sock)
 		return 1
 	}
+	h.token = strings.clone(token)
 	ep := Endpoint{
 		version = HOST_VERSION,
 		pid = os.get_pid(),
@@ -937,7 +1060,7 @@ host_run :: proc() -> int {
 		thread.create_and_start_with_poly_data2(h, client, host_client, nil, .Normal, true)
 	}
 	host_shutdown_all(h)
-	remove_endpoint()
+	host_remove_endpoint(h)
 	net.close(sock)
 	return 0
 }
@@ -951,7 +1074,7 @@ host_idle_watchdog :: proc(h: ^Host, idle_seconds: int) {
 		if host_client_count(h) == 0 && idle >= time.Duration(idle_seconds) * time.Second {
 			fmt.eprintln("miagent-mcp-host: idle timeout, shutting down")
 			host_shutdown_all(h)
-			remove_endpoint()
+			host_remove_endpoint(h)
 			os.exit(0)
 		}
 	}

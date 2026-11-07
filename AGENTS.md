@@ -56,6 +56,9 @@ src/
   app.odin        app state, layout constants, per-project drawer lifecycle
   panels.odin     terminal rail and drawers
   projects.odin   per-project harness/view/shell state + projects pane
+  sessions.odin   conversation tabs, per-tab harness/view, GUI session names
+  details.odin    behind-the-scenes session/config/tools/details page
+  selection.odin  transcript drag-selection state and clipboard copy
   filepicker.odin async portal folder/multi-file picker child process + fallback path entry
   audio.odin      turn-end tone via dlopen'd ALSA + terminal-bell fallback
   gui_config.odin window metrics + known projects in gui.json
@@ -84,11 +87,14 @@ src/
     http.c        libcurl streaming + buffered GET shim
     archive.odin  tar.gz session archives, naming, and atomic file operations
     session_commands.odin  /new, /sessions, /load, /compact, /desc
+    introspect.odin  read-only harness snapshot for the details page
     archive.c     zlib gzip compression/decompression
   cli/
     main.odin     CLI entry point: prompt/command dispatch, signals, event loop
     display.odin  terminal markdown renderers + live tool boxes, raw fallback
   termark/        terminal markdown formatter ported from the Go CLI
+    api.odin      public termark entry points
+    style.odin    monokai/dark styles and SGR helpers
     render.odin   block scanner + inline/block ANSI renderer
     renderer.odin streaming Renderer (commit/tail model)
     screen.odin   cursor-protocol screen manager
@@ -97,6 +103,12 @@ src/
     syntax.odin   compact monokai syntax highlighter
     ansi.odin     SGR, width measurement, ANSI-aware wrapping
   mcp/            MCP config, JSON-RPC, host, sessions, and IPC client
+    config.odin   mcp.json discovery/normalization/fingerprints
+    protocol.odin JSON-RPC shapes, advertised tools, JSON helpers
+    session.odin  one live stdio/streamable-HTTP MCP session
+    host.odin     detached host daemon, session map, resource tools
+    ipc.odin      endpoint/token file, loopback IPC, host start/stop/status
+    native.odin   libmcp C bindings (spawn/random/signals/HTTP)
   host/main.odin  the detached background host binary
   mcptool/main.odin  the TGI-shaped MCP bridge binary
   pty.c           forkpty/resize/read/write shim
@@ -106,11 +118,13 @@ tools/            bundled TGI tools: bash, deepseek-search, activate_skill (inst
 skills/           bundled global Agent Skills; tgi-tools carries the TGI protocol reference (installed into the config dir)
 assets/fonts/     bundled scalable monochrome emoji fallback + OFL license
 assets/icons/     hicolor app icon tree: scalable SVG + rendered PNG sizes
+README.md         user-facing overview, build/run instructions, development aids
+AGENTS.md         agent-facing development aids and this project map
 .env.example      full dotenv reference, installed as the config .env when missing
 theme.json.example  default terminal colors/font, installed for users to copy to theme.json
 install.sh        dependency check, build, asset install, launchers, desktop entry, icons
 uninstall.sh      remove only the launcher symlinks and installed icons; leaves the config directory
-tests/            MCP bridge, activate_skill, and install smoke tests
+tests/            MCP bridge, Agent Skills, and install smoke tests + mock MCP servers
 scripts/
   bootstrap.sh    fetch + build pinned native dependencies
   preview.py      ASCII screenshot preview helper (dev aid)

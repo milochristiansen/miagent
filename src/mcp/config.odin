@@ -335,26 +335,6 @@ function_name :: proc(server, tool: string) -> string {
 	return fmt.aprintf("%s%s__%.*s_%08x", FUNCTION_PREFIX, s, 12, t, h)
 }
 
-// env_fingerprint adds a caller's environment (dotenv + process environment)
-// to a session's identity, so two projects using the same server name do not
-// accidentally share a process with the wrong credentials.
-env_fingerprint :: proc(env: map[string]string) -> string {
-	if len(env) == 0 do return ""
-	keys := make([dynamic]string, 0, len(env))
-	for k in env do append(&keys, k)
-	for i in 1 ..< len(keys) {
-		j := i
-		for j > 0 && keys[j] < keys[j - 1] {
-			keys[j], keys[j - 1] = keys[j - 1], keys[j]
-			j -= 1
-		}
-	}
-	b := strings.builder_make()
-	for k in keys do fmt.sbprintf(&b, "env:%s=%s\n", k, env[k])
-	delete(keys)
-	return strings.to_string(b)
-}
-
 // expand_env_refs substitutes $NAME and ${NAME} from the process environment.
 // The bridge calls this with the TGI tool environment (which already contains
 // the project's dotenv values), so config headers and env values can refer to

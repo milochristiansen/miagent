@@ -256,7 +256,7 @@ main :: proc() {
 			case .Turn_End, .Action_End:
 				display_end_turn(&disp)
 				done = true
-			case .Context, .User, .Assistant_Start, .Assistant_End, .Reasoning_Start, .Reasoning_End, .Session_Changed:
+			case .Context, .User, .Assistant_Start, .Assistant_Replace, .Assistant_End, .Reasoning_Start, .Reasoning_Discard, .Reasoning_End, .Session_Changed:
 				// The CLI does not echo the prompt and has no separate UI
 				// state for these events.
 			}

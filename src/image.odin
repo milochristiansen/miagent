@@ -39,6 +39,7 @@ Image_Entry :: struct {
 	error:   string,
 	texture: u32,
 	thread:  ^thread.Thread,
+	cancel:  i32,
 }
 
 Image_Cache :: struct {
@@ -171,6 +172,7 @@ image_cache_init :: proc(c: ^Image_Cache) {
 image_cache_destroy :: proc(c: ^Image_Cache) {
 	for e in c.entries {
 		if e.thread != nil {
+			sync.atomic_store(&e.cancel, 1)
 			thread.destroy(e.thread)
 			e.thread = nil
 		}
@@ -348,7 +350,7 @@ image_load_worker :: proc(e: ^Image_Entry) {
 
 	case .Remote:
 		out_len: uint
-		data := mi_image_http_get(zstr(e.source), uint(IMAGE_MAX_BYTES), &out_len)
+		data := mi_image_http_get(zstr(e.source), uint(IMAGE_MAX_BYTES), &out_len, &e.cancel)
 		if data == nil {
 			failure = strings.clone("could not download image")
 			break

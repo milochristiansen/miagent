@@ -171,7 +171,41 @@ session_load :: proc(s: ^Session) -> string {
 		return ""
 	}
 	defer delete(data)
-	return session_parse(s, string(data))
+	if perr := session_parse(s, string(data)); perr != "" {
+		session_reset(s)
+		return perr
+	}
+	if verr := session_validate_items(s.items[:]); verr != "" {
+		session_reset(s)
+		return fmt.aprintf("bad session: %s", verr)
+	}
+	return ""
+}
+
+// session_validate_items catches pairs that cannot be replayed by the
+// Responses API. It deliberately allows an unanswered trailing function call:
+// a crash between committing the call and its output is recoverable by the
+// turn error path, and rejecting it would make that session unreadable.
+session_validate_items :: proc(items: []StoredItem) -> string {
+	calls := make(map[string]int, len(items))
+	defer delete(calls)
+	for it, i in items {
+		switch it.role {
+		case "function_call":
+			if len(it.call_id) == 0 do return fmt.aprintf("function_call at item %d has no call_id", i)
+			if _, exists := calls[it.call_id]; exists {
+				return fmt.aprintf("duplicate function_call %q at item %d", it.call_id, i)
+			}
+			calls[it.call_id] = 0
+		case "function_call_output":
+			if len(it.call_id) == 0 do return fmt.aprintf("function_call_output at item %d has no call_id", i)
+			answered, exists := calls[it.call_id]
+			if !exists do return fmt.aprintf("function_call_output for unknown call %q at item %d", it.call_id, i)
+			if answered == 1 do return fmt.aprintf("duplicate function_call_output for %q at item %d", it.call_id, i)
+			calls[it.call_id] = 1
+		}
+	}
+	return ""
 }
 
 // session_parse appends the JSONL records in text to s, exactly as loadFrom
@@ -231,6 +265,7 @@ session_probe :: proc(text: string) -> string {
 	probe.items = make([dynamic]StoredItem, 0, 8)
 	probe.usages = make([dynamic]Usage, 0, 4)
 	err := session_parse(&probe, text)
+	if err == "" do err = session_validate_items(probe.items[:])
 	session_destroy(&probe)
 	return err
 }
@@ -280,6 +315,7 @@ harness_read_archive_items :: proc(path: string) -> ([]StoredItem, string) {
 	s.usages = make([dynamic]Usage, 0, 4)
 	defer session_destroy(&s)
 	if perr := session_parse(&s, content); perr != "" do return nil, perr
+	if verr := session_validate_items(s.items[:]); verr != "" do return nil, fmt.aprintf("bad session: %s", verr)
 	return clone_session_items(&s), ""
 }
 
@@ -307,20 +343,47 @@ append_session :: proc(path: string, items: []StoredItem, usages: []Usage) -> st
 	if err != nil do return fmt.aprintf("opening session %s: %v", path, err)
 	defer os.close(f)
 
+	start_size, size_err := os.file_size(f)
+	if size_err != nil do return fmt.aprintf("sizing session %s: %v", path, size_err)
+
+	rollback := proc(f: ^os.File, size: i64) {
+		_ = os.truncate(f, size)
+		_ = os.sync(f)
+	}
+
+	b := strings.builder_make()
+	defer delete(b.buf)
 	for it in items {
 		data, jerr := json.marshal(it)
 		if jerr != nil do return fmt.aprintf("encoding session item: %v", jerr)
-		defer delete(data)
-		if _, werr := os.write(f, data); werr != nil do return fmt.aprintf("writing session: %v", werr)
-		if _, werr := os.write(f, []byte{'\n'}); werr != nil do return fmt.aprintf("writing session: %v", werr)
+		strings.write_bytes(&b, data)
+		strings.write_byte(&b, '\n')
+		delete(data)
 	}
 	for u in usages {
 		line := usage_line_from(u)
 		data, jerr := json.marshal(line)
 		if jerr != nil do return fmt.aprintf("encoding usage: %v", jerr)
-		defer delete(data)
-		if _, werr := os.write(f, data); werr != nil do return fmt.aprintf("writing session: %v", werr)
-		if _, werr := os.write(f, []byte{'\n'}); werr != nil do return fmt.aprintf("writing session: %v", werr)
+		strings.write_bytes(&b, data)
+		strings.write_byte(&b, '\n')
+		delete(data)
+	}
+
+	payload := strings.to_string(b)
+	bytes := transmute([]byte)payload
+	written := 0
+	for written < len(bytes) {
+		n, werr := os.write(f, bytes[written:])
+		if werr != nil || n <= 0 {
+			rollback(f, start_size)
+			if werr != nil do return fmt.aprintf("writing session: %v", werr)
+			return "writing session: short write"
+		}
+		written += n
+	}
+	if serr := os.sync(f); serr != nil {
+		rollback(f, start_size)
+		return fmt.aprintf("syncing session: %v", serr)
 	}
 	return ""
 }
