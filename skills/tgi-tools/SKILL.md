@@ -1,6 +1,6 @@
 ---
 name: tgi-tools
-description: Write, install, and debug MiAgent TGI tools. Use when the user asks to add or change an agent tool, or when tool discovery or invocation fails.
+description: Write, install, and debug MiAgent TGI tools. Use when the user asks to create or edit an agent tool, or when tool discovery or invocation fails.
 ---
 
 # Writing MiAgent TGI Tools
