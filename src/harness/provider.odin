@@ -285,11 +285,64 @@ item_to_input :: proc(it: StoredItem) -> json.Value {
 	return nil
 }
 
+// missing_output_input returns a truthful result for a call whose output was
+// never persisted (for example, a crash between the call and its result). The
+// Responses API rejects an unanswered call, so the session would otherwise be
+// unusable no matter what the user did next.
+missing_output_input :: proc(call_id: string) -> json.Value {
+	env := tool_envelope(Tool_Result{code = -1, stderr = "not executed: tool output missing from session"})
+	defer delete(env)
+	o := make(json.Object)
+	obj_set(&o, "type", str_value("function_call_output"))
+	obj_set(&o, "call_id", str_value(call_id))
+	obj_set(&o, "output", str_value(env))
+	return o
+}
+
+// build_input converts stored items into Responses API input items. Tool
+// outputs are emitted immediately after the block of calls they answer, even
+// if the session stored something else (notably a nugget) between a later call
+// and its output. Strict Responses API implementations require that adjacency:
+// otherwise they report "No tool output found for tool call <id>" even though
+// the output is present elsewhere in the request.
 build_input :: proc(items: []StoredItem) -> []json.Value {
+	output_index := make(map[string]int, len(items))
+	defer delete(output_index)
+	for it, i in items {
+		if it.role != "function_call_output" || len(it.call_id) == 0 do continue
+		if _, exists := output_index[it.call_id]; !exists do output_index[it.call_id] = i
+	}
+	consumed := make([]bool, len(items))
+	defer delete(consumed)
+
 	out := make([dynamic]json.Value, 0, len(items))
-	for it in items {
-		v := item_to_input(it)
-		if v != nil do append(&out, v)
+	i := 0
+	for i < len(items) {
+		it := items[i]
+		switch it.role {
+		case "function_call":
+			// Calls from one model response are contiguous. Emit the whole
+			// block, then its outputs in call order, before moving on.
+			start := i
+			for i < len(items) && items[i].role == "function_call" do i += 1
+			for k in start ..< i do append(&out, function_call_input(items[k]))
+			for k in start ..< i {
+				call_id := items[k].call_id
+				if idx, ok := output_index[call_id]; ok && !consumed[idx] {
+					consumed[idx] = true
+					append(&out, function_output_input(items[idx]))
+				} else {
+					append(&out, missing_output_input(call_id))
+				}
+			}
+		case "function_call_output":
+			// Outputs paired with a call above were already emitted. Anything
+			// left is an orphan or duplicate and would itself be rejected.
+			i += 1
+		case:
+			if v := item_to_input(it); v != nil do append(&out, v)
+			i += 1
+		}
 	}
 	return out[:]
 }

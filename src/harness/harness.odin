@@ -816,6 +816,15 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 			return
 		}
 
+		// Nuggets become user messages in the request. Emitting one between tool
+		// calls and their outputs makes strict Responses API implementations
+		// report the later call as unanswered, so hold them until every output
+		// from this model response has been appended.
+		pending_nuggets := make([dynamic]StoredItem, 0, 4)
+		defer {
+			for &n in pending_nuggets do item_destroy(&n)
+			delete(pending_nuggets)
+		}
 		for it in items {
 			if it.role != "function_call" do continue
 			h_emit_assistant_end(h)
@@ -893,8 +902,9 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 				output = envelope,
 				attachments = res.attachments,
 			})
+			sync.mutex_unlock(&h.state_mutex)
 			for nug in res.nuggets {
-				append(&h.session.items, StoredItem{
+				append(&pending_nuggets, StoredItem{
 					role = "nugget",
 					name = nug.name,
 					content = nug.content,
@@ -904,12 +914,20 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 				})
 				delete(nug.mime)
 			}
-			sync.mutex_unlock(&h.state_mutex)
 			delete(res.nuggets)
 			// envelope, attachments, and nugget strings were transferred above.
 			delete(res.stdout)
 			delete(res.stderr)
 			if len(res.err) > 0 do delete(res.err)
+		}
+
+		// All outputs for this model response are in place; now it is safe to
+		// append the nuggets they produced.
+		if len(pending_nuggets) > 0 {
+			sync.mutex_lock(&h.state_mutex)
+			for n in pending_nuggets do append(&h.session.items, n)
+			sync.mutex_unlock(&h.state_mutex)
+			clear(&pending_nuggets)
 		}
 
 		sync.mutex_lock(&h.state_mutex)
