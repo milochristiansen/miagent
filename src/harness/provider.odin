@@ -3,6 +3,7 @@
 // persists.
 package harness
 
+import "core:encoding/base64"
 import "core:encoding/json"
 import "base:runtime"
 import "core:fmt"
@@ -200,11 +201,128 @@ function_call_input :: proc(it: StoredItem) -> json.Value {
 	return o
 }
 
+attachment_placeholder :: proc(att: Attachment, reason: string) -> string {
+	return fmt.aprintf("[miagent attachment %s v1: name=%s kind=%s bytes=%d blob=%s]",
+		reason, att.name, att.kind, att.size, att.blob)
+}
+
+output_placeholder :: proc(it: StoredItem, reason: string) -> string {
+	size := it.output_size
+	if size <= 0 do size = len(it.output)
+	return fmt.aprintf("[miagent tool output %s v1: call_id=%s bytes=%d blob=%s]",
+		reason, it.call_id, size, it.output_blob)
+}
+
+resolve_output_text :: proc(it: StoredItem, store: ^Attachment_Store) -> string {
+	if it.output_omitted do return output_placeholder(it, "omitted")
+	if len(it.output_blob) > 0 {
+		if store == nil do return output_placeholder(it, "missing")
+		text, err := attachment_store_read_text(store, it.output_blob)
+		if len(err) > 0 {
+			delete(err)
+			return output_placeholder(it, "missing")
+		}
+		return text
+	}
+	return strings.clone(it.output)
+}
+
+attachment_data_url :: proc(kind: string, mime: string, data: []byte) -> string {
+	encoded, err := base64.encode(data)
+	if err != nil do return ""
+	url := fmt.aprintf("data:%s;base64,%s", mime, encoded)
+	delete(encoded)
+	return url
+}
+
 // append_attachment_parts emits the same attachment representation for tool
 // results and user prompts: images become input_image, text files become an
-// input_text part, and other files become input_file data URLs.
-append_attachment_parts :: proc(parts: ^json.Array, attachments: []Attachment) {
+// input_text part, and other files become input_file data URLs. Blob-backed
+// attachments are expanded only when they are still active. Omitted, missing,
+// and duplicate references become deterministic placeholder text.
+append_attachment_parts :: proc(
+	parts: ^json.Array,
+	attachments: []Attachment,
+	store: ^Attachment_Store = nil,
+	seen_blobs: ^map[string]bool = nil,
+	item_index: int = -1,
+	newest_active: ^map[string]int = nil,
+) {
 	for att in attachments {
+		if att.omitted {
+			text := attachment_placeholder(att, "omitted")
+			append(parts, text_part("input_text", text))
+			delete(text)
+			continue
+		}
+		if len(att.blob) > 0 {
+			if newest_active != nil {
+				if newest, ok := newest_active[att.blob]; ok && newest != item_index {
+					text := attachment_placeholder(att, "duplicate")
+					append(parts, text_part("input_text", text))
+					delete(text)
+					continue
+				}
+			}
+			if seen_blobs != nil && seen_blobs[att.blob] {
+				text := attachment_placeholder(att, "duplicate")
+				append(parts, text_part("input_text", text))
+				delete(text)
+				continue
+			}
+			if seen_blobs != nil do seen_blobs[att.blob] = true
+			if store == nil {
+				text := attachment_placeholder(att, "missing")
+				append(parts, text_part("input_text", text))
+				delete(text)
+				continue
+			}
+			if att.kind == "text" {
+				text, err := attachment_store_read_text(store, att.blob)
+				if len(err) > 0 {
+					delete(err)
+					text = attachment_placeholder(att, "missing")
+				}
+				file_text := fmt.aprintf("[Attached file: %s]\n%s", att.name, text)
+				append(parts, text_part("input_text", file_text))
+				delete(file_text)
+				delete(text)
+				continue
+			}
+			data, err := attachment_store_get(store, att.blob)
+			if len(err) > 0 {
+				delete(err)
+				text := attachment_placeholder(att, "missing")
+				append(parts, text_part("input_text", text))
+				delete(text)
+				continue
+			}
+			url := attachment_data_url(att.kind, att.mime, data)
+			delete(data)
+			if len(url) == 0 {
+				text := attachment_placeholder(att, "missing")
+				append(parts, text_part("input_text", text))
+				delete(text)
+				continue
+			}
+			if att.kind == "image" {
+				p := make(json.Object)
+				obj_set(&p, "type", str_value("input_image"))
+				obj_set(&p, "detail", str_value("high"))
+				obj_set(&p, "image_url", str_value(url))
+				append(parts, p)
+			} else {
+				p := make(json.Object)
+				obj_set(&p, "type", str_value("input_file"))
+				obj_set(&p, "filename", str_value(att.name))
+				obj_set(&p, "file_data", str_value(url))
+				append(parts, p)
+			}
+			delete(url)
+			continue
+		}
+
+		// Legacy inline representation.
 		switch att.kind {
 		case "image":
 			p := make(json.Object)
@@ -226,32 +344,53 @@ append_attachment_parts :: proc(parts: ^json.Array, attachments: []Attachment) {
 	}
 }
 
-function_output_input :: proc(it: StoredItem) -> json.Value {
+function_output_input :: proc(
+	it: StoredItem,
+	store: ^Attachment_Store = nil,
+	seen_blobs: ^map[string]bool = nil,
+	item_index: int = -1,
+	newest_active: ^map[string]int = nil,
+) -> json.Value {
 	o := make(json.Object)
 	obj_set(&o, "type", str_value("function_call_output"))
 	obj_set(&o, "call_id", str_value(it.call_id))
+	output_text := resolve_output_text(it, store)
 	if len(it.attachments) == 0 {
-		obj_set(&o, "output", str_value(it.output))
+		obj_set(&o, "output", str_value(output_text))
+		delete(output_text)
 		return o
 	}
 	parts := make(json.Array, 0, len(it.attachments) + 1)
-	if len(it.output) > 0 {
-		append(&parts, text_part("input_text", it.output))
+	if len(output_text) > 0 {
+		append(&parts, text_part("input_text", output_text))
 	}
-	append_attachment_parts(&parts, it.attachments)
+	append_attachment_parts(&parts, it.attachments, store, seen_blobs, item_index, newest_active)
+	delete(output_text)
+	if len(parts) == 0 {
+		append(&parts, text_part("input_text", "[miagent empty tool output]"))
+	}
 	obj_set(&o, "output", parts)
 	return o
 }
 
 // user_input keeps the prompt first and places the files immediately after it
 // in the same message content array.
-user_input :: proc(it: StoredItem) -> json.Value {
+user_input :: proc(
+	it: StoredItem,
+	store: ^Attachment_Store = nil,
+	seen_blobs: ^map[string]bool = nil,
+	item_index: int = -1,
+	newest_active: ^map[string]int = nil,
+) -> json.Value {
 	o := make(json.Object)
 	obj_set(&o, "type", str_value("message"))
 	obj_set(&o, "role", str_value("user"))
 	parts := make(json.Array, 0, len(it.attachments) + 1)
 	if len(it.content) > 0 do append(&parts, text_part("input_text", it.content))
-	append_attachment_parts(&parts, it.attachments)
+	append_attachment_parts(&parts, it.attachments, store, seen_blobs, item_index, newest_active)
+	if len(parts) == 0 {
+		append(&parts, text_part("input_text", "[miagent empty message]"))
+	}
 	obj_set(&o, "content", parts)
 	return o
 }
@@ -264,10 +403,16 @@ nugget_input :: proc(it: StoredItem) -> json.Value {
 	return message_input("user", "input_text", text)
 }
 
-item_to_input :: proc(it: StoredItem) -> json.Value {
+item_to_input :: proc(
+	it: StoredItem,
+	store: ^Attachment_Store = nil,
+	seen_blobs: ^map[string]bool = nil,
+	item_index: int = -1,
+	newest_active: ^map[string]int = nil,
+) -> json.Value {
 	switch it.role {
 	case "user":
-		return user_input(it)
+		return user_input(it, store, seen_blobs, item_index, newest_active)
 	case "compaction":
 		return message_input("user", "input_text", fmt.aprintf("%s%s%s", COMPACTION_PREFIX, it.content, COMPACTION_SUFFIX))
 	case "assistant":
@@ -278,7 +423,7 @@ item_to_input :: proc(it: StoredItem) -> json.Value {
 	case "function_call":
 		return function_call_input(it)
 	case "function_call_output":
-		return function_output_input(it)
+		return function_output_input(it, store, seen_blobs, item_index, newest_active)
 	case "nugget":
 		return nugget_input(it)
 	}
@@ -306,6 +451,19 @@ missing_output_input :: proc(call_id: string) -> json.Value {
 // otherwise they report "No tool output found for tool call <id>" even though
 // the output is present elsewhere in the request.
 build_input :: proc(items: []StoredItem) -> []json.Value {
+	return build_input_with_store(items, nil)
+}
+
+build_input_with_store :: proc(items: []StoredItem, store: ^Attachment_Store) -> []json.Value {
+	seen_blobs := make(map[string]bool, 8)
+	defer delete(seen_blobs)
+	newest_active := make(map[string]int, 8)
+	defer delete(newest_active)
+	for it, i in items {
+		for att in it.attachments {
+			if len(att.blob) > 0 && !att.omitted do newest_active[att.blob] = i
+		}
+	}
 	output_index := make(map[string]int, len(items))
 	defer delete(output_index)
 	for it, i in items {
@@ -330,7 +488,7 @@ build_input :: proc(items: []StoredItem) -> []json.Value {
 				call_id := items[k].call_id
 				if idx, ok := output_index[call_id]; ok && !consumed[idx] {
 					consumed[idx] = true
-					append(&out, function_output_input(items[idx]))
+					append(&out, function_output_input(items[idx], store, &seen_blobs, idx, &newest_active))
 				} else {
 					append(&out, missing_output_input(call_id))
 				}
@@ -340,7 +498,7 @@ build_input :: proc(items: []StoredItem) -> []json.Value {
 			// left is an orphan or duplicate and would itself be rejected.
 			i += 1
 		case:
-			if v := item_to_input(it); v != nil do append(&out, v)
+			if v := item_to_input(it, store, &seen_blobs, i, &newest_active); v != nil do append(&out, v)
 			i += 1
 		}
 	}
@@ -420,6 +578,16 @@ turn_accum_destroy :: proc(a: ^Turn_Accum) {
 	delete(a.err)
 }
 
+// append_owned grows *dst by suffix and releases the previous value. The
+// streaming path calls this once per delta; without the delete every prefix
+// would remain allocated for the lifetime of the session.
+append_owned :: proc(dst: ^string, suffix: string) {
+	if len(suffix) == 0 do return
+	previous := dst^
+	dst^ = strings.concatenate({previous, suffix})
+	delete(previous)
+}
+
 add_reasoning_delta :: proc(a: ^Turn_Accum, id: string, summary: bool, part_index: int, delta: string) {
 	if len(id) == 0 || len(delta) == 0 do return
 	idx, exists := a.reasoning_index[id]
@@ -440,7 +608,7 @@ add_reasoning_delta :: proc(a: ^Turn_Accum, id: string, summary: bool, part_inde
 			delete(old)
 			r.summary = grown
 		}
-		r.summary[part_index].text = strings.concatenate({r.summary[part_index].text, delta})
+		append_owned(&r.summary[part_index].text, delta)
 	} else {
 		if part_index >= len(r.content) {
 			old := r.content
@@ -450,7 +618,7 @@ add_reasoning_delta :: proc(a: ^Turn_Accum, id: string, summary: bool, part_inde
 			delete(old)
 			r.content = grown
 		}
-		r.content[part_index].text = strings.concatenate({r.content[part_index].text, delta})
+		append_owned(&r.content[part_index].text, delta)
 	}
 	a.reasoning_items[idx].reasoning = r
 }
@@ -682,7 +850,7 @@ handle_stream_event :: proc(state: ^SSE_State, payload: string) {
 		if len(ev.item_id) > 0 {
 			a.progress = true
 			idx := add_fn(a, ev.item_id)
-			a.fn_items[idx].arguments = strings.concatenate({a.fn_items[idx].arguments, ev.delta})
+			append_owned(&a.fn_items[idx].arguments, ev.delta)
 		}
 	case "response.output_item.added":
 		if item, ok := jobj(ev.item); ok {
@@ -693,8 +861,14 @@ handle_stream_event :: proc(state: ^SSE_State, payload: string) {
 				idx := add_fn(a, id)
 				name := jstr(jget(item, "name"))
 				call_id := jstr(jget(item, "call_id"))
-				if len(name) > 0 do a.fn_items[idx].name = strings.clone(name)
-				if len(call_id) > 0 do a.fn_items[idx].call_id = strings.clone(call_id)
+				if len(name) > 0 {
+					delete(a.fn_items[idx].name)
+					a.fn_items[idx].name = strings.clone(name)
+				}
+				if len(call_id) > 0 {
+					delete(a.fn_items[idx].call_id)
+					a.fn_items[idx].call_id = strings.clone(call_id)
+				}
 			}
 		}
 	case "response.output_item.done":
@@ -707,8 +881,14 @@ handle_stream_event :: proc(state: ^SSE_State, payload: string) {
 				id := jstr(jget(item, "id"))
 				if len(id) > 0 {
 					idx := add_fn(a, id)
-					if n := jstr(jget(item, "name")); len(n) > 0 do a.fn_items[idx].name = strings.clone(n)
-					if c := jstr(jget(item, "call_id")); len(c) > 0 do a.fn_items[idx].call_id = strings.clone(c)
+					if n := jstr(jget(item, "name")); len(n) > 0 {
+						delete(a.fn_items[idx].name)
+						a.fn_items[idx].name = strings.clone(n)
+					}
+					if c := jstr(jget(item, "call_id")); len(c) > 0 {
+						delete(a.fn_items[idx].call_id)
+						a.fn_items[idx].call_id = strings.clone(c)
+					}
 					if len(a.fn_items[idx].arguments) == 0 {
 						a.fn_items[idx].arguments = strings.clone(jstr(jget(item, "arguments")))
 					}
@@ -807,6 +987,11 @@ stream_model_turn :: proc(h: ^Harness, input: []json.Value, tools: []json.Value,
 		return a, a.err
 	}
 	defer delete(body)
+	if h.config.request_hard_bytes > 0 && i64(len(body)) > h.config.request_hard_bytes {
+		a.err = fmt.aprintf("request body is %d bytes, over the %d-byte hard limit; run /shake or /compact to drop payloads before sending",
+			len(body), h.config.request_hard_bytes)
+		return a, a.err
+	}
 
 	endpoint := responses_url(h.config.base_url)
 	defer delete(endpoint)

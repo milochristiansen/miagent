@@ -34,6 +34,12 @@ Conversation_Tab :: struct {
 
 	details_open: bool,
 	details:      Details_State,
+
+	// A close button queues `/close` on the harness. `closing` keeps the button
+	// disabled while the archive runs; `close_requested` is set once the
+	// harness reports success and the app can safely remove the tab.
+	closing:         bool,
+	close_requested: bool,
 }
 
 ATTACHMENT_MAX :: 16
@@ -542,6 +548,75 @@ app_add_session_tab :: proc(app: ^App, p: ^Project) -> int {
 	return p.active_tab
 }
 
+// app_request_close_tab archives the session through the harness and asks it
+// to close the tab. The worker is used because naming the archive can require
+// a model call; the Session_Close event triggers the actual removal.
+app_request_close_tab :: proc(p: ^Project, index: int) {
+	if index < 0 || index >= len(p.tabs) do return
+	t := p.tabs[index]
+	if t.closing || t.close_requested do return
+	if !t.harness_ready {
+		// Without a worker there is nothing to archive through. Close the tab
+		// anyway rather than stranding it.
+		t.closing = true
+		t.close_requested = true
+		return
+	}
+	if !harness.harness_submit(&t.harness, "/close") {
+		view_add_note(&t.view, "could not queue /close")
+		return
+	}
+	t.closing = true
+}
+
+project_close_tab :: proc(app: ^App, p: ^Project, index: int) {
+	if index < 0 || index >= len(p.tabs) do return
+	if p.session_name_editing do app_session_name_commit(p)
+	t := p.tabs[index]
+	was_active := index == p.active_tab
+	conversation_tab_destroy(t)
+	free(t)
+	ordered_remove(&p.tabs, index)
+
+	if len(p.tabs) == 0 {
+		p.active_tab = -1
+		p.session_name_editing = false
+		p.session_name_was_active = false
+		p.session_name_input[0] = 0
+	} else if was_active {
+		p.active_tab = min(index, len(p.tabs) - 1)
+		// Only the selected project owns the global focus/preview state.
+		if p == app_active_project(app) && !app.preview_active {
+			next := p.tabs[p.active_tab]
+			tab_ensure_runtime(p, next)
+			next.view.follow = true
+			next.view.scroll_pending = 4
+			next.composer_refocus = true
+			next.details.dirty = true
+			app.mcp_status_refreshed = false
+			app_refresh_mcp_status(app, true)
+		}
+	} else if index < p.active_tab {
+		p.active_tab -= 1
+	}
+
+	if err := project_session_names_save(p); len(err) > 0 {
+		if at := project_active_tab(p); at != nil do view_add_note(&at.view, err)
+		delete(err)
+	}
+}
+
+// app_close_finished_tabs removes tabs whose `/close` command has completed.
+// It runs after the event-polling loops, so removing tabs cannot invalidate an
+// in-progress iteration over a project's tab slice.
+app_close_finished_tabs :: proc(app: ^App) {
+	for p in app.projects {
+		for i := len(p.tabs) - 1; i >= 0; i -= 1 {
+			if p.tabs[i].close_requested do project_close_tab(app, p, i)
+		}
+	}
+}
+
 // --- session rename --------------------------------------------------------
 
 session_name_copy :: proc(buf: []u8, s: string) {
@@ -607,8 +682,13 @@ draw_session_tabs :: proc(app: ^App, p: ^Project, r: Rect) {
 
 	for t, i in p.tabs {
 		tr := rect(x, y, tab_w, h)
+		close_w: f32 = 20
+		close_r := rect(tr.x + tr.w - close_w, tr.y + (h - close_w) * 0.5, close_w, close_w)
 		idbuf: [32]u8
-		clicked := hit(id_cstr(idbuf[:], "sessiontab%d", i), tr)
+		// Keep the close target out of the tab-selection target so a click on
+		// the X cannot also select the tab underneath it.
+		clicked := hit(id_cstr(idbuf[:], "sessiontab%d", i),
+			rect(tr.x, tr.y, max(tr.w - close_w, 1), tr.h))
 		hovered := mi_hit_hovered()
 		active := i == p.active_tab
 		if active {
@@ -622,10 +702,28 @@ draw_session_tabs :: proc(app: ^App, p: ^Project, r: Rect) {
 			dot(list, tr.x + 8, tr.y + tr.h * 0.5, 2.4, th.yellow)
 			name_x = tr.x + 16
 		}
-		text_elided(list, app.f.ui, 12.0, name_x, tr.y + 5, tr.w - (name_x - tr.x) - 10,
-			active ? th.fg : th.fg_dim, t.name)
-		if hovered do tooltip(t.name)
+		name_w := max(tr.w - (name_x - tr.x) - close_w - 6, 8)
+		name_col := t.closing ? th.fg_faint : (active ? th.fg : th.fg_dim)
+		text_elided(list, app.f.ui, 12.0, name_x, tr.y + 5, name_w, name_col, t.name)
+		if hovered do tooltip(t.closing ? "Closing session..." : t.name)
+
+		close_hovered := false
+		close_clicked := false
+		if !t.closing && !t.close_requested {
+			close_idbuf: [32]u8
+			close_clicked = hit(id_cstr(close_idbuf[:], "sessiontabclose%d", i), close_r)
+			close_hovered = mi_hit_hovered()
+		}
+		if close_hovered do panel(list, close_r, th.bg_hover, 5)
+		glyph_close(list, close_r.x + close_w * 0.5, close_r.y + close_w * 0.5, 3.2,
+			(t.closing || t.close_requested) ? th.fg_faint : (close_hovered ? th.fg : th.fg_dim), 1.3)
+		if close_hovered do tooltip("Close session (archives it)")
+		if t.closing && rect_contains(close_r, app.mouse.x, app.mouse.y) {
+			tooltip("Closing session...")
+		}
+
 		if clicked do app_select_tab(app, p, i)
+		if close_clicked do app_request_close_tab(p, i)
 		x += tab_w + gap
 	}
 

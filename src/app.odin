@@ -36,10 +36,15 @@ Drawer :: struct {
 Mcp_Status_Poller :: struct {
 	running: bool,
 	done:    bool,
-	project: string,
-	status:  mcp.Host_Status,
-	mutex:   sync.Mutex,
-	thread:  ^thread.Thread,
+	// wake requests one status query from the long-lived worker. The worker
+	// would otherwise block on cond until the next poll interval.
+	wake:     bool,
+	shutdown: bool,
+	project:  string,
+	status:   mcp.Host_Status,
+	mutex:    sync.Mutex,
+	cond:     sync.Cond,
+	thread:   ^thread.Thread,
 }
 
 App :: struct {
@@ -237,6 +242,43 @@ app_running_count :: proc(app: ^App) -> int {
 	return count
 }
 
+// app_wants_animation_frames reports work that must run at the display refresh
+// rate: drawer slides and any other explicitly animated geometry.
+app_wants_animation_frames :: proc(app: ^App) -> bool {
+	for p in app.projects {
+		for &d in p.drawers {
+			if d.anim > 0.001 && d.anim < 0.999 do return true
+		}
+		if p.drawer_anim > 0.001 && p.drawer_anim < 0.999 do return true
+	}
+	return false
+}
+
+// app_wants_realtime_frames reports background work whose progress or output
+// must be polled promptly even when the user is not interacting. The renderer
+// still only draws on a timer while idle, but this keeps streaming turns, shell
+// output, pickers, and image loads responsive.
+app_wants_realtime_frames :: proc(app: ^App) -> bool {
+	for p in app.projects {
+		for &d in p.drawers {
+			if d.spawned do return true
+		}
+		for t in p.tabs {
+			if !t.harness_ready do continue
+			if t.view.turn_running || harness.harness_is_busy(&t.harness) ||
+			   harness.harness_has_events(&t.harness) {
+				return true
+			}
+		}
+	}
+	if app.folder_picker.running || app.attachment_picker.running do return true
+	if app.mcp_poller.running do return true
+	for e in app.image_cache.entries {
+		if e.state == .Pending do return true
+	}
+	return false
+}
+
 drawer_max_width :: proc(app: ^App) -> f32 {
 	// The drawer pushes the conversation rather than covering it, so cap it at
 	// whatever still leaves the center a usable width.
@@ -320,54 +362,73 @@ app_update_splitter :: proc(app: ^App) {
 
 // --- MCP status card -------------------------------------------------------
 
+// mcp_status_poller_worker is a single long-lived worker. Creating a fresh
+// thread for each two-second status query used to leave an 8 MB pthread stack
+// and a glibc arena behind every interval, which is a steady idle memory leak.
 mcp_status_poller_worker :: proc(p: ^Mcp_Status_Poller) {
-	sync.mutex_lock(&p.mutex)
-	project := strings.clone(p.project)
-	sync.mutex_unlock(&p.mutex)
-	status := mcp.host_status(project)
-	delete(project)
-	sync.mutex_lock(&p.mutex)
-	mcp.host_status_destroy(&p.status)
-	p.status = status
-	p.done = true
-	sync.mutex_unlock(&p.mutex)
+	for {
+		sync.mutex_lock(&p.mutex)
+		for !p.wake && !p.shutdown {
+			sync.cond_wait(&p.cond, &p.mutex)
+		}
+		if p.shutdown {
+			sync.mutex_unlock(&p.mutex)
+			break
+		}
+		p.wake = false
+		project := strings.clone(p.project)
+		sync.mutex_unlock(&p.mutex)
+
+		status := mcp.host_status(project)
+		delete(project)
+
+		sync.mutex_lock(&p.mutex)
+		mcp.host_status_destroy(&p.status)
+		p.status = status
+		p.done = true
+		sync.mutex_unlock(&p.mutex)
+
+		// A long-lived thread owns a thread-local temporary arena. Reclaim the
+		// per-query scratch data instead of letting it accumulate forever.
+		free_all(context.temp_allocator)
+	}
 }
 
 mcp_status_poller_start :: proc(app: ^App, project: string) -> bool {
 	p := &app.mcp_poller
 	if p.running do return false
+	if p.thread == nil {
+		p.thread = thread.create_and_start_with_poly_data(p, mcp_status_poller_worker, name = "miagent-mcp-status")
+		if p.thread == nil do return false
+	}
+	sync.mutex_lock(&p.mutex)
 	mcp.host_status_destroy(&p.status)
 	delete(p.project)
 	p.project = strings.clone(project)
 	p.done = false
 	p.running = true
-	p.thread = thread.create_and_start_with_poly_data(p, mcp_status_poller_worker, name = "miagent-mcp-status")
-	if p.thread == nil {
-		p.running = false
-		return false
-	}
+	p.wake = true
+	p.shutdown = false
+	sync.cond_signal(&p.cond)
+	sync.mutex_unlock(&p.mutex)
 	return true
 }
 
-mcp_status_poller_poll :: proc(app: ^App) {
+mcp_status_poller_poll :: proc(app: ^App) -> bool {
 	p := &app.mcp_poller
-	if !p.running do return
+	if !p.running do return false
 	sync.mutex_lock(&p.mutex)
 	done := p.done
 	sync.mutex_unlock(&p.mutex)
-	if !done do return
+	if !done do return false
 
-	p.running = false
-	if p.thread != nil {
-		thread.destroy(p.thread)
-		p.thread = nil
-	}
 	sync.mutex_lock(&p.mutex)
 	status := p.status
 	p.status = {}
 	project := p.project
 	p.project = ""
 	p.done = false
+	p.running = false
 	sync.mutex_unlock(&p.mutex)
 
 	if project == app.mcp_status_project {
@@ -377,18 +438,27 @@ mcp_status_poller_poll :: proc(app: ^App) {
 		mcp.host_status_destroy(&status)
 	}
 	delete(project)
+	return true
 }
 
 mcp_status_poller_destroy :: proc(app: ^App) {
 	p := &app.mcp_poller
-	if p.running {
-		if p.thread != nil do thread.destroy(p.thread)
+	if p.thread != nil {
+		sync.mutex_lock(&p.mutex)
+		p.shutdown = true
+		p.wake = true
+		sync.cond_signal(&p.cond)
+		sync.mutex_unlock(&p.mutex)
+		thread.destroy(p.thread)
 		p.thread = nil
-		p.running = false
 	}
+	sync.mutex_lock(&p.mutex)
 	mcp.host_status_destroy(&p.status)
 	delete(p.project)
 	p.project = ""
+	p.running = false
+	p.done = false
+	sync.mutex_unlock(&p.mutex)
 }
 
 app_clear_mcp_status :: proc(app: ^App) {
@@ -443,11 +513,15 @@ app_refresh_mcp_status :: proc(app: ^App, force: bool = false) {
 
 // --- frame update ----------------------------------------------------------
 
-app_update :: proc(app: ^App) {
+app_update :: proc(app: ^App) -> bool {
+	changed := false
 	mi_io_display_size(&app.width, &app.height)
 	app.mouse = igGetMousePos()
 	app.now = mi_io_time()
-	app.dt = mi_io_dt()
+	// The on-demand frame loop can leave a long gap between frames while idle.
+	// Clamp the delta so an animation that starts on the next event does not
+	// jump straight to its target.
+	app.dt = min(mi_io_dt(), 0.1)
 
 	if app.f.cell_w <= 0 {
 		px := app.f.mono_size > 0 ? app.f.mono_size : MONO_PX
@@ -463,8 +537,12 @@ app_update :: proc(app: ^App) {
 	}
 
 	app.shortcut_fired = app_shortcuts(app)
+	picker_was_running := app.folder_picker.running || app.attachment_picker.running
 	folder_picker_poll(app)
 	attachment_picker_poll(app)
+	if picker_was_running && !(app.folder_picker.running || app.attachment_picker.running) {
+		changed = true
+	}
 
 	// Keep every project's shells alive even while that project is not visible,
 	// and animate each project's drawer region independently.
@@ -478,13 +556,16 @@ app_update :: proc(app: ^App) {
 			// its kernel buffer and block the shell.
 			if d.spawned {
 				terminal_pump(d.term)
+				if d.term.dirty || d.term.meta_dirty do changed = true
 				if bells := terminal_take_bell(d.term); bells > 0 && !app.mute_audio {
 					audio_bell_play()
 				}
 				terminal_compression_tick(d.term, app.now)
 			}
 		}
+		drawer_count := len(p.drawers)
 		app_reap_project_drawers(p)
+		if len(p.drawers) != drawer_count do changed = true
 		any_open := false
 		for &d in p.drawers {
 			if d.open do any_open = true
@@ -503,8 +584,16 @@ app_update :: proc(app: ^App) {
 			if !t.harness_ready do continue
 			was_running := harness.harness_is_running(&t.harness)
 			was_view_running := t.view.turn_running
-			turn_ended := conversation_poll(&t.view, &t.harness)
-			if turn_ended do any_turn_ended = true
+			poll := conversation_poll(&t.view, &t.harness)
+			if poll.events do changed = true
+			if poll.turn_ended do any_turn_ended = true
+			if poll.close_requested {
+				t.close_requested = true
+			} else if poll.action_ended {
+				// `/close` failed before archiving (for example the naming
+				// request failed), so let the user try again.
+				t.closing = false
+			}
 			session_changed := t.view.session_changed
 			if session_changed {
 				t.view.session_changed = false
@@ -521,7 +610,7 @@ app_update :: proc(app: ^App) {
 			if t.details_open {
 				now_running := harness.harness_is_running(&t.harness)
 				snap := &t.details.snapshot
-				if turn_ended || session_changed || was_running != now_running ||
+				if poll.turn_ended || session_changed || was_running != now_running ||
 				   was_view_running != t.view.turn_running ||
 				   ctx.tokens != snap.context_tokens || ctx.items != snap.context_items ||
 				   ctx.limit != snap.context_limit || ctx.measured != snap.context_measured {
@@ -531,11 +620,16 @@ app_update :: proc(app: ^App) {
 		}
 		if any_session_changed && p.expanded do project_refresh_sessions(app, i, true)
 	}
+	// Remove tabs only after every harness queue has been drained. Closing a
+	// tab mutates the project's tab slice, so doing it inside the loop above
+	// could skip or invalidate the next tab.
+	app_close_finished_tabs(app)
 	if any_turn_ended && !app.mute_audio {
 		audio_alert_play()
 	}
 
 	if app.project_remove_pending >= 0 {
+		changed = true
 		if err := app_project_remove(app, app.project_remove_pending); err != "" {
 			delete(app.project_input_error)
 			app.project_input_error = strings.clone(err)
@@ -544,8 +638,11 @@ app_update :: proc(app: ^App) {
 	}
 
 	app_update_splitter(app)
-	mcp_status_poller_poll(app)
+	if app.splitter_dragging do changed = true
+	if mcp_status_poller_poll(app) do changed = true
 	app_refresh_mcp_status(app)
+	if app_wants_animation_frames(app) do changed = true
+	return changed
 }
 
 // app_reap_project_drawers removes a project's drawers whose shell has exited.
@@ -623,8 +720,8 @@ app_shortcuts :: proc(app: ^App) -> bool {
 
 // --- frame -----------------------------------------------------------------
 
-app_frame :: proc(app: ^App) {
-	app_update(app)
+app_frame :: proc(app: ^App) -> bool {
+	changed := app_update(app)
 
 	draw_projects(app)
 	draw_conversation(app)
@@ -632,6 +729,7 @@ app_frame :: proc(app: ^App) {
 	draw_drawers(app)
 	draw_image_viewer(app)
 	app_update_terminal_focus(app)
+	return changed
 }
 
 app_update_terminal_focus :: proc(app: ^App) {

@@ -46,9 +46,9 @@ the CLI (`src/cli/`).
   loading dotenv files.
 
 Slash command support includes `/help`, `/context`, `/models`, `/new`,
-`/sessions`, `/load`, `/compact`, and `/desc`. Session commands match the CLI's
-gzip/tar archive names, `session-name.md` entries, compaction prompts, and
-`prepak-` archives. `/models` reads the endpoint's `/models` document through
+`/close`, `/sessions`, `/load`, `/compact`, `/shake`, and `/desc`. Session
+commands match the CLI's gzip/tar archive names, `session-name.md` entries,
+compaction prompts, and `prepak-` archives. `/models` reads the endpoint's `/models` document through
 the buffered libcurl shim and annotates each model with the reasoning levels
 the endpoint reports or the harness's model-family table knows.
 

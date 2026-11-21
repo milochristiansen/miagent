@@ -83,7 +83,7 @@ test_reload_refreshes_instructions_and_tools_but_keeps_session :: proc(t: ^testi
 	original_session := strings.clone(h.session.path)
 	defer delete(original_session)
 	testing.expect(t, strings.contains(h.config.instructions, "first system prompt"))
-	testing.expect_value(t, harness_tool_count(&h), 0)
+	testing.expect_value(t, harness_tool_count(&h), 0) // discovery is deferred to the first turn
 
 	// Change both a prompt document and the tool directory between turns.
 	if err := os.write_entire_file_from_string(system_path, "second system prompt"); err != nil {
@@ -100,7 +100,7 @@ printf '%s\n' '{"name":"reload-tool","description":"freshly discovered","paramet
 	h_reload_runtime(&h, true)
 
 	testing.expect(t, strings.contains(h.config.instructions, "second system prompt"))
-	testing.expect_value(t, harness_tool_count(&h), 1)
+	testing.expect_value(t, harness_tool_count(&h), 3) // reload-tool + internal recall tools
 	testing.expect_value(t, h.config.session_path, original_session)
 	testing.expect_value(t, h.session.path, original_session)
 

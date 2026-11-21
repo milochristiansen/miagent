@@ -61,7 +61,10 @@ test_collect_tool_attachments_and_nuggets :: proc(t: ^testing.T) {
 		}
 	}
 
-	attachments, nuggets, notes := collect_tool_attachments(root)
+	session_path := join_path(root, "session.jsonl")
+	store := attachment_store_init(session_path)
+	defer attachment_store_destroy(&store)
+	attachments, nuggets, notes := collect_tool_attachments(&store, root)
 	defer free_attachments_test(attachments)
 	defer free_nuggets_test(nuggets)
 	defer free_notes_test(notes)

@@ -217,8 +217,14 @@ draw_details_overview :: proc(app: ^App, t: ^Conversation_Tab, list: ^ImDrawList
 	items := fmt.tprintf("%d in context · %d discovered", s.context_items, len(s.tools))
 	instructions := data_size(s.instructions_bytes)
 	headroom := s.context_headroom > 0 ? fmt.tprintf("%d%% of context", s.context_headroom) : "disabled"
+	attachments := fmt.tprintf("active %d (%s) · omitted %d (%s) · store %s",
+		s.attachment_active_unique, data_size(int(s.attachment_active_bytes)),
+		s.attachment_omitted_unique, data_size(int(s.attachment_omitted_bytes)),
+		data_size(int(s.attachment_store_bytes)))
+	tool_bodies := fmt.tprintf("active %s · omitted %s",
+		data_size(int(s.tool_body_active_bytes)), data_size(int(s.tool_body_omitted_bytes)))
 
-	rows := [14][2]string{
+	rows := [16][2]string{
 		{"Project", s.project_dir},
 		{"Model", s.model},
 		{"Endpoint", base},
@@ -233,6 +239,8 @@ draw_details_overview :: proc(app: ^App, t: ^Conversation_Tab, list: ^ImDrawList
 		{"State", s.state_dir},
 		{"Items / tools", items},
 		{"History", fmt.tprintf("compacted: %s · file: %s", compacted, file_size)},
+		{"Attachments", attachments},
+		{"Tool bodies", tool_bodies},
 	}
 
 	notes := s.startup_notes
@@ -432,21 +440,26 @@ draw_details_prompts :: proc(
 		text_font(list, app.f.ui, 10.0, row.x + inner_w - mw - 4, row.y + 7, mcol, m)
 
 		yy += DETAIL_ROW_BODY
-		if open && clickable && yy < clip_bottom + 50 && yy + 20 > clip_top - 50 {
+		if open && clickable {
 			code_w := inner_w - 20
 			code_h := code_wrapped_height(app.f.mono, 11.5, code_w, d.content)
-			code_r := rect(x + DETAIL_PAD + 10, yy, code_w + 20, code_h + 16)
-			panel(list, code_r, th.bg_deep, 7, th.border_soft, 1)
-			draw_code_wrapped(list, app.f.mono, 11.5, code_r.x + 10, code_r.y + 8, code_w,
-				d.content, th.fg_dim, nil)
+			// Test the whole block against the viewport. Checking only its top
+			// hides a document that is taller than the pane once the user has
+			// scrolled partway into it.
+			if yy < clip_bottom + 50 && yy + code_h + 16 > clip_top - 50 {
+				code_r := rect(x + DETAIL_PAD + 10, yy, code_w + 20, code_h + 16)
+				panel(list, code_r, th.bg_deep, 7, th.border_soft, 1)
+				draw_code_wrapped(list, app.f.mono, 11.5, code_r.x + 10, code_r.y + 8, code_w,
+					d.content, th.fg_dim, nil)
+			}
 			yy += code_h + 24
-		} else if open && clickable {
-			yy += prompt_doc_height(app, d, true, inner_w) - DETAIL_ROW_BODY
 		}
-		if len(d.error) > 0 && yy < clip_bottom + 50 && yy + 20 > clip_top - 50 {
+		if len(d.error) > 0 {
 			eh := plain_wrapped_height(app.f.ui, 10.5, inner_w - 20, d.error)
-			text_wrapped(list, app.f.ui, 10.5, x + DETAIL_PAD + 18, yy, inner_w - 20,
-				mix(th.fg, th.red, 0.25), d.error)
+			if yy < clip_bottom + 50 && yy + eh > clip_top - 50 {
+				text_wrapped(list, app.f.ui, 10.5, x + DETAIL_PAD + 18, yy, inner_w - 20,
+					mix(th.fg, th.red, 0.25), d.error)
+			}
 			yy += eh + 6
 		}
 	}

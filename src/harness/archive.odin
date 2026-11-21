@@ -708,3 +708,81 @@ compacted_session_bytes :: proc(rec: compaction_record, items: []StoredItem) -> 
 	delete(b.buf)
 	return copied, ""
 }
+
+// --- attachment blobs in session archives ----------------------------------
+
+ARCHIVE_ATTACHMENT_PREFIX :: "attachments/"
+
+archive_attachment_name :: proc(id: string) -> string {
+	return fmt.aprintf("%s%s", ARCHIVE_ATTACHMENT_PREFIX, id)
+}
+
+archive_attachment_id :: proc(name: string) -> (string, bool) {
+	if !strings.has_prefix(name, ARCHIVE_ATTACHMENT_PREFIX) do return "", false
+	id := name[len(ARCHIVE_ATTACHMENT_PREFIX):]
+	if !attachment_store_valid_id(id) do return "", false
+	return id, true
+}
+
+// archive_collect_blobs appends every blob referenced by the given session
+// files. The caller owns the appended entries through archive_entries_destroy.
+archive_collect_blobs :: proc(
+	files: []string,
+	store: ^Attachment_Store,
+	entries: ^[dynamic]Archive_Entry,
+) -> string {
+	seen := make(map[string]bool, 16)
+	defer {
+		for id in seen do delete(id)
+		delete(seen)
+	}
+	for file in files {
+		s := session_init(file)
+		err := session_load(&s)
+		if err != "" {
+			session_destroy(&s)
+			return err
+		}
+		for it in s.items {
+			for att in it.attachments {
+				if len(att.blob) == 0 || seen[att.blob] do continue
+				ids := att.blob
+				seen[strings.clone(ids)] = true
+				if !attachment_store_has(store, ids) {
+					session_destroy(&s)
+					return fmt.aprintf("session archive is missing attachment blob %s", ids)
+				}
+				data, derr := attachment_store_get(store, ids)
+				if len(derr) > 0 {
+					session_destroy(&s)
+					return derr
+				}
+				append(entries, Archive_Entry{
+					name = archive_attachment_name(ids),
+					content = strings.clone(string(data)),
+				})
+				delete(data)
+			}
+			if len(it.output_blob) > 0 && !seen[it.output_blob] {
+				id := it.output_blob
+				seen[strings.clone(id)] = true
+				if !attachment_store_has(store, id) {
+					session_destroy(&s)
+					return fmt.aprintf("session archive is missing tool-output blob %s", id)
+				}
+				data, derr := attachment_store_get(store, id)
+				if len(derr) > 0 {
+					session_destroy(&s)
+					return derr
+				}
+				append(entries, Archive_Entry{
+					name = archive_attachment_name(id),
+					content = strings.clone(string(data)),
+				})
+				delete(data)
+			}
+		}
+		session_destroy(&s)
+	}
+	return ""
+}

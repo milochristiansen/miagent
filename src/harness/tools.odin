@@ -2,7 +2,6 @@
 // stdout/stderr while they run, and collect tool-returned files.
 package harness
 
-import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
@@ -12,12 +11,22 @@ import "core:thread"
 import "core:time"
 import "core:unicode/utf8"
 
+Tool_Kind :: enum {
+	TGI,
+	Recall_Attachment,
+	Recall_Output,
+}
+
 Tool :: struct {
 	name:        string,
 	exec_path:   string,
 	description: string,
 	parameters:  json.Value,
+	kind:        Tool_Kind,
 }
+
+RECALL_ATTACHMENT_TOOL :: "recall_attachment"
+RECALL_OUTPUT_TOOL :: "recall_output"
 
 Tool_Stream :: enum {
 	Stdout,
@@ -65,6 +74,9 @@ Tool_Result :: struct {
 	code:        int,
 	stdout:      string,
 	stderr:      string,
+	// raw_output lets an internal tool replace the function_call_output body
+	// exactly, without wrapping it in a second TGI envelope.
+	raw_output:  string,
 	attachments: []Attachment,
 	nuggets:     []Tool_Nugget,
 	err:         string,
@@ -262,6 +274,10 @@ discover_tools :: proc(config: ^Config, cancel: ^i32 = nil) -> (tools: []Tool, w
 		join_path(config.config_dir, TOOLS_DIR),
 		join_path(config.state_dir, TOOLS_DIR),
 	}
+	defer {
+		delete(dirs[0])
+		delete(dirs[1])
+	}
 	index := make(map[string]int)
 	scanned := make([dynamic]string, 0, 4)
 	out := make([dynamic]Tool, 0, 8)
@@ -375,10 +391,64 @@ discover_tools :: proc(config: ^Config, cancel: ^i32 = nil) -> (tools: []Tool, w
 
 	if interrupted {
 		warnings = join_notes(warnings, "tool discovery interrupted")
+	} else {
+		builtins := internal_tools()
+		for &t in builtins {
+			if _, exists := index[t.name]; exists {
+				tool_destroy(&t)
+			} else {
+				index[strings.clone(t.name)] = len(out)
+				append(&out, t)
+			}
+		}
+		delete(builtins)
 	}
 	for key in index do delete(key)
 	delete(index)
 	return out[:], warnings
+}
+
+internal_tools :: proc() -> []Tool {
+	out := make([dynamic]Tool, 0, 2)
+	attach_schema := `{
+		"type": "object",
+		"properties": {
+			"blob": {
+				"type": "string",
+				"description": "SHA-256 blob id shown in the omitted-attachment placeholder"
+			}
+		},
+		"required": ["blob"]
+	}`
+	output_schema := `{
+		"type": "object",
+		"properties": {
+			"call_id": {
+				"type": "string",
+				"description": "call_id shown in the omitted-tool-output placeholder"
+			}
+		},
+		"required": ["call_id"]
+	}`
+	attach_params, attach_err := json.parse_string(attach_schema)
+	if attach_err == nil {
+		append(&out, Tool{
+			name = strings.clone(RECALL_ATTACHMENT_TOOL),
+			description = strings.clone("Recall an omitted attachment by blob id and return it as a tool-result attachment."),
+			parameters = attach_params,
+			kind = .Recall_Attachment,
+		})
+	}
+	output_params, output_err := json.parse_string(output_schema)
+	if output_err == nil {
+		append(&out, Tool{
+			name = strings.clone(RECALL_OUTPUT_TOOL),
+			description = strings.clone("Recall an omitted tool-result body by call_id."),
+			parameters = output_params,
+			kind = .Recall_Output,
+		})
+	}
+	return out[:]
 }
 
 TOOL_SCHEMA_TIMEOUT :: 10 * time.Second
@@ -597,12 +667,18 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 		res.err = "not executed: interrupted"
 		return res
 	}
+	if tool.kind != .TGI do return run_internal_tool(h, config, tool, call_id, arguments)
+
+	store := attachment_store_init(config.session_path)
+	defer attachment_store_destroy(&store)
 
 	attachment_dir, attachment_note := make_tool_attachment_dir(config)
 	if len(attachment_note) > 0 {
 		res.stderr = fmt.aprintf("%s\n", attachment_note)
 		h_emit_tool_output(h, call_id, .Stderr, res.stderr)
+		delete(attachment_note)
 	}
+	if len(attachment_dir) > 0 do defer delete(attachment_dir)
 
 	env := tool_env(config, "INVOKE", tool.name, attachment_dir)
 	defer free_env(env)
@@ -694,20 +770,33 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 	if h_cancelled(h) do res.err = "interrupted"
 	if time.tick_since(start) > TOOL_CALL_TIMEOUT {
 		note := fmt.aprintf("tool call timed out after %s\n", "5m")
-		res.stderr = strings.concatenate({res.stderr, note})
+		updated := strings.concatenate({res.stderr, note})
+		delete(res.stderr)
+		res.stderr = updated
 		h_emit_tool_output(h, call_id, .Stderr, note)
+		delete(note)
 		res.code = -1
 	}
 
 	if len(attachment_dir) > 0 {
-		attachments, nuggets, notes := collect_tool_attachments(attachment_dir)
+		attachments, nuggets, notes := collect_tool_attachments(&store, attachment_dir)
 		if len(notes) > 0 {
 			note := strings.join(notes, "\n")
-			if len(res.stderr) > 0 && res.stderr[len(res.stderr) - 1] != '\n' do res.stderr = strings.concatenate({res.stderr, "\n"})
-			res.stderr = strings.concatenate({res.stderr, note, "\n"})
-			h_emit_tool_output(h, call_id, .Stderr, fmt.aprintf("%s\n", note))
+			if len(res.stderr) > 0 && res.stderr[len(res.stderr) - 1] != '\n' {
+				updated := strings.concatenate({res.stderr, "\n"})
+				delete(res.stderr)
+				res.stderr = updated
+			}
+			updated := strings.concatenate({res.stderr, note, "\n"})
+			delete(res.stderr)
+			res.stderr = updated
+			emitted := fmt.aprintf("%s\n", note)
+			h_emit_tool_output(h, call_id, .Stderr, emitted)
+			delete(emitted)
 			delete(note)
 		}
+		for n in notes do delete(n)
+		delete(notes)
 		res.attachments = attachments
 		res.nuggets = nuggets
 		os.remove_all(attachment_dir)
@@ -715,14 +804,131 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 	return res
 }
 
+find_attachment_meta :: proc(h: ^Harness, blob: string) -> (Attachment, bool) {
+	for i := len(h.session.items) - 1; i >= 0; i -= 1 {
+		for j := len(h.session.items[i].attachments) - 1; j >= 0; j -= 1 {
+			att := h.session.items[i].attachments[j]
+			if att.blob == blob do return attachment_clone(att), true
+		}
+	}
+	return {}, false
+}
+
+find_output_meta :: proc(h: ^Harness, call_id: string) -> (string, bool) {
+	for i := len(h.session.items) - 1; i >= 0; i -= 1 {
+		it := h.session.items[i]
+		if it.role == "function_call_output" && it.call_id == call_id {
+			return strings.clone(it.output_blob), true
+		}
+	}
+	return "", false
+}
+
+run_internal_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: string) -> Tool_Result {
+	res := Tool_Result{code = -1}
+	args_value, jerr := json.parse_string(strings.trim_space(arguments))
+	if jerr != nil {
+		res.err = fmt.aprintf("invalid arguments: %v", jerr)
+		return res
+	}
+	defer json.destroy_value(args_value)
+	args, ok := jobj(args_value)
+	if !ok {
+		res.err = "arguments must be a JSON object"
+		return res
+	}
+
+	switch tool.kind {
+	case .TGI:
+		res.err = "internal tool dispatch received a TGI tool"
+		return res
+	case .Recall_Attachment:
+		blob := jstr(jget(args, "blob"))
+		if !attachment_store_valid_id(blob) {
+			res.err = "blob must be a 64-character lowercase SHA-256 id"
+			return res
+		}
+		att, found := find_attachment_meta(h, blob)
+		if !found {
+			res.err = fmt.aprintf("attachment blob %s is not referenced by this session", blob)
+			return res
+		}
+		store := attachment_store_init(config.session_path)
+		defer attachment_store_destroy(&store)
+		if !attachment_store_has(&store, blob) {
+			attachment_destroy(&att)
+			res.err = fmt.aprintf("attachment blob %s is missing from the store", blob)
+			return res
+		}
+		att.omitted = false
+		res.code = 0
+		res.stdout = fmt.aprintf("recalled attachment %s (%d bytes, blob %s)\n", att.name, att.size, blob)
+		h_emit_tool_output(h, call_id, .Stdout, res.stdout)
+		res.attachments = make([]Attachment, 1)
+		res.attachments[0] = att
+		return res
+	case .Recall_Output:
+		call := jstr(jget(args, "call_id"))
+		if len(call) == 0 {
+			res.err = "call_id is required"
+			return res
+		}
+		blob, found := find_output_meta(h, call)
+		if !found {
+			delete(blob)
+			res.err = fmt.aprintf("tool output %s is not in this session", call)
+			return res
+		}
+		if len(blob) > 0 {
+			store := attachment_store_init(config.session_path)
+			defer attachment_store_destroy(&store)
+			text, err := attachment_store_read_text(&store, blob)
+			if len(err) > 0 {
+				delete(blob)
+				res.err = err
+				return res
+			}
+			delete(blob)
+			res.code = 0
+			res.raw_output = text
+			res.stdout = fmt.aprintf("recalled tool output for %s (%d bytes)\n", call, len(text))
+			h_emit_tool_output(h, call_id, .Stdout, res.stdout)
+			return res
+		}
+		// Inline output is already present; returning it is harmless and
+		// avoids a surprising error if the model asks for a still-visible body.
+		for i := len(h.session.items) - 1; i >= 0; i -= 1 {
+			it := h.session.items[i]
+			if it.role == "function_call_output" && it.call_id == call {
+				if len(it.output) == 0 {
+					res.err = fmt.aprintf("tool output %s has no body", call)
+					return res
+				}
+				res.code = 0
+				res.raw_output = strings.clone(it.output)
+				res.stdout = fmt.aprintf("recalled tool output for %s (%d bytes)\n", call, len(it.output))
+				h_emit_tool_output(h, call_id, .Stdout, res.stdout)
+				return res
+			}
+		}
+		res.err = fmt.aprintf("tool output %s is not in this session", call)
+		return res
+	}
+	res.err = "unsupported internal tool"
+	return res
+}
+
 make_tool_attachment_dir :: proc(config: ^Config) -> (dir: string, note: string) {
 	parent := join_path(config.state_dir, "tool-attachments")
+	defer delete(parent)
 	// TGI_ATTACHMENT_DIR is bind-mounted by tools like bash; bwrap needs an
 	// absolute destination or it tries to create the relative path under its
 	// read-only root.
 	if !os.is_absolute_path(parent) {
 		if cwd, err := os.get_working_directory(context.temp_allocator); err == nil {
-			parent = join_path(cwd, parent)
+			joined := join_path(cwd, parent)
+			delete(parent)
+			parent = joined
 		}
 	}
 	if !os.exists(parent) {
@@ -730,20 +936,34 @@ make_tool_attachment_dir :: proc(config: ^Config) -> (dir: string, note: string)
 			return "", fmt.aprintf("tool attachments unavailable: %v", err)
 		}
 	}
-	base := strings.concatenate({parent, fmt.aprintf("/%d-%d", os.get_pid(), time.to_unix_nanoseconds(time.now()))})
+	suffix := fmt.aprintf("/%d-%d", os.get_pid(), time.to_unix_nanoseconds(time.now()))
+	base := strings.concatenate({parent, suffix})
+	delete(suffix)
 	for i in 0 ..< 100 {
-		candidate := i == 0 ? base : fmt.aprintf("%s-%d", base, i)
+		candidate := base
+		if i > 0 do candidate = fmt.aprintf("%s-%d", base, i)
 		if !os.exists(candidate) {
 			if err := os.make_directory(candidate); err != nil {
+				if i > 0 do delete(candidate)
+				delete(base)
 				return "", fmt.aprintf("tool attachments unavailable: %v", err)
 			}
-			return candidate, ""
+			if i > 0 {
+				delete(base)
+				return candidate, ""
+			}
+			return base, ""
 		}
+		if i > 0 do delete(candidate)
 	}
-	return "", "tool attachments unavailable: could not find a free directory"
+	delete(base)
+	// Return an allocated note for consistency with the error paths above;
+	// run_tool owns and frees both the directory and the note.
+	return "", strings.clone("tool attachments unavailable: could not find a free directory")
 }
 
 Attachment_Collector :: struct {
+	store:       ^Attachment_Store,
 	attachments: [dynamic]Attachment,
 	nuggets:     [dynamic]Tool_Nugget,
 	notes:       [dynamic]string,
@@ -752,8 +972,9 @@ Attachment_Collector :: struct {
 	limit_noted: bool,
 }
 
-collect_tool_attachments :: proc(dir: string) -> ([]Attachment, []Tool_Nugget, []string) {
+collect_tool_attachments :: proc(store: ^Attachment_Store, dir: string) -> ([]Attachment, []Tool_Nugget, []string) {
 	c := Attachment_Collector{
+		store = store,
 		attachments = make([dynamic]Attachment, 0, 8),
 		nuggets = make([dynamic]Tool_Nugget, 0, 4),
 		notes = make([dynamic]string, 0, 4),
@@ -844,52 +1065,31 @@ collect_attachment_file :: proc(c: ^Attachment_Collector, e: os.File_Info, name:
 		return
 	}
 
-	if mime := image_mime(data); len(mime) > 0 {
-		encoded, enc_err := base64.encode(data)
-		if enc_err != nil {
-			append(&c.notes, fmt.aprintf("%s: %v", name, enc_err))
-			return
-		}
-		append(&c.attachments, Attachment{
-			name = strings.clone(name),
-			mime = strings.clone(mime),
-			kind = strings.clone("image"),
-			url = fmt.aprintf("data:%s;base64,%s", mime, encoded),
-			size = int(e.size),
-		})
-		delete(encoded)
-		c.total += e.size
-		c.count += 1
+	mime: string
+	kind: string
+	if image_mime(data) != "" {
+		mime = image_mime(data)
+		kind = "image"
+	} else if is_text_data(data) {
+		mime = text_mime(name)
+		kind = "text"
+	} else {
+		mime = binary_mime(name)
+		kind = "binary"
+	}
+	blob, blob_err := attachment_store_put(c.store, data)
+	if len(blob_err) > 0 {
+		append(&c.notes, fmt.aprintf("%s: %v", name, blob_err))
+		delete(blob_err)
 		return
 	}
-
-	if is_text_data(data) {
-		append(&c.attachments, Attachment{
-			name = strings.clone(name),
-			mime = strings.clone(text_mime(name)),
-			kind = strings.clone("text"),
-			text = strings.clone(string(data)),
-			size = int(e.size),
-		})
-		c.total += e.size
-		c.count += 1
-		return
-	}
-
-	encoded, enc_err := base64.encode(data)
-	if enc_err != nil {
-		append(&c.notes, fmt.aprintf("%s: %v", name, enc_err))
-		return
-	}
-	mime := binary_mime(name)
 	append(&c.attachments, Attachment{
 		name = strings.clone(name),
 		mime = strings.clone(mime),
-		kind = strings.clone("binary"),
-		url = fmt.aprintf("data:%s;base64,%s", mime, encoded),
+		kind = strings.clone(kind),
 		size = int(e.size),
+		blob = blob,
 	})
-	delete(encoded)
 	c.total += e.size
 	c.count += 1
 }
@@ -965,16 +1165,30 @@ image_mime :: proc(data: []byte) -> string {
 PROMPT_ATTACHMENT_MAX_BYTES :: i64(32 << 20)
 PROMPT_ATTACHMENT_TOTAL_BYTES :: i64(48 << 20)
 
+attachment_clone :: proc(src: Attachment) -> Attachment {
+	return Attachment{
+		name = strings.clone(src.name),
+		mime = strings.clone(src.mime),
+		kind = strings.clone(src.kind),
+		text = strings.clone(src.text),
+		url = strings.clone(src.url),
+		size = src.size,
+		blob = strings.clone(src.blob),
+		omitted = src.omitted,
+	}
+}
+
 attachment_destroy :: proc(att: ^Attachment) {
 	delete(att.name)
 	delete(att.mime)
 	delete(att.kind)
 	delete(att.text)
 	delete(att.url)
+	delete(att.blob)
 	att^ = {}
 }
 
-attachment_from_path :: proc(path: string) -> (att: Attachment, err: string) {
+attachment_from_path :: proc(store: ^Attachment_Store, path: string) -> (att: Attachment, err: string) {
 	fi, serr := os.stat(path, context.temp_allocator)
 	if serr != nil do return {}, fmt.aprintf("%s: %v", path, serr)
 	if fi.type != .Regular do return {}, fmt.aprintf("%s: not a regular file", path)
@@ -989,35 +1203,26 @@ attachment_from_path :: proc(path: string) -> (att: Attachment, err: string) {
 	att.name = name
 	att.size = int(fi.size)
 
+	blob, blob_err := attachment_store_put(store, data)
+	if len(blob_err) > 0 {
+		attachment_destroy(&att)
+		return {}, fmt.aprintf("%s: %v", path, blob_err)
+	}
+	att.blob = blob
+
 	if mime := image_mime(data); len(mime) > 0 {
-		encoded, enc_err := base64.encode(data)
-		if enc_err != nil {
-			attachment_destroy(&att)
-			return {}, fmt.aprintf("%s: %v", path, enc_err)
-		}
-		defer delete(encoded)
 		att.mime = strings.clone(mime)
 		att.kind = strings.clone("image")
-		att.url = fmt.aprintf("data:%s;base64,%s", mime, encoded)
 		return att, ""
 	}
 
 	if is_text_data(data) {
 		att.mime = strings.clone(text_mime(name))
 		att.kind = strings.clone("text")
-		att.text = strings.clone(string(data))
 		return att, ""
 	}
 
-	encoded, enc_err := base64.encode(data)
-	if enc_err != nil {
-		attachment_destroy(&att)
-		return {}, fmt.aprintf("%s: %v", path, enc_err)
-	}
-	defer delete(encoded)
-	mime := binary_mime(name)
-	att.mime = strings.clone(mime)
+	att.mime = strings.clone(binary_mime(name))
 	att.kind = strings.clone("binary")
-	att.url = fmt.aprintf("data:%s;base64,%s", mime, encoded)
 	return att, ""
 }

@@ -351,6 +351,13 @@ Harness_Snapshot :: struct {
 	context_measured: bool,
 	session_compacted: bool,
 	session_file_bytes: int,
+	attachment_store_bytes: i64,
+	attachment_active_unique: int,
+	attachment_active_bytes: i64,
+	attachment_omitted_unique: int,
+	attachment_omitted_bytes: i64,
+	tool_body_active_bytes: i64,
+	tool_body_omitted_bytes: i64,
 
 	startup_notes: string,
 	last_turn:     Turn_Info,
@@ -420,6 +427,14 @@ harness_snapshot :: proc(h: ^Harness) -> Harness_Snapshot {
 
 	sync.mutex_lock(&h.state_mutex)
 	s.session_compacted = h.session.compacted
+	attach_stats := attachment_stats(&h.session)
+	s.attachment_store_bytes = attach_stats.store_bytes
+	s.attachment_active_unique = attach_stats.active_unique
+	s.attachment_active_bytes = attach_stats.active_bytes
+	s.attachment_omitted_unique = attach_stats.omitted_unique
+	s.attachment_omitted_bytes = attach_stats.omitted_bytes
+	s.tool_body_active_bytes = attach_stats.body_active_bytes
+	s.tool_body_omitted_bytes = attach_stats.body_omitted_bytes
 	s.nuggets = nugget_infos(h.session.items[:])
 	s.total_usage = session_total(&h.session)
 	recent := 12

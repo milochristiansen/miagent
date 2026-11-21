@@ -109,6 +109,7 @@ foreign cimgui {
 	mi_io_set_mouse_cursor :: proc(cursor: i32) ---
 	mi_io_input_chars :: proc(out: [^]u32, cap: i32) -> i32 ---
 	mi_io_input_event_count :: proc() -> i32 ---
+	mi_io_input_pending_count :: proc() -> i32 ---
 	mi_io_input_event_get :: proc(index: i32, out: ^Mi_Input_Event) -> bool ---
 
 	mi_font_add :: proc(path: cstring, px: f32) -> ^ImFont ---

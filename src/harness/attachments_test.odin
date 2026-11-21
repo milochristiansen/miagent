@@ -27,27 +27,34 @@ test_attachment_from_path :: proc(t: ^testing.T) {
 	if err := os.write_entire_file_from_string(md_path, "# Notes\nhello\n"); err != nil do testing.fail_now(t, fmt.aprintf("%v", err))
 	if err := os.write_entire_file(bin_path, bin_bytes); err != nil do testing.fail_now(t, fmt.aprintf("%v", err))
 
-	png, png_err := attachment_from_path(png_path)
+	session_path := join_path(root, "session.jsonl")
+	store := attachment_store_init(session_path)
+	defer attachment_store_destroy(&store)
+
+	png, png_err := attachment_from_path(&store, png_path)
 	if !testing.expect_value(t, png_err, "") do return
 	defer attachment_destroy(&png)
 	testing.expect_value(t, png.kind, "image")
 	testing.expect_value(t, png.mime, "image/png")
 	testing.expect_value(t, png.name, "tiny.png")
-	testing.expect(t, strings.has_prefix(png.url, "data:image/png;base64,"))
+	testing.expect(t, attachment_store_valid_id(png.blob))
+	testing.expect_value(t, png.url, "")
 
-	md, md_err := attachment_from_path(md_path)
+	md, md_err := attachment_from_path(&store, md_path)
 	if !testing.expect_value(t, md_err, "") do return
 	defer attachment_destroy(&md)
 	testing.expect_value(t, md.kind, "text")
 	testing.expect_value(t, md.mime, "text/markdown")
-	testing.expect_value(t, md.text, "# Notes\nhello\n")
+	testing.expect_value(t, md.text, "")
+	testing.expect(t, attachment_store_valid_id(md.blob))
 
-	bin, bin_err := attachment_from_path(bin_path)
+	bin, bin_err := attachment_from_path(&store, bin_path)
 	if !testing.expect_value(t, bin_err, "") do return
 	defer attachment_destroy(&bin)
 	testing.expect_value(t, bin.kind, "binary")
 	testing.expect_value(t, bin.mime, "application/octet-stream")
-	testing.expect(t, strings.has_prefix(bin.url, "data:application/octet-stream;base64,"))
+	testing.expect(t, attachment_store_valid_id(bin.blob))
+	testing.expect_value(t, bin.url, "")
 }
 
 @(test)

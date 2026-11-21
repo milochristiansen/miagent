@@ -11,6 +11,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:time"
 
 // Attachment is one file returned by a tool. Images and binary files carry a
 // data: URL; text files carry their contents inline. Name is kept for display
@@ -19,9 +20,11 @@ Attachment :: struct {
 	name: string `json:"name,omitempty"`,
 	mime: string `json:"mime,omitempty"`,
 	kind: string `json:"kind,omitempty"`, // "image" | "text" | "binary"
-	text: string `json:"text,omitempty"`,
-	url:  string `json:"url,omitempty"`,
-	size: int    `json:"size,omitempty"`,
+	text: string `json:"text,omitempty"`, // legacy inline text
+	url:  string `json:"url,omitempty"`,  // legacy inline data URL
+	size: int    `json:"size,omitempty"`, // raw bytes
+	blob: string `json:"blob,omitempty"`, // SHA-256 hex in the session attachment store
+	omitted: bool `json:"omitted,omitempty"`,
 }
 
 // Nugget_Digest is the SHA-256 digest of a nugget's content. Nuggets are hard,
@@ -67,6 +70,10 @@ StoredItem :: struct {
 	name:        string          `json:"name,omitempty"`,
 	arguments:   string          `json:"arguments,omitempty"`,
 	output:      string          `json:"output,omitempty"`,
+	output_blob: string          `json:"output_blob,omitempty"`,
+	output_size: int             `json:"output_size,omitempty"`,
+	output_omitted: bool         `json:"output_omitted,omitempty"`,
+	recalled: bool               `json:"recalled,omitempty"`,
 	source:      string          `json:"source,omitempty"`,
 	nugget_id:   string          `json:"nugget_id,omitempty"`,
 	reasoning:   Maybe(Reasoning) `json:"reasoning,omitempty"`,
@@ -112,6 +119,12 @@ compaction_record :: struct {
 	usage:         Usage  `json:"usage"`,
 }
 
+compaction_record_destroy :: proc(rec: ^compaction_record) {
+	delete(rec.archived)
+	delete(rec.created)
+	rec^ = {}
+}
+
 // Session is a loaded session file plus the append bookkeeping. Only one
 // thread (the harness worker) mutates it; readers take the harness state lock.
 Session :: struct {
@@ -119,6 +132,7 @@ Session :: struct {
 	usages:            [dynamic]Usage,
 	carried:           Usage,
 	compacted:         bool,
+	compaction_record: Maybe(compaction_record),
 	path:              string,
 	committed:         int,
 	committed_usages:  int,
@@ -138,6 +152,7 @@ item_destroy :: proc(it: ^StoredItem) {
 	delete(it.name)
 	delete(it.arguments)
 	delete(it.output)
+	delete(it.output_blob)
 	delete(it.source)
 	delete(it.nugget_id)
 	for &att in it.attachments do attachment_destroy(&att)
@@ -157,6 +172,7 @@ session_destroy :: proc(s: ^Session) {
 	for &it in s.items do item_destroy(&it)
 	delete(s.items)
 	delete(s.usages)
+	if rec, has := s.compaction_record.?; has do compaction_record_destroy(&rec)
 	delete(s.path)
 }
 
@@ -190,6 +206,17 @@ session_validate_items :: proc(items: []StoredItem) -> string {
 	calls := make(map[string]int, len(items))
 	defer delete(calls)
 	for it, i in items {
+		for att, j in it.attachments {
+			if len(att.blob) > 0 && !attachment_store_valid_id(att.blob) {
+				return fmt.aprintf("attachment %d on item %d has an invalid blob id", j, i)
+			}
+			if len(att.blob) == 0 && len(att.url) == 0 && len(att.text) == 0 && !att.omitted {
+				return fmt.aprintf("attachment %d on item %d has no blob or inline payload", j, i)
+			}
+		}
+		if len(it.output_blob) > 0 && !attachment_store_valid_id(it.output_blob) {
+			return fmt.aprintf("item %d has an invalid output blob id", i)
+		}
 		switch it.role {
 		case "function_call":
 			if len(it.call_id) == 0 do return fmt.aprintf("function_call at item %d has no call_id", i)
@@ -250,6 +277,7 @@ session_parse :: proc(s: ^Session, text: string) -> string {
 			if rec.archived == "" do return `bad session: compaction record has no "archived" field`
 			s.compacted = true
 			s.carried = rec.usage
+			s.compaction_record = rec
 		case:
 			return fmt.aprintf("bad session line %d: unknown record type %q", line_no, tag.kind)
 		}
@@ -302,6 +330,7 @@ harness_read_archive_items :: proc(path: string) -> ([]StoredItem, string) {
 	for e in entries {
 		if e.name == SESSION_NAME_ENTRY do continue
 		if is_compaction_archive_name(e.name) do continue
+		if _, is_blob := archive_attachment_id(e.name); is_blob do continue
 		if len(name) > 0 {
 			return nil, fmt.aprintf("archive holds more than one session file (%q and %q)", name, e.name)
 		}
@@ -327,6 +356,8 @@ session_reset :: proc(s: ^Session) {
 	clear(&s.usages)
 	s.carried = Usage{}
 	s.compacted = false
+	if rec, has := s.compaction_record.?; has do compaction_record_destroy(&rec)
+	s.compaction_record = nil
 	s.committed = 0
 	s.committed_usages = 0
 }
@@ -398,6 +429,70 @@ session_commit :: proc(s: ^Session) -> string {
 	return ""
 }
 
+// session_rewrite replaces the JSONL file with the current in-memory state.
+// It is required for migrations and pruning because the normal commit path only
+// appends new items and cannot change an existing line.
+session_rewrite :: proc(s: ^Session) -> string {
+	if len(s.path) == 0 do return "no session file configured"
+	dir := os.dir(s.path)
+	if len(dir) == 0 do dir = "."
+	mode := PERM_0644
+	if st, serr := os.stat(s.path, context.temp_allocator); serr == nil do mode = st.mode
+
+	tmp := ""
+	f: ^os.File
+	for i in 0 ..< 100 {
+		candidate := fmt.aprintf("%s.tmp-rewrite-%d-%d-%d", s.path, os.get_pid(), time.to_unix_nanoseconds(time.now()), i)
+		ff, oerr := os.open(candidate, {.Create, .Excl, .Write}, mode)
+		if oerr == nil {
+			f = ff
+			tmp = candidate
+			break
+		}
+		delete(candidate)
+	}
+	if f == nil do return fmt.aprintf("creating temporary session file in %s", dir)
+	ok := false
+	defer {
+		if f != nil do os.close(f)
+		if !ok do os.remove(tmp)
+		delete(tmp)
+	}
+
+	write_line :: proc(f: ^os.File, value: any) -> string {
+		data, err := json.marshal(value)
+		if err != nil do return fmt.aprintf("encoding session record: %v", err)
+		defer delete(data)
+		written := 0
+		for written < len(data) {
+			n, werr := os.write(f, data[written:])
+			if werr != nil || n <= 0 do return fmt.aprintf("writing session record: %v", werr)
+			written += n
+		}
+		if _, werr := os.write(f, []byte{'\n'}); werr != nil do return fmt.aprintf("writing session record: %v", werr)
+		return ""
+	}
+
+	if rec, has := s.compaction_record.?; has {
+		if err := write_line(f, rec); err != "" do return err
+	}
+	for it in s.items {
+		if err := write_line(f, it); err != "" do return err
+	}
+	for u in s.usages {
+		line := usage_line_from(u)
+		if err := write_line(f, line); err != "" do return err
+	}
+	if serr := os.sync(f); serr != nil do return fmt.aprintf("syncing session: %v", serr)
+	os.close(f)
+	f = nil
+	if rerr := os.rename(tmp, s.path); rerr != nil do return fmt.aprintf("replacing session %s: %v", s.path, rerr)
+	ok = true
+	s.committed = len(s.items)
+	s.committed_usages = len(s.usages)
+	return ""
+}
+
 session_append_item :: proc(s: ^Session, it: StoredItem) {
 	append(&s.items, it)
 }
@@ -445,14 +540,26 @@ estimate_item_tokens :: proc(it: StoredItem) -> int {
 	case "function_call":
 		chars = len(it.name) + len(it.arguments)
 	case "function_call_output":
-		chars = len(it.output)
+		if it.output_omitted {
+			chars = len(it.call_id) + len(it.output_blob) + 64
+		} else if it.output_size > 0 && len(it.output) == 0 {
+			chars = it.output_size
+		} else {
+			chars = len(it.output)
+		}
 	}
 	tokens := 0
 	if chars > 0 do tokens = (chars + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
 	for att in it.attachments {
+		if att.omitted {
+			tokens += (len(att.name) + len(att.blob) + 64 + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+			continue
+		}
 		switch att.kind {
 		case "text":
-			tokens += (len(att.text) + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
+			payload := att.size
+			if payload <= 0 do payload = len(att.text)
+			tokens += (payload + CHARS_PER_TOKEN - 1) / CHARS_PER_TOKEN
 		case:
 			tokens += IMAGE_TOKEN_ESTIMATE
 		}

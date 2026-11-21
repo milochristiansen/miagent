@@ -39,6 +39,26 @@ Config :: struct {
 	context_headroom: int,
 	tool_call_size:   int,
 
+	// Attachment retention and request-budget settings.
+	attachment_small_bytes:    i64,
+	attachment_send_budget:    i64,
+	attachment_max_active:     int,
+	attachment_recent_items:   int,
+	attachment_pressure_count: int,
+	attachment_pressure_bytes: i64,
+	attachment_pressure_recent: int,
+	recall_headroom:           i64,
+	request_hard_bytes:        i64,
+	cache_sweep:               bool,
+	sweep_aggression:          int,
+	sweep_low_watermark:       int,
+	sweep_horizon:             int,
+	tool_body_small_bytes:     i64,
+	tool_body_blob_threshold:  i64,
+	tool_body_send_budget:     i64,
+	shake_body_threshold:      i64,
+	attachment_store_max_bytes: i64,
+
 	// setup_error is a non-fatal problem found while loading configuration.
 	// The GUI shows it as a note and keeps running.
 	setup_error: string,
@@ -247,6 +267,49 @@ parse_positive_env :: proc(c: ^Config, key: string, fallback: int) -> (int, stri
 	return n, ""
 }
 
+DEFAULT_ATTACHMENT_SMALL_BYTES :: i64(64 * 1024)
+DEFAULT_ATTACHMENT_SEND_BUDGET :: i64(16 * 1024 * 1024)
+DEFAULT_ATTACHMENT_MAX_ACTIVE :: 32
+DEFAULT_ATTACHMENT_RECENT_ITEMS :: 32
+DEFAULT_ATTACHMENT_PRESSURE_COUNT :: 16
+DEFAULT_ATTACHMENT_PRESSURE_BYTES :: i64(16 * 1024 * 1024)
+DEFAULT_ATTACHMENT_PRESSURE_RECENT :: 4
+DEFAULT_RECALL_HEADROOM :: i64(8 * 1024 * 1024)
+DEFAULT_REQUEST_HARD_BYTES :: i64(40 * 1024 * 1024)
+DEFAULT_SWEEP_AGGRESSION :: 2
+DEFAULT_SWEEP_LOW_WATERMARK :: 60
+DEFAULT_SWEEP_HORIZON :: 2
+DEFAULT_TOOL_BODY_SMALL_BYTES :: i64(8 * 1024)
+DEFAULT_TOOL_BODY_BLOB_THRESHOLD :: i64(64 * 1024)
+DEFAULT_TOOL_BODY_SEND_BUDGET :: i64(8 * 1024 * 1024)
+DEFAULT_SHAKE_BODY_THRESHOLD :: i64(64 * 1024)
+
+// parse_size_env parses classic binary computing sizes. Bare integers are
+// bytes; KB/MB/GB/TB are 1024-based. Suffixes are case-insensitive.
+parse_size_env :: proc(c: ^Config, key: string, fallback: i64) -> (i64, string) {
+	v, ok := lookup_env(c, key)
+	if !ok || len(strings.trim_space(v)) == 0 do return fallback, ""
+	text := strings.trim_space(v)
+	i := 0
+	for i < len(text) && text[i] >= '0' && text[i] <= '9' do i += 1
+	if i == 0 do return 0, fmt.aprintf("%s must be a size in bytes or with KB/MB/GB/TB (got %q)", key, v)
+	parsed_n, parsed_ok := strconv.parse_int(text[:i])
+	if !parsed_ok || parsed_n < 0 do return 0, fmt.aprintf("%s must be a non-negative size (got %q)", key, v)
+	n := i64(parsed_n)
+	suffix := strings.to_upper(strings.trim_space(text[i:]), context.temp_allocator)
+	mult: i64 = 1
+	switch suffix {
+	case "", "B": mult = 1
+	case "KB": mult = 1024
+	case "MB": mult = 1024 * 1024
+	case "GB": mult = 1024 * 1024 * 1024
+	case "TB": mult = 1024 * 1024 * 1024 * 1024
+	case: return 0, fmt.aprintf("%s has an unknown size suffix (got %q)", key, v)
+	}
+	if n > (max(i64) / mult) do return 0, fmt.aprintf("%s is too large (got %q)", key, v)
+	return n * mult, ""
+}
+
 // config_dir_path resolves the installation configuration directory without
 // loading any dotenv file: MIAGENT_CONFIG_DIR when set, otherwise
 // $XDG_CONFIG_HOME/miagent or ~/.config/miagent. The GUI uses it for its own
@@ -342,6 +405,63 @@ config_load_for :: proc(project_dir: string) -> Config {
 	value, err = parse_nonneg_env(&c, "MIAGENT_TOOLCALL_SIZE", 10)
 	if err != "" do c.setup_error = join_notes(c.setup_error, err)
 	c.tool_call_size = value
+
+	size: i64
+	var_err: string
+	size, var_err = parse_size_env(&c, "MIAGENT_ATTACHMENT_SMALL_BYTES", DEFAULT_ATTACHMENT_SMALL_BYTES)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.attachment_small_bytes = size
+	size, var_err = parse_size_env(&c, "MIAGENT_ATTACHMENT_SEND_BUDGET", DEFAULT_ATTACHMENT_SEND_BUDGET)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.attachment_send_budget = size
+	value, err = parse_positive_env(&c, "MIAGENT_ATTACHMENT_MAX_ACTIVE", DEFAULT_ATTACHMENT_MAX_ACTIVE)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.attachment_max_active = value
+	value, err = parse_positive_env(&c, "MIAGENT_ATTACHMENT_RECENT_ITEMS", DEFAULT_ATTACHMENT_RECENT_ITEMS)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.attachment_recent_items = value
+	value, err = parse_positive_env(&c, "MIAGENT_ATTACHMENT_PRESSURE_COUNT", DEFAULT_ATTACHMENT_PRESSURE_COUNT)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.attachment_pressure_count = value
+	size, var_err = parse_size_env(&c, "MIAGENT_ATTACHMENT_PRESSURE_BYTES", DEFAULT_ATTACHMENT_PRESSURE_BYTES)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.attachment_pressure_bytes = size
+	value, err = parse_positive_env(&c, "MIAGENT_ATTACHMENT_PRESSURE_RECENT", DEFAULT_ATTACHMENT_PRESSURE_RECENT)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.attachment_pressure_recent = value
+	size, var_err = parse_size_env(&c, "MIAGENT_RECALL_HEADROOM", DEFAULT_RECALL_HEADROOM)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.recall_headroom = size
+	size, var_err = parse_size_env(&c, "MIAGENT_REQUEST_HARD_BYTES", DEFAULT_REQUEST_HARD_BYTES)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.request_hard_bytes = size
+	value, err = parse_nonneg_env(&c, "MIAGENT_CACHE_SWEEP", 1)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.cache_sweep = value != 0
+	value, err = parse_positive_env(&c, "MIAGENT_SWEEP_AGGRESSION", DEFAULT_SWEEP_AGGRESSION)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.sweep_aggression = value
+	value, err = parse_nonneg_env(&c, "MIAGENT_SWEEP_LOW_WATERMARK", DEFAULT_SWEEP_LOW_WATERMARK)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.sweep_low_watermark = min(value, 100)
+	value, err = parse_positive_env(&c, "MIAGENT_SWEEP_HORIZON", DEFAULT_SWEEP_HORIZON)
+	if err != "" do c.setup_error = join_notes(c.setup_error, err)
+	c.sweep_horizon = value
+	size, var_err = parse_size_env(&c, "MIAGENT_TOOL_BODY_SMALL_BYTES", DEFAULT_TOOL_BODY_SMALL_BYTES)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.tool_body_small_bytes = size
+	size, var_err = parse_size_env(&c, "MIAGENT_TOOL_BODY_BLOB_THRESHOLD", DEFAULT_TOOL_BODY_BLOB_THRESHOLD)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.tool_body_blob_threshold = size
+	size, var_err = parse_size_env(&c, "MIAGENT_TOOL_BODY_SEND_BUDGET", DEFAULT_TOOL_BODY_SEND_BUDGET)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.tool_body_send_budget = size
+	size, var_err = parse_size_env(&c, "MIAGENT_SHAKE_BODY_THRESHOLD", DEFAULT_SHAKE_BODY_THRESHOLD)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.shake_body_threshold = size
+	size, var_err = parse_size_env(&c, "MIAGENT_ATTACHMENT_STORE_MAX_BYTES", 0)
+	if var_err != "" do c.setup_error = join_notes(c.setup_error, var_err)
+	c.attachment_store_max_bytes = size
 
 	instructions, instr_err := load_instructions(c.config_dir, c.project_dir, c.state_dir)
 	if instr_err != "" {

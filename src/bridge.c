@@ -88,6 +88,13 @@ int mi_io_input_event_count(void) {
   return ctx ? ctx->InputEventsTrail.Size : 0;
 }
 
+// Queued input events have not been consumed by NewFrame yet. The frame loop
+// uses this to decide whether a new ImGui frame is needed at all.
+int mi_io_input_pending_count(void) {
+  ImGuiContext *ctx = igGetCurrentContext();
+  return ctx ? ctx->InputEventsQueue.Size : 0;
+}
+
 bool mi_io_input_event_get(int index, MiInputEvent *out) {
   ImGuiContext *ctx = igGetCurrentContext();
   if (ctx == NULL || out == NULL || index < 0 || index >= ctx->InputEventsTrail.Size) return false;

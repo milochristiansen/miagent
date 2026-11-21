@@ -352,7 +352,9 @@ pretty_args :: proc(s: string) -> string {
 view_load_history :: proc(v: ^Conversation_View, items: []harness.StoredItem, session_path: string) {
 	v.turn_running = false
 	label := len(items) > 0 ? "Session resumed" : "Session started"
-	view_add_note(v, fmt.aprintf("%s  ·  %s", label, session_path))
+	intro := fmt.aprintf("%s  ·  %s", label, session_path)
+	view_add_note(v, intro)
+	delete(intro)
 	for it in items {
 		switch it.role {
 		case "user":
@@ -381,7 +383,9 @@ view_load_history :: proc(v: ^Conversation_View, items: []harness.StoredItem, se
 			view_add_note(v, "Compacted session summary")
 		case "nugget":
 			name := len(it.name) > 0 ? it.name : "nugget"
-			view_add_note(v, fmt.aprintf("Nugget · %s", name))
+			note := fmt.aprintf("Nugget · %s", name)
+			view_add_note(v, note)
+			delete(note)
 		case "function_call":
 			args := pretty_args(it.arguments)
 			view_append(v, View_Message{
@@ -485,6 +489,8 @@ view_apply_event :: proc(v: ^Conversation_View, ev: ^harness.Event) {
 		v.turn_running = false
 	case .Session_Changed:
 		// Handled by conversation_poll, which can reload immediately.
+	case .Session_Close:
+		// Handled by conversation_poll, which tells the app to remove the tab.
 	}
 }
 
@@ -533,27 +539,49 @@ conversation_reload :: proc(v: ^Conversation_View, h: ^harness.Harness) {
 	v.session_changed = true
 }
 
-// conversation_poll drains a harness event queue into the view. It reports
-// whether the batch contained an agent turn end, so the caller can ring the
-// audio alert alongside the project card's running/idle status change. A
-// slash command or other Action_End must not ring it.
-conversation_poll :: proc(v: ^Conversation_View, h: ^harness.Harness) -> bool {
-	agent_turn_ended := false
+Conversation_Poll_Result :: struct {
+	// The batch contained an agent turn end. The caller can ring the audio
+	// alert alongside the project card's running/idle status change. A slash
+	// command or other Action_End must not ring it.
+	turn_ended:      bool,
+	// Non-turn work finished. A close button uses this to stop showing a
+	// pending state if `/close` failed before it could archive the session.
+	action_ended:    bool,
+	// `/close` archived the session and asked for its tab to be removed.
+	close_requested: bool,
+	// At least one harness event was drained. Any event can change the
+	// transcript, header, or status indicators, so the renderer must draw.
+	events: bool,
+}
+
+// conversation_poll drains a harness event queue into the view.
+conversation_poll :: proc(v: ^Conversation_View, h: ^harness.Harness) -> Conversation_Poll_Result {
+	result: Conversation_Poll_Result
 	for {
 		ev: harness.Event
 		if !harness.harness_poll_event(h, &ev) do break
-		if ev.kind == .Session_Changed {
+		result.events = true
+		#partial switch ev.kind {
+		case .Session_Changed:
 			// The worker has already finished mutating the session before it
 			// emits this event. Reloading now lets the command's notes, which
 			// follow, land at the bottom of the new transcript.
 			conversation_reload(v, h)
-		} else {
+		case .Session_Close:
+			result.close_requested = true
+		case:
 			view_apply_event(v, &ev)
 		}
-		if ev.kind == .Turn_End do agent_turn_ended = true
+		#partial switch ev.kind {
+		case .Turn_End:
+			result.turn_ended = true
+		case .Action_End:
+			result.action_ended = true
+		case:
+		}
 		harness.event_destroy(&ev)
 	}
-	return agent_turn_ended
+	return result
 }
 
 draw_message :: proc(
@@ -792,6 +820,7 @@ draw_conversation :: proc(app: ^App) {
 	view := app_active_view(app)
 	active_harness := app_active_harness(app)
 	no_project := project == nil && !app.preview_active
+	no_tab := project != nil && tab == nil && !app.preview_active
 	live := !app.preview_active && tab != nil && tab.harness_ready
 	details_mode := tab != nil && tab.details_open
 
@@ -850,6 +879,7 @@ draw_conversation :: proc(app: ^App) {
 	item_count := app.preview_active ? view.message_count : ctx_info.items
 	sub := fmt.tprintf("%s  ·  %s  ·  %d items  ·  %d tools", model, path, item_count, view.tool_count)
 	if no_project do sub = "Add a project with + in the projects pane"
+	if no_tab do sub = "No session open"
 	if details_mode do sub = fmt.tprintf("details  ·  %s", sub)
 	text_elided(list, app.f.ui, 12.0, r.x + 26, header_y + 42, r.w - 52, th.fg_faint, sub)
 
@@ -1144,9 +1174,9 @@ draw_conversation :: proc(app: ^App) {
 	if !live {
 		preview := app.preview_active
 		dot(list, composer.x + 24, composer.y + composer.h * 0.5 - 10, 3.6, th.fg_faint)
-		title_text := preview ? "Read-only preview" : no_project ? "No project selected" : "Project unavailable"
-		detail := preview ? (len(app.preview_subtitle) > 0 ? app.preview_subtitle : app.preview.session_path) : no_project ? "Add a project with + in the projects pane" : "the project harness could not be started"
-		hint := preview ? "Load this archive to continue it" : no_project ? "Nothing to send yet" : "Choose another project"
+		title_text := preview ? "Read-only preview" : no_project ? "No project selected" : no_tab ? "No session open" : "Project unavailable"
+		detail := preview ? (len(app.preview_subtitle) > 0 ? app.preview_subtitle : app.preview.session_path) : no_project ? "Add a project with + in the projects pane" : no_tab ? "Use + in the tab bar to start a new session" : "the project harness could not be started"
+		hint := preview ? "Load this archive to continue it" : no_project ? "Nothing to send yet" : no_tab ? "Nothing to send yet" : "Choose another project"
 
 		// A preview can be resumed directly from here. The button queues the
 		// same operation as `/load <archive>`; the preview closes immediately so
@@ -1184,12 +1214,15 @@ draw_conversation :: proc(app: ^App) {
 		tab.composer_refocus = false
 	}
 	igSetNextItemWidth(input_r.w)
-	igInputTextMultiline(
+	// Enter validates the multiline input; Shift+Enter (and Ctrl+Enter) still
+	// insert a newline. Without CtrlEnterForNewLine ImGui writes a newline at
+	// the caret before the key can be handled as a submit.
+	submitted := igInputTextMultiline(
 		"##composer",
 		&tab.composer[0],
 		uint(len(tab.composer)),
 		ivec2(input_r.w, input_r.h),
-		INPUT_TEXT_WORD_WRAP,
+		INPUT_TEXT_WORD_WRAP | INPUT_TEXT_CTRL_ENTER_FOR_NEWLINE | INPUT_TEXT_ENTER_RETURNS_TRUE,
 		nil,
 		nil,
 	)
@@ -1202,25 +1235,28 @@ draw_conversation :: proc(app: ^App) {
 			th.fg_faint, "Message MiAgent...")
 	}
 
-	submit :: proc(app: ^App) {
+	submit :: proc(app: ^App) -> bool {
 		t := app_active_tab(app)
-		if t == nil || !t.harness_ready do return
+		if t == nil || !t.harness_ready do return false
 		s := string(cstring(&t.composer[0]))
 		trimmed := strings.trim_space(s)
-		if len(trimmed) == 0 do return
-		if harness.harness_submit_files(&t.harness, trimmed, t.attachments[:]) {
-			t.composer[0] = 0
-			t.composer_refocus = true
-			conversation_tab_clear_attachments(t)
-			// The input widget keeps its own text buffer while active; dropping
-			// the active id makes it re-read the cleared buffer next frame.
-			igClearActiveID()
-			t.view.scroll_pending = 4
-		}
+		if len(trimmed) == 0 do return false
+		if !harness.harness_submit_files(&t.harness, trimmed, t.attachments[:]) do return false
+		t.composer[0] = 0
+		t.composer_refocus = true
+		conversation_tab_clear_attachments(t)
+		// The input widget keeps its own text buffer while active; dropping
+		// the active id makes it re-read the cleared buffer next frame.
+		igClearActiveID()
+		t.view.scroll_pending = 4
+		return true
 	}
 
-	entered := igIsKeyPressed_Bool(KEY_ENTER, false) && mi_io_key_shift() == 0
-	if active && entered do submit(app)
+	if submitted {
+		// Enter also deactivates the multiline input. Refocus after an empty
+		// submit so the user can keep typing.
+		if !submit(app) do tab.composer_refocus = true
+	}
 	if !app.image_viewer.open && igIsKeyPressed_Bool(KEY_ESCAPE, false) && active_harness != nil && harness.harness_is_busy(active_harness) {
 		harness.harness_cancel(active_harness)
 	}

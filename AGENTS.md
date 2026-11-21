@@ -82,11 +82,13 @@ src/
     harness.odin  public API, worker thread, event queue, agent loop, nugget dedupe
     config.odin   per-project dotenv map, prompts, paths, environment
     session.odin  CLI-compatible JSONL sessions, context sizing, nugget digests
+    attachment_store.odin  per-session content-addressed attachment blobs
+    attachment_policy.odin  attachment/output migration, retention, cache-aware pruning, /shake helpers
     provider.odin Responses API request/SSE/reconstruction, /models, prompt/tool attachments
     tools.odin    TGI tool discovery/execution, prompt + tool attachment collection, nuggets
     http.c        libcurl streaming + buffered GET shim
     archive.odin  tar.gz session archives, naming, and atomic file operations
-    session_commands.odin  /new, /sessions, /load, /compact, /desc
+    session_commands.odin  /new, /close, /sessions, /load, /compact, /shake, /desc
     introspect.odin  read-only harness snapshot for the details page
     archive.c     zlib gzip compression/decompression
   cli/
@@ -119,6 +121,7 @@ skills/           bundled global Agent Skills; tgi-tools carries the TGI protoco
 assets/fonts/     bundled scalable monochrome emoji fallback + OFL license
 assets/icons/     hicolor app icon tree: scalable SVG + rendered PNG sizes
 README.md         user-facing overview, build/run instructions, development aids
+ATTACH.md         design reference for external attachments, pruning, and /shake
 AGENTS.md         agent-facing development aids and this project map
 .env.example      full dotenv reference, installed as the config .env when missing
 theme.json.example  default terminal colors/font, installed for users to copy to theme.json

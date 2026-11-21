@@ -5,6 +5,7 @@ package harness
 
 import "core:encoding/json"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -38,6 +39,10 @@ Event_Kind :: enum {
 	Turn_End,
 	Action_End,
 	Session_Changed,
+	// Session_Close asks a tabbed consumer (the desktop app) to remove the
+	// current session's tab after `/close` archived it. The CLI ignores it;
+	// `/close` behaves exactly like `/new` there.
+	Session_Close,
 }
 
 Event :: struct {
@@ -133,6 +138,15 @@ h_emit :: proc(h: ^Harness, ev: Event) {
 	sync.mutex_lock(&h.events_mutex)
 	append(&h.events, e)
 	sync.mutex_unlock(&h.events_mutex)
+}
+
+// harness_has_events reports whether the worker has emitted anything the UI
+// has not drained yet. It lets an on-demand renderer wake without polling at
+// the full display rate.
+harness_has_events :: proc(h: ^Harness) -> bool {
+	sync.mutex_lock(&h.events_mutex)
+	defer sync.mutex_unlock(&h.events_mutex)
+	return len(h.events) > 0
 }
 
 harness_poll_event :: proc(h: ^Harness, ev: ^Event) -> bool {
@@ -486,6 +500,12 @@ worker_loop :: proc(h: ^Harness) {
 		sync.mutex_lock(&h.work_mutex)
 		h.running = false
 		sync.mutex_unlock(&h.work_mutex)
+
+		// The worker thread outlives every turn. Odin's default temporary
+		// allocator is thread-local and only reclaimed by forking threads at
+		// exit, so a long-lived worker must release its per-turn scratch data
+		// explicitly. Everything a finished work item retains is heap-owned.
+		free_all(context.temp_allocator)
 	}
 }
 
@@ -621,6 +641,10 @@ clone_item :: proc(src: StoredItem) -> StoredItem {
 		name = strings.clone(src.name),
 		arguments = strings.clone(src.arguments),
 		output = strings.clone(src.output),
+		output_blob = strings.clone(src.output_blob),
+		output_size = src.output_size,
+		output_omitted = src.output_omitted,
+		recalled = src.recalled,
 		source = strings.clone(src.source),
 		nugget_id = strings.clone(src.nugget_id),
 	}
@@ -635,6 +659,8 @@ clone_item :: proc(src: StoredItem) -> StoredItem {
 				text = strings.clone(att.text),
 				url = strings.clone(att.url),
 				size = att.size,
+				blob = strings.clone(att.blob),
+				omitted = att.omitted,
 			}
 		}
 	}
@@ -722,10 +748,13 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 		}
 	}
 
+	store := attachment_store_init(h.session.path)
+	defer attachment_store_destroy(&store)
+
 	attachments := make([dynamic]Attachment, 0, len(files))
 	total := i64(0)
 	for path in files {
-		att, err := attachment_from_path(path)
+		att, err := attachment_from_path(&store, path)
 		if len(err) > 0 {
 			note := fmt.aprintf("attachment skipped: %s", err)
 			h_emit_note(h, note)
@@ -768,7 +797,15 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 	defer delete(nugget_digests)
 
 	for {
-		input := build_input(h.session.items[:])
+		sync.mutex_lock(&h.state_mutex)
+		policy_changed, policy_notes := attachments_prepare_and_apply(&h.config, &h.session)
+		sync.mutex_unlock(&h.state_mutex)
+		_ = policy_changed
+		if len(policy_notes) > 0 {
+			h_emit_note(h, policy_notes)
+			delete(policy_notes)
+		}
+		input := build_input_with_store(h.session.items[:], &store)
 		tools := build_tools(h.tools)
 		items, usage, got_usage, final, err := run_model_turn(h, input, tools)
 		for v in tools do json.destroy_value(v)
@@ -869,9 +906,31 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 			for name in skipped_names do delete(name)
 			delete(skipped_names)
 			if len(res.err) > 0 && len(res.stderr) == 0 {
-				h_emit_tool_output(h, it.call_id, .Stderr, fmt.aprintf("%s\n", res.err))
+				note := fmt.aprintf("%s\n", res.err)
+				h_emit_tool_output(h, it.call_id, .Stderr, note)
+				delete(note)
 			}
-			envelope := tool_envelope(res)
+			envelope := ""
+			if len(res.raw_output) > 0 {
+				envelope = res.raw_output
+				res.raw_output = ""
+			} else {
+				envelope = tool_envelope(res)
+			}
+			output_blob := ""
+			output_text := envelope
+			output_size := 0
+			if i64(len(envelope)) > h.config.tool_body_blob_threshold {
+				blob, berr := attachment_store_put(&store, transmute([]byte)envelope)
+				if len(berr) == 0 {
+					output_blob = blob
+					output_size = len(envelope)
+					delete(envelope)
+					output_text = ""
+				} else {
+					delete(berr)
+				}
+			}
 			status := res.code
 			meta := fmt.aprintf("%.2fs", time.duration_seconds(time.tick_since(start)))
 
@@ -883,23 +942,32 @@ h_run_prompt :: proc(h: ^Harness, prompt: string, files: []string = nil) {
 			turn_info_tool_call(h, it.name)
 			delete(meta)
 			if len(res.attachments) > 0 {
-				h_emit_note(h, fmt.aprintf("attached %d file%s to the tool result",
-					len(res.attachments), len(res.attachments) == 1 ? "" : "s"))
+				note := fmt.aprintf("attached %d file%s to the tool result",
+					len(res.attachments), len(res.attachments) == 1 ? "" : "s")
+				h_emit_note(h, note)
+				delete(note)
 			}
 			if len(res.nuggets) > 0 {
-				h_emit_note(h, fmt.aprintf("preserved %d nugget%s for this session",
-					len(res.nuggets), len(res.nuggets) == 1 ? "" : "s"))
+				note := fmt.aprintf("preserved %d nugget%s for this session",
+					len(res.nuggets), len(res.nuggets) == 1 ? "" : "s")
+				h_emit_note(h, note)
+				delete(note)
 			}
 			if skipped_count > 0 {
-				h_emit_note(h, fmt.aprintf("skipped %d duplicate nugget%s",
-					skipped_count, skipped_count == 1 ? "" : "s"))
+				note := fmt.aprintf("skipped %d duplicate nugget%s",
+					skipped_count, skipped_count == 1 ? "" : "s")
+				h_emit_note(h, note)
+				delete(note)
 			}
 
 			sync.mutex_lock(&h.state_mutex)
 			append(&h.session.items, StoredItem{
 				role = "function_call_output",
 				call_id = strings.clone(it.call_id),
-				output = envelope,
+				output = output_text,
+				output_blob = output_blob,
+				output_size = output_size,
+				recalled = tool != nil && tool.kind != .TGI,
 				attachments = res.attachments,
 			})
 			sync.mutex_unlock(&h.state_mutex)
@@ -968,12 +1036,15 @@ TGI_Envelope :: struct {
 }
 
 tool_envelope :: proc(res: Tool_Result) -> string {
-	stderr := res.stderr
+	stderr := strings.builder_make()
+	defer delete(stderr.buf)
+	strings.write_string(&stderr, res.stderr)
 	if len(res.err) > 0 {
-		if len(stderr) > 0 && stderr[len(stderr) - 1] != '\n' do stderr = strings.concatenate({stderr, "\n"})
-		stderr = strings.concatenate({stderr, res.err, "\n"})
+		if len(res.stderr) > 0 && res.stderr[len(res.stderr) - 1] != '\n' do strings.write_byte(&stderr, '\n')
+		strings.write_string(&stderr, res.err)
+		strings.write_byte(&stderr, '\n')
 	}
-	env := TGI_Envelope{exit_code = res.code, stdout = res.stdout, stderr = stderr}
+	env := TGI_Envelope{exit_code = res.code, stdout = res.stdout, stderr = strings.to_string(stderr)}
 	data, err := json.marshal(env, {pretty = true, use_spaces = true, spaces = 4})
 	if err != nil do return fmt.aprintf("{\"exit_code\":%d,\"stdout\":\"\",\"stderr\":\"encoding error\"}\n", res.code)
 	defer delete(data)
@@ -1108,7 +1179,9 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 
 		if aerr == "" {
 			carry_text := strings.to_string(carry)
-			answer := combined_answer(carry_text, assistant_text_of(attempt_items), attempt_text)
+			attempt_answer := assistant_text_of(attempt_items)
+			answer := combined_answer(carry_text, attempt_answer, attempt_text)
+			delete(attempt_answer)
 			attempt_items = with_assistant_text(attempt_items, answer)
 			if continuing {
 				emit_continuation_display(h, carry_text, answer)
@@ -1120,6 +1193,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 				}
 				delete(streamed)
 			}
+			delete(answer)
 			delete(attempt_text)
 			h_emit_assistant_end(h)
 			h_emit_reasoning_end(h)
@@ -1127,11 +1201,14 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 			return attempt_items, attempt_usage, attempt_got_usage, final, ""
 		}
 
-		answer := combined_answer(strings.to_string(carry), assistant_text_of(attempt_items), attempt_text)
+		attempt_answer := assistant_text_of(attempt_items)
+		answer := combined_answer(strings.to_string(carry), attempt_answer, attempt_text)
+		delete(attempt_answer)
 		attempt_items = with_assistant_text(attempt_items, answer)
 
 		if h_cancelled(h) {
 			if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
+			delete(answer)
 			delete(attempt_text)
 			h_emit_assistant_end(h)
 			h_emit_reasoning_end(h)
@@ -1141,6 +1218,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 		if attempt_progress {
 			if continuations >= MAX_MODEL_CONTINUATIONS {
 				if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
+				delete(answer)
 				delete(attempt_text)
 				h_emit_assistant_end(h)
 				h_emit_reasoning_end(h)
@@ -1153,6 +1231,7 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 			h_emit_reasoning_discard(h)
 			continuations += 1
 			strings.write_string(&carry, attempt_text)
+			delete(answer)
 			delete(attempt_text)
 			continuing = true
 			retries = 0
@@ -1163,12 +1242,14 @@ run_model_turn :: proc(h: ^Harness, conversation_input: []json.Value, tools: []j
 
 		if retries >= MAX_MODEL_RETRIES {
 			if continuing do emit_continuation_display(h, strings.to_string(carry), answer)
+			delete(answer)
 			delete(attempt_text)
 			h_emit_assistant_end(h)
 			h_emit_reasoning_end(h)
 			return attempt_items, attempt_usage, attempt_got_usage, false, aerr
 		}
 		retries += 1
+		delete(answer)
 		delete(attempt_text)
 		for &it in attempt_items do item_destroy(&it)
 		delete(attempt_items)
@@ -1191,7 +1272,9 @@ h_run_command :: proc(h: ^Harness, prompt: string) {
 			"  /models    list models (not wired up in the desktop app yet)\n" +
 			"  /desc      describe the work done in this session\n" +
 			"  /compact   summarize older conversation and archive the session\n" +
+			"  /shake     drop all attachments and tool outputs over 64 KB\n" +
 			"  /new       archive the session and start fresh\n" +
+			"  /close     archive the session and close its tab (same as /new in the CLI)\n" +
 			"  /sessions  list archived sessions\n" +
 			"  /load      load an archived session")
 	case "context":
@@ -1209,18 +1292,34 @@ h_run_command :: proc(h: ^Harness, prompt: string) {
 			return
 		}
 		if err := cmd_models(h); err != "" do h_emit_error(h, err)
-	case "new":
+	case "new", "close":
 		if len(args) > 0 {
 			h_emit_error(h, "takes no arguments")
 			return
 		}
-		if err := cmd_new(h); err != "" do h_emit_error(h, err)
+		if err := cmd_new(h); err != "" {
+			h_emit_error(h, err)
+			return
+		}
+		if name == "close" {
+			// `/new` can leave a zero-byte session file behind when there is
+			// nothing to archive. Closing the tab should not resurrect it as an
+			// empty session on the next launch.
+			if len(h.session.path) > 0 {
+				if st, stat_err := os.stat(h.session.path, context.temp_allocator); stat_err == nil && st.size == 0 {
+					_ = os.remove(h.session.path)
+				}
+			}
+			h_emit(h, Event{kind = .Session_Close})
+		}
 	case "sessions":
 		if err := cmd_sessions(h, args); err != "" do h_emit_error(h, err)
 	case "load":
 		if err := cmd_load(h, args); err != "" do h_emit_error(h, err)
 	case "compact":
 		if err := cmd_compact(h, args); err != "" do h_emit_error(h, err)
+	case "shake":
+		if err := cmd_shake(h, args); err != "" do h_emit_error(h, err)
 	case "desc":
 		if err := cmd_desc(h, args); err != "" do h_emit_error(h, err)
 	case:

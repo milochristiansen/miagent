@@ -7,6 +7,14 @@ import "core:time"
 import glfw "vendor:glfw"
 import gl "vendor:OpenGL"
 
+// Wayland/X11 may ask us to repaint after the surface is exposed or resized by
+// the compositor even when no input arrived.
+window_refresh_requested: bool
+
+on_window_refresh :: proc "c" (window: glfw.WindowHandle) {
+	window_refresh_requested = true
+}
+
 FONT_REGULAR := [?]string{
 	"/usr/share/fonts/TTF/FiraCode-Regular.ttf",
 	"/usr/share/fonts/truetype/firacode/FiraCode-Regular.ttf",
@@ -117,6 +125,17 @@ main :: proc() {
 		return
 	}
 
+	// GLFW 3.5 can run natively on Wayland or through XWayland. Let a launch
+	// select the platform explicitly; this is useful for isolating driver
+	// paths and as a workaround for compositor/EGL driver leaks.
+	if requested := os.get_env("MIAGENT_GLFW_PLATFORM", context.temp_allocator); len(requested) > 0 {
+		switch requested {
+		case "x11":
+			glfw.InitHint(glfw.PLATFORM, glfw.PLATFORM_X11)
+		case "wayland":
+			glfw.InitHint(glfw.PLATFORM, glfw.PLATFORM_WAYLAND)
+		}
+	}
 	if !glfw.Init() {
 		fmt.eprintln("failed to initialize GLFW")
 		return
@@ -146,6 +165,7 @@ main :: proc() {
 	glfw.MakeContextCurrent(win)
 	glfw.SwapInterval(1)
 	glfw.SetWindowSizeLimits(win, GUI_MIN_WINDOW_W, GUI_MIN_WINDOW_H, glfw.DONT_CARE, glfw.DONT_CARE)
+	glfw.SetWindowRefreshCallback(win, on_window_refresh)
 	gl.load_up_to(3, 3, glfw.gl_set_proc_address)
 
 	ctx := igCreateContext(nil)
@@ -233,35 +253,121 @@ main :: proc() {
 	shot := os.get_env("MIAGENT_SCREENSHOT", context.allocator)
 	profile := len(os.get_env("MIAGENT_PROFILE", context.temp_allocator)) > 0
 	frame_count := 0
+	render_count := 0
 	start_time := glfw.GetTime()
+
+	last_render: f64 = -1000.0
+	next_frame_at: f64 = 0
+	prev_fw: i32 = -1
+	prev_fh: i32 = -1
+	prev_focused := false
 
 	for !glfw.WindowShouldClose(win) {
 		glfw.PollEvents()
-		app.window_focused = glfw.GetWindowAttrib(win, glfw.FOCUSED) != 0
+		focused := glfw.GetWindowAttrib(win, glfw.FOCUSED) != 0
+		app.window_focused = focused
+		fw, fh := glfw.GetFramebufferSize(win)
+		pending_input := mi_io_input_pending_count() > 0
+		forced := frame_count < 3 || fw != prev_fw || fh != prev_fh ||
+			focused != prev_focused || window_refresh_requested || len(shot) > 0
+		realtime := app_wants_realtime_frames(&app)
+		animating := app_wants_animation_frames(&app)
+		was_animating := animating
+		now := glfw.GetTime()
+
+		// A worker can start a turn or emit an event while the UI is sleeping
+		// on a long idle timer. Shorten the next wakeup as soon as that happens
+		// so streaming stays responsive without returning to a 60 Hz swap loop.
+		if realtime && next_frame_at > now + 1.0 / 30.0 {
+			next_frame_at = now + 1.0 / 30.0
+		}
+
+		// Build and present a frame only when something needs it. In
+		// particular, do not touch the GL/compositor swap path just because the
+		// event loop woke up: repeated no-op presents are exactly what lets a
+		// compositor/EGL driver leak slowly while the app is idle.
+		if !(forced || pending_input || animating || glfw.GetTime() >= next_frame_at) {
+			if focused {
+				time.sleep(4 * time.Millisecond)
+			} else {
+				time.sleep(50 * time.Millisecond)
+			}
+			continue
+		}
+		window_refresh_requested = false
 
 		ImGui_ImplOpenGL3_NewFrame()
 		ImGui_ImplGlfw_NewFrame()
 		igNewFrame()
 
-		fw, fh := glfw.GetFramebufferSize(win)
 		gl.Viewport(0, 0, fw, fh)
 		gl.ClearColor(th.bg[0], th.bg[1], th.bg[2], 1.0)
 		gl.Clear(gl.COLOR_BUFFER_BIT)
 
 		frame_start := time.tick_now()
-		app_frame(&app)
+		app_changed := app_frame(&app)
 		frame_count += 1
 		if profile && (frame_count <= 3 || frame_count % 60 == 0) {
 			view := app_active_view(&app)
-			fmt.eprintf("frame %d: %.2f ms, %d messages, %d selection cells\n",
+			fmt.eprintf("frame %d: %.2f ms, %d messages, %d selection cells, %d presents\n",
 				frame_count,
 				time.duration_milliseconds(time.tick_since(frame_start)),
-				len(view.messages), len(view.sel.items))
+				len(view.messages), len(view.sel.items), render_count)
+		}
+
+		now = glfw.GetTime()
+		animating = app_wants_animation_frames(&app)
+		realtime = app_wants_realtime_frames(&app)
+		changed := forced || pending_input || app_changed || animating || was_animating
+
+		// Streaming deltas and shell output can arrive faster than the eye can
+		// use them. Coalesce non-input updates to 20 Hz; animations still run at
+		// the display rate.
+		if !animating && !forced && !pending_input && app_changed &&
+		   now - last_render < 1.0 / 20.0 {
+			changed = false
+		}
+
+		// Keep spinners, status cards, and text cursors alive at low rates.
+		if !changed && realtime && now - last_render >= 0.25 {
+			changed = true
+		}
+		if !changed && mi_io_want_text_input() != 0 && now - last_render >= 0.5 {
+			changed = true
+		}
+		if !changed && app.mcp_configured && now - last_render >= 1.0 {
+			changed = true
 		}
 
 		igRender()
-		ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData())
-		glfw.SwapBuffers(win)
+		if changed {
+			ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData())
+			glfw.SwapBuffers(win)
+			last_render = now
+			render_count += 1
+		}
+
+		// Schedule the next frame. Animations need every loop; background work
+		// is polled at 30 Hz; a focused idle window keeps a slow repaint timer
+		// for compositor/expose safety, and an unfocused one waits for events.
+		switch {
+		case animating:
+			next_frame_at = now
+		case realtime:
+			next_frame_at = now + 1.0 / 30.0
+		case mi_io_want_text_input() != 0:
+			next_frame_at = now + 0.5
+		case app.mcp_configured:
+			next_frame_at = now + 1.0
+		case focused:
+			next_frame_at = now + 2.0
+		case:
+			next_frame_at = now + 3600.0
+		}
+
+		prev_fw = fw
+		prev_fh = fh
+		prev_focused = focused
 
 		if len(shot) > 0 && glfw.GetTime() - start_time > 2.0 {
 			capture(fw, fh, shot)

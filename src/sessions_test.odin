@@ -66,3 +66,63 @@ test_session_names_round_trip_and_new_file_naming :: proc(t: ^testing.T) {
 	testing.expect_value(t, os.base(next), "session-3.jsonl")
 	testing.expect_value(t, next_name, "Session 3")
 }
+
+// Closing a tab removes its GUI name and keeps the project's active index
+// coherent. Preview mode is used here so the test does not need to start a
+// harness worker for the replacement tab.
+@(test)
+test_project_close_tab_removes_names_and_selects_neighbor :: proc(t: ^testing.T) {
+	root := fmt.aprintf("/tmp/miagent-close-tab-test-%d", time.to_unix_nanoseconds(time.now()))
+	defer delete(root)
+	if !testing.expectf(t, os.make_directory_all(root) == nil, "creating %s", root) do return
+	defer os.remove_all(root)
+	state_dir := fmt.aprintf("%s/.miagent", root)
+	defer delete(state_dir)
+	if !testing.expect(t, os.make_directory_all(state_dir) == nil) do return
+
+	first_path := fmt.aprintf("%s/session.jsonl", state_dir)
+	defer delete(first_path)
+	second_path := fmt.aprintf("%s/session-2.jsonl", state_dir)
+	defer delete(second_path)
+
+	p := Project{path = root, active_tab = 0}
+	p.tabs = make([dynamic]^Conversation_Tab, 0, 2)
+	defer {
+		for tab in p.tabs do conversation_tab_destroy(tab)
+		delete(p.tabs)
+	}
+	first := new(Conversation_Tab)
+	conversation_tab_init(first, first_path, "First")
+	second := new(Conversation_Tab)
+	conversation_tab_init(second, second_path, "Second")
+	append(&p.tabs, first, second)
+
+	app := App{selected_project = 0, preview_active = true}
+	app.projects = make([dynamic]^Project, 1)
+	defer delete(app.projects)
+	app.projects[0] = &p
+
+	project_close_tab(&app, &p, 0)
+	if !testing.expect_value(t, len(p.tabs), 1) do return
+	if !testing.expect(t, p.tabs[0] == second, "the second tab must become active") do return
+	testing.expect_value(t, p.active_tab, 0)
+
+	names, err := project_session_names_load(&p)
+	if len(err) > 0 {
+		testing.fail_now(t, err)
+	}
+	defer gui_session_names_destroy(&names)
+	if !testing.expect_value(t, len(names.sessions), 1) do return
+	testing.expect_value(t, names.sessions[0].file, "session-2.jsonl")
+
+	project_close_tab(&app, &p, 0)
+	testing.expect_value(t, len(p.tabs), 0)
+	testing.expect_value(t, p.active_tab, -1)
+
+	names_after, err_after := project_session_names_load(&p)
+	if len(err_after) > 0 {
+		testing.fail_now(t, err_after)
+	}
+	defer gui_session_names_destroy(&names_after)
+	testing.expect_value(t, len(names_after.sessions), 0)
+}

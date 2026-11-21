@@ -1,5 +1,5 @@
-// Session-management slash commands: /new, /sessions, /load, /compact, and
-// /desc. The archive layout, naming, prompts, and compaction plan match the
+// Session-management slash commands: /new, /close, /sessions, /load, /compact,
+// /shake, and /desc. The archive layout, naming, prompts, and compaction plan match the
 // Go CLI so archives and sessions can move between the two implementations.
 package harness
 
@@ -62,6 +62,8 @@ cmd_new :: proc(h: ^Harness) -> string {
 	defer session_files_destroy(&files)
 	all := session_files_all(files)
 	defer delete(all)
+	store := attachment_store_init(h.session.path)
+	defer attachment_store_destroy(&store)
 	if len(all) == 0 {
 		if files.empty {
 			h_emit_note(h, fmt.aprintf("nothing to archive: %s holds no exchanges yet", h.session.path))
@@ -109,6 +111,7 @@ cmd_new :: proc(h: ^Harness) -> string {
 		})
 	}
 	defer delete(name)
+	if berr := archive_collect_blobs(all, &store, &entries); berr != "" do return berr
 
 	stamp := utc_stamp(time.now())
 	stem := fmt.aprintf("%s%s", NEW_ARCHIVE_PREFIX, stamp)
@@ -131,6 +134,8 @@ cmd_new :: proc(h: ^Harness) -> string {
 		delete(retired)
 	}
 	cleanup_err := remove_files(retired)
+	attach_cleanup_err := ""
+	if cleanup_err == "" do attach_cleanup_err = attachment_store_remove_all(&store)
 	sync.mutex_lock(&h.state_mutex)
 	session_reset(&h.session)
 	sync.mutex_unlock(&h.state_mutex)
@@ -149,6 +154,51 @@ cmd_new :: proc(h: ^Harness) -> string {
 		h_emit_note(h, fmt.aprintf("archived as %s, but deleting the retired originals failed: %s", target, cleanup_err))
 		delete(cleanup_err)
 	}
+	if attach_cleanup_err != "" {
+		h_emit_note(h, attach_cleanup_err)
+		delete(attach_cleanup_err)
+	}
+	h_emit_context(h)
+	return ""
+}
+
+// --- /shake ----------------------------------------------------------------
+
+cmd_shake :: proc(h: ^Harness, args: []string) -> string {
+	if len(args) > 0 do return "takes no arguments"
+	if len(h.session.path) == 0 do return "no session file configured"
+	sync.mutex_lock(&h.state_mutex)
+	cerr := session_commit(&h.session)
+	sync.mutex_unlock(&h.state_mutex)
+	if cerr != "" do return fmt.aprintf("saving session before shake: %s", cerr)
+
+	store := attachment_store_init(h.session.path)
+	defer attachment_store_destroy(&store)
+
+	sync.mutex_lock(&h.state_mutex)
+	attachments, attach_bytes, bodies, body_bytes, changed, serr := attachments_shake(
+		&h.session, &store, h.config.shake_body_threshold, h.config.tool_body_blob_threshold)
+	if len(serr) == 0 && changed {
+		serr = session_rewrite(&h.session)
+	}
+	sync.mutex_unlock(&h.state_mutex)
+	if len(serr) > 0 do return serr
+
+	if !changed {
+		h_emit_note(h, "nothing to shake: no attachments or large tool outputs")
+		return ""
+	}
+
+	refresh_context(h)
+	h_emit(h, Event{kind = .Session_Changed})
+	attach_size := human_bytes(attach_bytes)
+	body_size := human_bytes(body_bytes)
+	h_emit_note(h, fmt.aprintf(
+		"shook session: %d attachment%s (%s) and %d tool output%s (%s) replaced with placeholders; blobs kept in %s",
+		attachments, plural(attachments, "", "s"), attach_size,
+		bodies, plural(bodies, "", "s"), body_size, store.dir))
+	delete(attach_size)
+	delete(body_size)
 	h_emit_context(h)
 	return ""
 }
@@ -215,6 +265,7 @@ resolve_archive_path :: proc(dir, arg: string) -> (string, string) {
 
 check_archive_names :: proc(entries: []Archive_Entry) -> string {
 	for e in entries {
+		if _, is_blob := archive_attachment_id(e.name); is_blob do continue
 		if len(e.name) == 0 || e.name == "." || e.name == ".." ||
 		   os.is_absolute_path(e.name) || os.base(e.name) != e.name {
 			return fmt.aprintf("unsafe entry name %q", e.name)
@@ -249,9 +300,18 @@ cmd_load_target :: proc(h: ^Harness, target: string) -> string {
 	session_content := ""
 	session_file_name := ""
 	extra := make([dynamic]Archive_Entry, 0, 4)
+	blobs := make([dynamic]Archive_Entry, 0, 8)
 	defer delete(extra)
+	defer delete(blobs)
 	for e in entries {
 		if e.name == SESSION_NAME_ENTRY do continue
+		if strings.has_prefix(e.name, ARCHIVE_ATTACHMENT_PREFIX) {
+			if _, is_blob := archive_attachment_id(e.name); !is_blob {
+				return fmt.aprintf("reading %s: unsafe attachment entry %q", target, e.name)
+			}
+			append(&blobs, e)
+			continue
+		}
 		if is_compaction_archive_name(e.name) {
 			append(&extra, e)
 		} else if len(session_file_name) == 0 {
@@ -303,6 +363,31 @@ cmd_load_target :: proc(h: ^Harness, target: string) -> string {
 		}
 		staged_extra[i] = staged
 	}
+	staged_blob_dir := fmt.aprintf("%s/.miagent-restore-attachments-%s", dir, stage_id)
+	defer {
+		os.remove_all(staged_blob_dir)
+		delete(staged_blob_dir)
+	}
+	if len(blobs) > 0 {
+		if merr := os.make_directory_all(staged_blob_dir); merr != nil {
+			return fmt.aprintf("staging attachment blobs: %v", merr)
+		}
+		for e in blobs {
+			id, _ := archive_attachment_id(e.name)
+			actual := attachment_blob_id(transmute([]byte)e.content)
+			if actual != id {
+				delete(actual)
+				return fmt.aprintf("staging attachment %s: content hash mismatch", id)
+			}
+			delete(actual)
+			path := join_path(staged_blob_dir, id)
+			if werr := write_restored_file(path, e.content); werr != "" {
+				delete(path)
+				return fmt.aprintf("staging attachment %s: %s", id, werr)
+			}
+			delete(path)
+		}
+	}
 	staged_session := fmt.aprintf("%s/.miagent-restore-session-%s", dir, stage_id)
 	defer {
 		if len(staged_session) > 0 {
@@ -316,6 +401,23 @@ cmd_load_target :: proc(h: ^Harness, target: string) -> string {
 
 	// Retire the session being replaced first, exactly as /new would.
 	if nerr := cmd_new(h); nerr != "" do return nerr
+
+	if len(blobs) > 0 {
+		store := attachment_store_init(h.session.path)
+		defer attachment_store_destroy(&store)
+		_ = attachment_store_remove_all(&store)
+		parent := join_path(dir, ATTACHMENT_STORE_DIR)
+		defer delete(parent)
+		if !os.exists(parent) {
+			if merr := os.make_directory_all(parent); merr != nil {
+				return fmt.aprintf("restoring attachment blobs: %v", merr)
+			}
+		}
+		if rerr := os.rename(staged_blob_dir, store.dir); rerr != nil {
+			return fmt.aprintf("restoring attachment blobs: %v", rerr)
+		}
+		clear(&blobs)
+	}
 
 	for e, i in extra {
 		final := join_path(dir, e.name)
@@ -781,6 +883,11 @@ cmd_compact :: proc(h: ^Harness, args: []string) -> string {
 	h.session.usages = make([dynamic]Usage, 0, 4)
 	h.session.carried = carried
 	h.session.compacted = true
+	if old_rec, has := h.session.compaction_record.?; has do compaction_record_destroy(&old_rec)
+	stored_rec := rec
+	stored_rec.archived = strings.clone(rec.archived)
+	stored_rec.created = strings.clone(rec.created)
+	h.session.compaction_record = stored_rec
 	h.session.committed = len(h.session.items)
 	h.session.committed_usages = 0
 	sync.mutex_unlock(&h.state_mutex)

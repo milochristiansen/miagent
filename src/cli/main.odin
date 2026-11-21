@@ -39,7 +39,7 @@ usage :: proc() {
 	fmt.eprint("Usage: miagent prompt...\n" +
 		"The prompt is the raw command line (space-joined)\n" +
 		"If the first prompt character is a \"/\" it is treated as a harness command instead of a prompt.\n" +
-		"Commands: (/help, /context, /models, /desc, /compact, /new, /sessions, /load).\n" +
+		"Commands: (/help, /context, /models, /desc, /compact, /shake, /new, /close, /sessions, /load).\n" +
 		"Configuration is read from MIAGENT_CONFIG_DIR when set, otherwise\n" +
 		"$XDG_CONFIG_HOME/miagent (~/.config/miagent by default).\n")
 	os.exit(2)
@@ -57,7 +57,9 @@ command_table := [?]Command_Info{
 	{"models", "list the endpoint's models and their supported reasoning levels", false},
 	{"desc", "describe the work done in this session in a sentence or two", true},
 	{"compact", "replace older conversation with a summary, archiving the session", true},
+	{"shake", "drop all attachments and large tool outputs", false},
 	{"new", "archive the session and its compaction archives under a generated name, then start fresh", true},
+	{"close", "same as /new in the CLI; in the desktop app it also closes the session tab", true},
 	{"sessions", "list archived sessions by date, with the description each holds", false},
 	{"load", "archive this session, then replace it with the named archived session", true},
 }
@@ -256,7 +258,7 @@ main :: proc() {
 			case .Turn_End, .Action_End:
 				display_end_turn(&disp)
 				done = true
-			case .Context, .User, .Assistant_Start, .Assistant_Replace, .Assistant_End, .Reasoning_Start, .Reasoning_Discard, .Reasoning_End, .Session_Changed:
+			case .Context, .User, .Assistant_Start, .Assistant_Replace, .Assistant_End, .Reasoning_Start, .Reasoning_Discard, .Reasoning_End, .Session_Changed, .Session_Close:
 				// The CLI does not echo the prompt and has no separate UI
 				// state for these events.
 			}
