@@ -678,7 +678,15 @@ run_tool :: proc(h: ^Harness, config: ^Config, tool: ^Tool, call_id, arguments: 
 		h_emit_tool_output(h, call_id, .Stderr, res.stderr)
 		delete(attachment_note)
 	}
-	if len(attachment_dir) > 0 do defer delete(attachment_dir)
+	// NOTE: defer is block-scoped in Odin. Writing this as the body of an
+	// `if` (`if cond do defer ...`) frees the directory immediately, at the
+	// end of the if body, while run_tool still needs it for the child
+	// environment and for attachment collection below.
+	defer {
+		if len(attachment_dir) > 0 {
+			delete(attachment_dir)
+		}
+	}
 
 	env := tool_env(config, "INVOKE", tool.name, attachment_dir)
 	defer free_env(env)

@@ -87,6 +87,7 @@ foreign cimgui {
 
 	// --- backends ----------------------------------------------------------
 	ImGui_ImplGlfw_InitForOpenGL :: proc(window: ^GLFWwindow, install_callbacks: bool) -> bool ---
+	ImGui_ImplGlfw_KeyCallback :: proc(window: ^GLFWwindow, key, scancode, action, mods: i32) ---
 	ImGui_ImplGlfw_Shutdown :: proc() ---
 	ImGui_ImplGlfw_NewFrame :: proc() ---
 	ImGui_ImplOpenGL3_Init :: proc(glsl_version: cstring) -> bool ---

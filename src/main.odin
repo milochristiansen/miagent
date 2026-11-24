@@ -15,6 +15,17 @@ on_window_refresh :: proc "c" (window: glfw.WindowHandle) {
 	window_refresh_requested = true
 }
 
+// ImGui's GLFW backend intentionally ignores GLFW_REPEAT events and implements
+// typematic repeat itself. Non-text keys such as arrows and backspace therefore
+// produce no queued ImGui input event, so an on-demand renderer must wake on the
+// repeat callback explicitly.
+key_repeat_requested: bool
+
+on_key :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
+	if action == glfw.REPEAT do key_repeat_requested = true
+	ImGui_ImplGlfw_KeyCallback(cast(^GLFWwindow)window, key, scancode, action, mods)
+}
+
 FONT_REGULAR := [?]string{
 	"/usr/share/fonts/TTF/FiraCode-Regular.ttf",
 	"/usr/share/fonts/truetype/firacode/FiraCode-Regular.ttf",
@@ -177,6 +188,7 @@ main :: proc() {
 		fmt.eprintln("failed to initialize the GLFW backend")
 		return
 	}
+	glfw.SetKeyCallback(win, on_key)
 	defer ImGui_ImplGlfw_Shutdown()
 	if !ImGui_ImplOpenGL3_Init("#version 330 core") {
 		fmt.eprintln("failed to initialize the OpenGL3 backend")
@@ -268,8 +280,11 @@ main :: proc() {
 		app.window_focused = focused
 		fw, fh := glfw.GetFramebufferSize(win)
 		pending_input := mi_io_input_pending_count() > 0
+		repeat_pending := key_repeat_requested
+		key_repeat_requested = false
 		forced := frame_count < 3 || fw != prev_fw || fh != prev_fh ||
-			focused != prev_focused || window_refresh_requested || len(shot) > 0
+			focused != prev_focused || window_refresh_requested ||
+			repeat_pending || len(shot) > 0
 		realtime := app_wants_realtime_frames(&app)
 		animating := app_wants_animation_frames(&app)
 		was_animating := animating
@@ -318,7 +333,8 @@ main :: proc() {
 		now = glfw.GetTime()
 		animating = app_wants_animation_frames(&app)
 		realtime = app_wants_realtime_frames(&app)
-		changed := forced || pending_input || app_changed || animating || was_animating
+		changed := forced || pending_input || repeat_pending || app_changed ||
+			animating || was_animating
 
 		// Streaming deltas and shell output can arrive faster than the eye can
 		// use them. Coalesce non-input updates to 20 Hz; animations still run at
